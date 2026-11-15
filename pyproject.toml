@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "olaf"
+version = "0.0.0"
+description = "A deep learning framework that handles training and inference with one compiler"
+requires-python = ">=3.12"
+# scipy is used only for erf in the eager interpreter. NumPy has no array erf, and calling
+# math.erf per element is too slow for GPT-2 scale verification.
+dependencies = ["numpy>=2.0", "scipy>=1.14"]
+
+[project.optional-dependencies]
+# PyTorch is only a reference implementation for tests; olaf/ never imports it.
+test = ["pytest>=8", "torch>=2.9", "transformers>=4.50", "safetensors>=0.4"]
+
+[tool.setuptools.packages.find]
+include = ["olaf*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "gpu: tests that need a GPU",
+    "slow: time-consuming tests such as full-size GPT-2",
+]
