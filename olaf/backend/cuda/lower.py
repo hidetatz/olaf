@@ -522,6 +522,12 @@ class _Emitter:
             return [self.reduce(op, self.cyclic(args[0]), out_t)]
         if kind == "dot":
             a, b, acc = args
+            if self.use_matrix:
+                from olaf.backend.cuda.mma import lower_register_dot
+
+                lowered = lower_register_dot(self, op, a, b, acc)
+                if lowered is not None:
+                    return [lowered]
             return [self.dot(self.cyclic(a), self.cyclic(b), self.cyclic(acc))]
         if kind == "load":
             return [self.load(op, args, out_t)]
@@ -856,6 +862,15 @@ class _Emitter:
     # -- driver ---------------------------------------------------------------------------------
 
     def run(self) -> Lowered:
+        self.producers = {}
+
+        def walk(body: Body) -> None:
+            for o in body.ops:
+                self.producers.update((v, o) for v in o.outputs)
+                for r in o.regions:
+                    walk(r)
+
+        walk(self.task.body)
         prologue = ["    %tid = nvvm.read.ptx.sreg.tid.x : i32", "    %block = nvvm.read.ptx.sreg.ctaid.x : i32"]
         # Recover one program id per grid axis from the flat block index.
         task = self.task

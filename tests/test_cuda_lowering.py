@@ -223,3 +223,21 @@ def test_split_column_reduction_on_device():
     program = to_program(graph, AMPERE_RTX3060)
     assert len(program.launches) == 2
     assert rel(CudaProgram(program).run([x])[0][0], interpret(graph, [x])[0][0]) < 1e-5
+
+
+@pytest.mark.parametrize("spec,a,b", [("ik,kj->ij", (70, 48), (48, 40)), ("ik,jk->ij", (33, 32), (64, 32)), ("ki,kj->ij", (32, 50), (32, 30))])
+def test_register_operand_dot_uses_matrix_instructions(spec, a, b):
+    # Default (non-pipelined) tiles: the dot's operands are register tiles staged through shared
+    # memory for mma.sync, including f32 values that are widened bf16.
+    from olaf.backend.cuda.lower import lower_task
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    x, y = bf16_round(R.normal(size=a)), bf16_round(R.normal(size=b))
+
+    def fn(p, q):
+        return olaf.einsum(spec, olaf.cast(p, olaf.f32), olaf.cast(q, olaf.f32))
+
+    graph = lower(olaf.trace(fn, tt(*a, dtype=olaf.bf16), tt(*b, dtype=olaf.bf16)).graph)
+    program = to_program(graph)
+    assert any("nvvm.mma.sync" in lower_task(launch.task).text for launch in program.launches)
+    assert rel(CudaProgram(program).run([x, y])[0][0], interpret(graph, [x, y])[0][0]) < 1e-5

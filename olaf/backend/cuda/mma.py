@@ -425,3 +425,80 @@ class _MatrixLoop:
         e.raw("nvvm.cp.async.wait.group 0")
         e.barrier()
         return [_Value(acc_params, False, carry.type, layout, None)]
+
+
+def exactly_b16(e, value: TValue) -> bool:
+    """value holds b16 values exactly: a bf16 tile, or f32 widened from one (through permute/reshape)."""
+    while True:
+        if value.type.dtype in _PTX_TYPE:
+            return True
+        op = e.producers.get(value)
+        if op is None or op.kind not in ("cast", "permute", "reshape"):
+            return False
+        if op.kind == "cast" and not (op.inputs[0].type.dtype in _PTX_TYPE and op.attr("dtype") is DType.f32):
+            return False
+        value = op.inputs[0]
+
+
+def lower_register_dot(e, dot: TOp, a, b, acc):
+    """dot(a, b, acc) on tiles held in registers (any layout), with mma.sync.
+
+    The operands are staged in shared memory as row-major [M][K] and [K][N] b16 tiles (the
+    swizzle of the pipelined loop), then the loop's ldmatrix + mma code runs on that single stage.
+    Used where operands are computed in the task (attention probabilities) rather than loaded.
+    Returns None when the shapes or dtypes do not fit, for the general path.
+    """
+    from olaf.backend.cuda.lower import _Value
+
+    a_t, b_t = dot.inputs[0], dot.inputs[1]
+    if acc.type.dtype is not DType.f32 or not (exactly_b16(e, a_t) and exactly_b16(e, b_t)):
+        return None
+    m, k = a.type.shape
+    n = b.type.shape[1]
+    grid = _warp_grid(e.task.warps, m, n)
+    if grid is None or k % 16 or n % 16 or m % 16:
+        return None
+    dtype = DType.bf16
+    a_op = _Operand(-1, None, [], 0, 1, True, m, k)
+    b_op = _Operand(-1, None, [], 0, 1, True, k, n)
+    loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 1, dtype)
+    lane, wm_idx, wn_idx = loop.lane_values()
+    layout = loop.accumulator_layout(lane, wm_idx, wn_idx)
+    if acc.coords is layout:
+        acc_regs = list(acc.regs)
+    elif len(set(acc.regs)) == 1:
+        acc_regs = [acc.regs[0]] * len(layout)
+    else:
+        acc_regs = e.relayout(acc, _Value([], False, acc.type, layout, None)).regs
+    e.barrier()
+    _stage(e, loop, a_op, a, 0)
+    _stage(e, loop, b_op, b, a_op.bytes)
+    e.barrier()
+    a_offsets, b_offsets = loop.fragment_offsets(lane, wm_idx, wn_idx)
+    out = loop.compute(e.i32(0), acc_regs, a_offsets, b_offsets)
+    e.barrier()
+    return _Value(out, False, acc.type, layout, None)
+
+
+def _stage(e, loop: _MatrixLoop, operand: _Operand, value, base: int) -> None:
+    """Write a register tile as a row-major b16 operand into shared memory, with the swizzle."""
+    shape = value.type.shape
+    cols = shape[1]
+    per_row = cols // 8
+    rep = max(1, 8 // per_row)
+    span = min(per_row, 8)
+    smem = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+    for slot, coords in enumerate(e.layout_of(value)):
+        row, col = coords if len(coords) == 2 else (e.i32(0), coords[0])
+        reg = value.regs[slot] if not value.replicated else value.regs[0]
+        if value.type.dtype is DType.f32:
+            reg = e.emit(f"llvm.fptrunc {reg} : f32 to bf16")  # exact: the value is a widened bf16
+        chunk = e.emit(f"llvm.udiv {col}, {e.i32(8)} : i32")
+        within = e.emit(f"llvm.urem {col}, {e.i32(8)} : i32")
+        r = e.emit(f"llvm.udiv {row}, {e.i32(rep)} : i32") if rep > 1 else row
+        swz = e.emit(f"llvm.xor {chunk}, {e.emit(f'llvm.urem {r}, {e.i32(span)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {e.emit(f'llvm.mul {row}, {e.i32(cols * 2)} : i32')}, {e.emit(f'llvm.mul {swz}, {e.i32(16)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {e.i32(base)} : i32')} : i32")
+        ptr = e.emit(f"llvm.getelementptr {smem}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
+        guard = e.valid_of(value, slot)
+        e.guarded(guard, lambda reg=reg, ptr=ptr: e.raw(f"llvm.store {reg}, {ptr} : bf16, !llvm.ptr<3>"))
