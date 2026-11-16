@@ -98,9 +98,12 @@ def infer(kind: str, inputs: Sequence[TileType], attrs: dict, regions: Sequence[
         if index is not None:
             _check(index.shape == shape and not index.dtype.is_float, f"load_indexed index must be an integer tile of the tile shape: {index}")
         return [TileType(shape, attrs["dtype"])]
-    if kind == "store":
+    if kind in ("store", "atomic_add"):
+        # atomic_add: like store, but adds to memory atomically (several instances may add to
+        # one element, in any order).
         value, *starts = inputs
-        _check(len(starts) == value.rank and all(s == TileType((), INDEX) for s in starts), "store needs one i32 start per tile axis")
+        _check(len(starts) == value.rank and all(s == TileType((), INDEX) for s in starts), f"{kind} needs one i32 start per tile axis")
+        _check(kind == "store" or value.dtype in (DType.f32, DType.f64), f"atomic_add of {value.dtype} is not supported")
         return []
     if kind == "atomic_add_indexed":
         index, value, *starts = inputs

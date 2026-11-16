@@ -34,7 +34,7 @@ from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, T
 
 CHEAP_OPS = 3
 
-_MEMORY = frozenset({"load", "load_indexed", "store", "atomic_add_indexed"})
+_MEMORY = frozenset({"load", "load_indexed", "store", "atomic_add", "atomic_add_indexed"})
 _FREE = frozenset({"cast", "full", "dim", "broadcast", "iota"})
 _POINTWISE = UNARY | BINARY | {"cmp", "where"} | _FREE
 

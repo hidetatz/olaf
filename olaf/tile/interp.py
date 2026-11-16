@@ -229,6 +229,12 @@ class _Run:
             offset, inside, _ = view.address(_tile_coords(starts, value.shape))
             flat[offset[inside]] = np.broadcast_to(value, inside.shape)[inside]
             return []
+        if kind == "atomic_add":
+            value, *starts = args
+            view, flat = self.views[op.attr("arg")], self.arrays[op.attr("arg")]
+            offset, inside, _ = view.address(_tile_coords(starts, value.shape))
+            np.add.at(flat, offset[inside], np.broadcast_to(value, inside.shape)[inside])
+            return []
         if kind == "atomic_add_indexed":
             index, value, *starts = args
             view, flat = self.views[op.attr("arg")], self.arrays[op.attr("arg")]

@@ -573,7 +573,7 @@ class _Emitter:
             return [self.lazy_broadcast(args[0], out_t, attrs["dims"])]
         if kind in ("broadcast", "permute"):
             return [self.exchange(op, self.cyclic(args[0]), out_t)]
-        if kind in ("cmp", "where") or (kind not in ("full", "dim", "iota", "cast", "reduce", "dot", "load", "load_indexed", "store", "atomic_add_indexed", "for")):
+        if kind in ("cmp", "where") or (kind not in ("full", "dim", "iota", "cast", "reduce", "dot", "load", "load_indexed", "store", "atomic_add", "atomic_add_indexed", "for")):
             args = self.unify(args)
         if kind in ("cmp", "where", "cast") or kind in _ELEMENTWISE:
             value = self.pointwise(op, args, out_t)
@@ -605,6 +605,9 @@ class _Emitter:
             return []
         if kind == "atomic_add_indexed":
             self.atomic_add(op, args)
+            return []
+        if kind == "atomic_add":
+            self.atomic_store(op, args)
             return []
         if kind == "for":
             if self.use_matrix and op.attr("stages", 1) > 1:
@@ -1096,6 +1099,24 @@ class _Emitter:
             self.guarded(both, lambda ptr=ptr, vec=vec: self.raw(f"llvm.store {vec}, {ptr} {{alignment = {2 * _BYTES[dtype]} : i64}} : vector<2x{t}>, !llvm.ptr<1>"))
             self.guarded(only, lambda ptr=ptr, reg=value.regs[slot]: self.raw(f"llvm.store {reg}, {ptr} : {t}, !llvm.ptr<1>"))
         return True
+
+    def atomic_store(self, op: TOp, args: list[_Value]) -> None:
+        """atomic_add: a store whose writes are atomic additions (any layout)."""
+        value, *starts = args
+        arg = op.attr("arg")
+        view = self.task.args[arg].view
+        dtype = value.type.dtype
+        coords_all = self.layout_of(value)
+        slots = [0] if value.replicated else range(len(value.regs))
+        for slot in slots:
+            tile = self.tile_coords(starts, value.type.shape, coords_all[slot])
+            offset, inside, _ = self.view_address(view, tile)
+            ok = self.conj(inside, self.valid_of(value, slot))
+            if value.replicated:
+                ok = self.conj(ok, self.emit(f"llvm.icmp \"eq\" %tid, {self.i32(0)} : i32"))
+            ptr = self.global_ptr(arg, offset, dtype)
+            reg = value.regs[slot]
+            self.guarded(ok, lambda ptr=ptr, reg=reg: self.raw(f"llvm.atomicrmw fadd {ptr}, {reg} monotonic : !llvm.ptr<1>, {_LLVM[dtype]}"))
 
     def atomic_add(self, op: TOp, args: list[_Value]) -> None:
         index, value, *starts = args

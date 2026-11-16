@@ -171,13 +171,38 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     zeros_k = b.full((g.cols, g.head), 0.0, DType.f32)
     zeros_v = b.full((g.cols, g.value_size), 0.0, DType.f32)
 
+    dq_arg = back.dq.launch.task.args[back.dq.out_arg]
+    dq_atomic = dq_arg.dtype is DType.f32
+
     def kv_body(inner: TileBuilder, r0, carries):
         t.b = inner
         dk, dv = carries
         prob, ds, d_o, q2d = inner_step(t, g, {**starts, row: r0})
         dv = inner.op("dot", inner.op("permute", prob, perm=(1, 0)), d_o, dv)
         dk = inner.op("dot", inner.op("permute", ds, perm=(1, 0)), q2d, dk)
+        if dq_atomic:
+            # This tile's share of dQ = dS K, added atomically: every column tile contributes to
+            # the same rows (FlashAttention-2), which saves recomputing S, P, dP and dS in a
+            # separate task per row tile.
+            k2d = _operand(t, f.c1, 1, {**{x: starts[x] for x in batch}, col: starts[col], s: inner.index(0)}, extents(g), col, s)
+            part = inner.op("dot", ds, k2d, inner.full((g.rows, g.head), 0.0, DType.f32))
+            local = _local(maps["dq"], {**starts, row: r0, s: inner.index(0)})
+            accumulate(t, back.dq, maps["dq"], part, row, s, local, extents(g))
         return [dk, dv]
+
+    def accumulate(t, contract, mapping, value, rows_name, cols_name, local, ext):
+        """atomic_add of a (rows, cols) tile into the contract's output (as _store, with addition)."""
+        arg = contract.launch.task.args[contract.out_arg]
+        term = contract.out
+        rows, cols = _letter(mapping, rows_name), _letter(mapping, cols_name)
+        unit = [x for x in term if x not in (rows, cols)]
+        lext = _local(mapping, ext)
+        shaped = t.b.op("reshape", value, shape=tuple([1] * len(unit) + [lext[rows], lext[cols]]))
+        current = unit + [rows, cols]
+        perm = tuple(current.index(x) for x in term)
+        if perm != tuple(range(len(term))):
+            shaped = t.b.op("permute", shaped, perm=perm)
+        t.b.emit("atomic_add", (shaped, *(local[x] for x in term)), {"arg": t.arg(contract.output, arg.view, arg.dtype, True)})
 
     dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body)
     t.b = b
@@ -187,6 +212,18 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     # with 4 warps (32 registers per tile per thread) it spills. Nothing here needs warps
     # stacked along rows (its dots take operands from memory or staged accumulators).
     kv_task = t.finish("attention_dkv", grid, pids, ("attention_dkv",), warps=8)
+
+    if dq_atomic:
+        # dQ starts at zero; the dK/dV task adds into it.
+        t = _Task()
+        b = t.b
+        gz = _Builder(p, f, rows=BLOCK, cols=BLOCK)
+        pids, starts, grid = gz.pids(t, row)
+        starts[s] = b.index(0)
+        zero = b.full((gz.rows, gz.head), 0.0, DType.f32)
+        store(t, gz, back.dq, maps["dq"], zero, row, s, starts)
+        zero_task = t.finish("attention_dq_zero", grid, pids, ("attention_dq_zero",))
+        return [d_task, zero_task, kv_task]
 
     # dQ: one tile of rows per instance, looping over columns (one accumulator: 128 rows).
     g = _Builder(p, f, rows=FORWARD_ROWS, cols=BLOCK)

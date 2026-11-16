@@ -340,7 +340,8 @@ def test_online_softmax_fusion(backward):
     before = fuse(to_tile(graph, AMPERE_RTX3060))
     after = fuse_online_softmax(before)
     names = {launch.task.name for launch in after.launches}
-    assert "attention" in names and (not backward or {"attention_dkv", "attention_dq"} <= names)
+    # dQ comes from its own task, or is accumulated atomically by the dK/dV task after a zeroing task.
+    assert "attention" in names and (not backward or ("attention_dkv" in names and names & {"attention_dq", "attention_dq_zero"}))
     assert len(after.launches) < len(before.launches)
     for a, e in zip(run_program(after, args)[0], interpret(graph, args)[0]):
         assert rel(a, e) < 1e-2, rel(a, e)
