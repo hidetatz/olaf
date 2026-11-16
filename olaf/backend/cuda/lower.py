@@ -970,6 +970,9 @@ class _Emitter:
                 guard = self.conj(leader, self.valid(shape, slot))
                 self.guarded(guard, lambda index=index, total=total: self.store_shared(index, total, dtype))
             self.barrier()
+            if n_out == 1:
+                # A single output is replicated: every thread reads it, not "its own" element.
+                return self.make(out_t, [self.load_shared(self.i32(0), dtype)])
             regs = []
             for slot in range(self.slots(out_shape)):
                 index = self.flat_index(slot)

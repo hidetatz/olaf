@@ -24,6 +24,7 @@ from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides, full_view
 
 ELEMENTWISE_BLOCK = 128
+ELEMENTWISE_ELEMENTS = 1024
 # Reduced chunk per loop step: wide for row reductions (one value per output, 8 registers per
 # thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
 # chunk x 128 values (32 per thread).
@@ -53,6 +54,24 @@ def _block(size: Dim, limit: int) -> int:
     if isinstance(size, int):
         return min(limit, 1 << max(size - 1, 0).bit_length())
     return limit
+
+
+def _elementwise_tile(shape) -> tuple[int, ...]:
+    """Tile of an elementwise task: up to ELEMENTWISE_BLOCK along the last axis and, when that
+    is narrow, rows of the axis before it, up to ELEMENTWISE_ELEMENTS in all.
+
+    One 128-element row per instance (one element per thread) left GPT-2's elementwise passes
+    far from memory bandwidth: 24576 tiny blocks for a 4 x 1024 x 768 tensor, too little in
+    flight per thread. Rows of the previous axis add work per instance without padding a
+    768-wide axis to 1024.
+    """
+    if not shape:
+        return ()
+    last = _block(shape[-1], ELEMENTWISE_BLOCK)
+    rows = 1
+    if len(shape) >= 2:
+        rows = _block(shape[-2], max(1, ELEMENTWISE_ELEMENTS // last))
+    return tuple(1 for _ in shape[:-2]) + ((rows,) if len(shape) >= 2 else ()) + (last,)
 
 
 def _ceil_div(d: Dim, t: int) -> Dim:
@@ -180,7 +199,7 @@ class _Converter:
         """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile."""
         out = out or self.new_buffer(out_type, kind)
         shape = out.shape
-        tile = tuple(1 for _ in shape[:-1]) + ((_block(shape[-1], ELEMENTWISE_BLOCK),) if shape else ())
+        tile = _elementwise_tile(shape)
         grid = tuple(_ceil_div(d, t) for d, t in zip(shape, tile))
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
@@ -515,7 +534,7 @@ class _Converter:
         axis_map = self._axis_map(x.view.rank, axis, n_index)
         out = self.new_buffer(out_type, BufferKind.temp)
         shape = out_type.shape
-        tile = tuple(1 for _ in shape[:-1]) + ((_block(shape[-1], ELEMENTWISE_BLOCK),) if shape else ())
+        tile = _elementwise_tile(shape)
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
         starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]
@@ -533,7 +552,7 @@ class _Converter:
         spread, n_index = self._index_over(index, updates.shape, axis, batch_dims)
         axis_map = self._axis_map(out.view.rank, axis, n_index)
         shape = updates.shape
-        tile = tuple(1 for _ in shape[:-1]) + ((_block(shape[-1], ELEMENTWISE_BLOCK),) if shape else ())
+        tile = _elementwise_tile(shape)
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
         starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]

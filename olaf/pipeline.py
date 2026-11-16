@@ -13,6 +13,7 @@ from olaf.tile.fuse import fuse, fuse_epilogues
 from olaf.tile.ir import Program
 from olaf.tile.normalize import align_rows, eliminate_copies, hoist_offsets
 from olaf.tile.online_softmax import fuse_online_softmax
+from olaf.tile.rows import fuse_rows
 
 
 def lower_graph(graph: Graph) -> Graph:
@@ -27,5 +28,5 @@ def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True
         # Epilogues first as well: a cheap consumer of a dot (a bias add) read by several tasks
         # would otherwise be duplicated into each of them, each materializing its own copy.
         program = fuse_epilogues(program, shared_cheap_only=True)
-        program = eliminate_copies(fuse_epilogues(fuse_online_softmax(fuse(program))))
+        program = eliminate_copies(fuse_epilogues(fuse_rows(fuse_online_softmax(fuse(program)))))
     return hoist_offsets(align_rows(program))

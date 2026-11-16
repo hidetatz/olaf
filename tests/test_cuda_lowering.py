@@ -255,3 +255,10 @@ def test_online_softmax_fusion_on_device(backward):
     assert "attention" in {launch.task.name for launch in program.launches}
     for a, e in zip(CudaProgram(program).run(args)[0], interpret(graph, args)[0]):
         assert rel(a, e) < 1e-2, rel(a, e)
+
+
+def test_short_row_reduction_result_is_used_by_every_thread():
+    # Rows of 5 reduce with a butterfly in groups of 8 lanes; the single result is then
+    # broadcast back over the row, so every thread must hold it, not only thread 0.
+    x = R.normal(size=(4, 5)).astype(np.float32)
+    run_both(lambda a: a - olaf.broadcast_to(olaf.reshape(olaf.max(a, axis=1), (4, 1)), (4, 5)), [x], fused=True)

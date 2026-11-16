@@ -424,3 +424,22 @@ def test_epilogue_through_a_permuted_read():
     after = fuse_epilogues(before)
     assert len(after.launches) == 1 < len(before.launches)
     assert rel(run_program(after, [a, b])[0][0], interpret(graph, [a, b])[0][0]) < 1e-5
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_row_fusion_merges_layernorm(backward):
+    from olaf.tile.rows import fuse_rows
+
+    x = R.normal(size=(3, 6, 40)).astype(np.float32)
+    w, bias = R.normal(size=(40,)).astype(np.float32), R.normal(size=(40,)).astype(np.float32)
+
+    def ln(a, w, c):
+        return olaf.layernorm(a * 2.0 + 1.0, w, c)
+
+    fn = (lambda a, w, c: olaf.grad(lambda a: olaf.sum(olaf.tanh(ln(a, w, c))))(a)) if backward else ln
+    graph = lower(olaf.trace(fn, tt(3, 6, 40), tt(40), tt(40)).graph)
+    before = fuse(to_tile(graph))
+    after = fuse_rows(before)
+    assert any(launch.task.name == "rows" for launch in after.launches)
+    assert len(after.launches) < len(before.launches)
+    assert rel(run_program(after, [x, w, bias])[0][0], interpret(graph, [x, w, bias])[0][0]) < 1e-5
