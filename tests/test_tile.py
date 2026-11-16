@@ -358,3 +358,28 @@ def test_online_softmax_skips_masked_tiles_of_a_causal_mask():
     after = fuse_online_softmax(before)
     for a, e in zip(run_program(after, args)[0], interpret(graph, args)[0]):
         assert rel(a, e) < 1e-2
+
+
+def test_copies_into_state_and_outputs_are_eliminated():
+    from olaf.pipeline import to_program
+    from olaf.tile.normalize import eliminate_copies
+
+    w_state = olaf.state("w", tt(3, 5))
+
+    def fn(x):
+        w = w_state.read()
+        # Expensive enough (over fuse.CHEAP_OPS) that fusion keeps it as one buffer with two readers.
+        new = olaf.tanh(olaf.exp(w * 0.5 + x) * x - 1.0)
+        w_state.write(new)
+        return new * 2.0
+
+    graph = lower(olaf.trace(fn, tt(3, 5)).graph)
+    plain = fuse(to_tile(graph))
+    program = eliminate_copies(plain)
+    assert sum(launch.task.origin == ("copy",) for launch in program.launches) < sum(launch.task.origin == ("copy",) for launch in plain.launches)
+    w0 = R.normal(size=(3, 5)).astype(np.float32)
+    got, got_state = run_program(to_program(graph), [X], {"w": w0})
+    want, want_state = interpret(graph, [X], {"w": w0})
+    for a, e in zip(got, want):
+        assert rel(a, e) < 1e-6
+    assert rel(got_state["w"], want_state["w"]) < 1e-6

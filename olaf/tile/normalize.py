@@ -81,3 +81,63 @@ def _restrided(view: View, physical: tuple[Dim, ...]) -> View:
                 start = start + view.pad[axis][0]
         offset = offset + start * physical[buffer_axis]
     return replace(view, strides=tuple(view_strides), offset=offset)
+
+
+def eliminate_copies(program: Program) -> Program:
+    """Remove copy tasks by letting the copied value's writer store into the copy's target.
+
+    write_state and program results materialize their value with a copy (from_graph), and the
+    value usually has other readers too, so fusion cannot inline it away. When the copied buffer
+    is a temp written once, through its full view, the writer can write the target instead and
+    every other reader reads the target. Conditions: the copy reads and writes full views of
+    equally typed contiguous buffers, and nothing touches the target before the copy.
+    """
+    from olaf.tile.ir import full_view
+
+    buffers = {b.name: b for b in program.buffers}
+    launches = list(program.launches)
+    rename: dict[str, str] = {}
+    removed: set[int] = set()
+    touches: dict[str, list[int]] = {}
+    writers: dict[str, list[int]] = {}
+    for i, launch in enumerate(launches):
+        for name, arg in zip(launch.buffers, launch.task.args):
+            touches.setdefault(name, []).append(i)
+            if arg.writes:
+                writers.setdefault(name, []).append(i)
+    for i, launch in enumerate(launches):
+        if launch.task.origin != ("copy",) or launch.offsets or len(launch.buffers) != 2:
+            continue
+        (src, src_arg), (dst, dst_arg) = zip(launch.buffers, launch.task.args)
+        if src_arg.writes or not dst_arg.writes or not _pure_copy(launch.task):
+            continue
+        a, b = buffers[src], buffers[dst]
+        if a.kind is not BufferKind.temp or a.type != b.type or a.strides is not None or b.strides is not None:
+            continue
+        if src_arg.view != full_view(a.type.shape) or dst_arg.view != full_view(b.type.shape):
+            continue
+        w = writers.get(src, [])
+        if len(w) != 1 or w[0] >= i or writers.get(dst) != [i] or min(touches[dst]) != i:
+            continue
+        writer = launches[w[0]]
+        stores = [arg for name, arg in zip(writer.buffers, writer.task.args) if name == src]
+        if len(stores) != 1 or not stores[0].writes or stores[0].view != full_view(a.type.shape):
+            continue
+        rename[src] = dst
+        removed.add(i)
+    if not rename:
+        return program
+    out = []
+    for i, launch in enumerate(launches):
+        if i in removed:
+            continue
+        out.append(replace(launch, buffers=tuple(rename.get(n, n) for n in launch.buffers)))
+    kept = tuple(b for b in program.buffers if b.name not in rename)
+    return replace(program, buffers=kept, launches=tuple(out), outputs=tuple(rename.get(n, n) for n in program.outputs))
+
+
+def _pure_copy(task: Task) -> bool:
+    """The body stores what it loads, unchanged (fusion may have inlined a producer into a copy)."""
+    stores = [op for op in task.body.ops if op.kind == "store"]
+    loads = {op.outputs[0]: op for op in task.body.ops if op.kind == "load"}
+    return len(stores) == 1 and len(loads) == 1 and stores[0].inputs[0] in loads and loads[stores[0].inputs[0]].attr("arg") == 0
