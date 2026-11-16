@@ -526,3 +526,52 @@ class TestCapability:
     def test_megakernel_needs_forward_progress(self):
         assert not CPU.supports_megakernel
         assert not AMPERE_RTX3060.supports_megakernel
+
+
+class TestCommonSubexpressions:
+    def test_attention_backward_reuses_forward_probabilities(self):
+        from olaf.passes.cse import eliminate_common_subexpressions
+
+        def loss(q, k, v):
+            return olaf.sum(olaf.attention(q, k, v, olaf.iota((4, 4), axis=0) >= olaf.iota((4, 4), axis=1)))
+
+        traced = olaf.trace(lambda q, k, v: olaf.value_and_grad(loss, (0, 1, 2))(q, k, v), tt(4, 8), tt(4, 8), tt(4, 8))
+        graph = canonicalize(decompose(traced.graph))
+        merged = eliminate_common_subexpressions(graph)
+        verify(merged)
+        count = lambda g, kind: sum(op.kind == kind for op in g.ops)  # noqa: E731
+        assert count(merged, "exp") < count(graph, "exp")
+        args = [R.normal(size=(4, 8)).astype(np.float32) for _ in range(3)]
+        for a, b in zip(interpret(merged, args)[0], interpret(graph, args)[0]):
+            np.testing.assert_array_equal(a, b)
+
+    def test_effects_and_signed_zero_are_kept_apart(self):
+        from olaf.passes.cse import eliminate_common_subexpressions
+
+        def fn(x):
+            return x * olaf.constant(0.0, F32), x * olaf.constant(-0.0, F32), olaf.pad(x, (1,), (0,), value=0.0), olaf.pad(x, (1,), (0,), value=-0.0)
+
+        graph = canonicalize(decompose(olaf.trace(fn, tt(3)).graph))
+        merged = eliminate_common_subexpressions(graph)
+        x = np.array([-1.0, 0.0, 2.0], np.float32)
+        out = interpret(merged, [x])[0]
+        for a, b in zip(out, interpret(graph, [x])[0]):
+            np.testing.assert_array_equal(np.signbit(a), np.signbit(b))
+        assert np.signbit(out[0][0]) != np.signbit(out[1][0]) and np.signbit(out[2][0]) != np.signbit(out[3][0])
+
+    def test_unrolled_scan_backward_shares_forward_values(self):
+        from olaf.passes.cse import eliminate_common_subexpressions
+        from olaf.passes.unroll import unroll_scans
+
+        def loss(x, ws):
+            return olaf.sum(olaf.scan(lambda h, w: (olaf.tanh(h @ w), None), x, ws)[0])
+
+        traced = olaf.trace(lambda x, ws: olaf.grad(loss, (0, 1))(x, ws), tt(3, 4), tt(2, 4, 4))
+        graph = eliminate_common_subexpressions(canonicalize(unroll_scans(decompose(traced.graph))))
+        verify(graph)
+        # The forward computes tanh twice (two iterations); the backward reuses both results.
+        assert sum(op.kind == "tanh" for op in graph.ops) == 2
+        args = [R.normal(size=(3, 4)).astype(np.float32), R.normal(size=(2, 4, 4)).astype(np.float32) * 0.5]
+        expected = traced.eager(*args)[0]
+        for a, e in zip(interpret(graph, args)[0], olaf.tree_flatten(expected)[0]):
+            np.testing.assert_allclose(a, e, rtol=1e-6)

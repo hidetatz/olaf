@@ -50,7 +50,9 @@ def _paths(params):
 
 
 def lower(graph):
-    return canonicalize(unroll_scans(decompose(graph)))
+    from olaf.pipeline import lower_graph
+
+    return lower_graph(graph)
 
 
 def torch_losses(model, batches, device, mixed=True):

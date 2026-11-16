@@ -50,6 +50,30 @@ def _slice_identity(op, defs):
             return x
 
 
+def _slice_of_concat(op, defs):
+    """A slice that selects exactly one concat operand is that operand.
+
+    Unrolled scans stack each iteration's outputs with concat, and the backward scan slices
+    iteration i back out; without this rule the backward reads a copy, and common
+    subexpression elimination cannot see that it is the forward's value.
+    """
+    inner = defs.get(op.inputs[0]) if op.inputs else None
+    if op.kind != "slice" or inner is None or inner.kind != "concat":
+        return None
+    axis = inner.attr("axis")
+    starts, stops = op.attr("starts"), op.attr("stops")
+    full = all(a == 0 and b == d for i, (a, b, d) in enumerate(zip(starts, stops, op.inputs[0].type.shape)) if i != axis)
+    if not full:
+        return None
+    position = 0
+    for operand in inner.inputs:
+        size = operand.type.shape[axis]
+        if starts[axis] == position and stops[axis] == position + size:
+            return operand
+        position = position + size
+    return None
+
+
 def _pad_identity(op, defs):
     if op.kind == "pad" and all(d == 0 for d in (*op.attr("low"), *op.attr("high"))):
         return op.inputs[0]
@@ -62,6 +86,7 @@ RULES: tuple[Rule, ...] = (
     _permute_of_permute,
     _broadcast_identity,
     _slice_identity,
+    _slice_of_concat,
     _pad_identity,
 )
 

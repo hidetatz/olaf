@@ -27,7 +27,9 @@ def rel(a, b):
 
 
 def lower(graph):
-    return canonicalize(unroll_scans(decompose(graph)))
+    from olaf.pipeline import lower_graph
+
+    return lower_graph(graph)
 
 
 def check(fn, *arrays, specs=None, tol=1e-5):
