@@ -588,6 +588,16 @@ class _Emitter:
             return [self.relabel(args[0], out_t, list(perm))]
         if kind == "broadcast" and (args[0].rebuild is not None or isinstance(args[0].structure, MmaRows)) and not args[0].replicated:
             return [self.lazy_broadcast(args[0], out_t, attrs["dims"])]
+        if kind == "broadcast" and args[0].replicated:
+            # A splat: free in any layout.
+            value = self.make(out_t, self.spread(args[0], out_t))
+            value.rebuild = lambda like, reg=args[0].regs[0]: [reg] * self.n_slots(like)
+            return [value]
+        if kind == "permute" and args[0].rebuild is not None and args[0].coords is None:
+            # Recompute at permuted coordinates instead of exchanging through shared memory; if
+            # nothing reads the registers (a dot that copies its operand from memory), the
+            # recomputation is dead code, where an exchange would leave its stores and barriers.
+            return [self.lazy_permute(args[0], out_t, attrs["perm"])]
         if kind in ("broadcast", "permute"):
             return [self.exchange(op, self.cyclic(args[0]), out_t)]
         if kind in ("cmp", "where") or (kind not in ("full", "dim", "iota", "cast", "reduce", "dot", "load", "load_indexed", "store", "atomic_add", "atomic_add_indexed", "for")):
@@ -699,8 +709,40 @@ class _Emitter:
             value.rebuild = back
         return value
 
+    def lazy_permute(self, src: _Value, out_t: TileType, perm) -> _Value:
+        def at(like, src=src, perm=perm):
+            source_coords = []
+            for c in self.layout_of(like):
+                sc = [None] * src.type.rank
+                for k, p in enumerate(perm):
+                    sc[p] = c[k]
+                source_coords.append(sc)
+            return src.rebuild(_Value([], False, src.type, source_coords, like.valid, None))
+
+        regs = at(_Value([], self.count(out_t.shape) == 1, out_t))
+        return _Value(regs, self.count(out_t.shape) == 1, out_t, rebuild=at)
+
+    def rows_broadcast_layout(self, rows: MmaRows, out_t: TileType, dims) -> _Value | None:
+        """The accumulator layout a broadcast of MmaRows along a new column axis lands in.
+
+        Built with the same cache key as a unit reshape of the accumulator (relabel), so it is
+        the same layout object as the tiles it will be combined with."""
+        acc = rows.acc
+        new_axes = [k for k in range(out_t.rank) if k not in dims]
+        cols = [k for k in new_axes if out_t.shape[k] == acc.en]
+        if len(cols) != 1 or any(out_t.shape[k] != 1 for k in new_axes if k != cols[0]):
+            return None
+        base = self.coords_cache.get(("mma-acc", acc.em, acc.en, acc.wm, acc.wn, self.threads))
+        if base is None:
+            return None
+        out_row = dims[rows.row_axis]
+        mapping = [0 if k == out_row else 1 if k == cols[0] else None for k in range(out_t.rank)]
+        template = _Value([], False, TileType((acc.em, acc.en), out_t.dtype), base, None, MmaAcc(acc.em, acc.en, acc.wm, acc.wn, 0, 1, 2))
+        return self.relabel(template, out_t, mapping)
+
     def lazy_broadcast(self, src: _Value, out_t: TileType, dims) -> _Value:
-        """A broadcast emitted in its consumer's layout (see relayout); cyclic by default."""
+        """A broadcast emitted in its consumer's layout (see relayout); cyclic by default, except
+        that rows of an accumulator land in the accumulator's layout (register-local)."""
 
         def at(like, src=src, dims=dims):
             if isinstance(src.structure, MmaRows) and isinstance(like.structure, MmaAcc) and like.structure == _acc_like(src.structure, like.structure):
@@ -711,6 +753,11 @@ class _Emitter:
             source_coords = [[c[d] if src.type.shape[i] != 1 else self.i32(0) for i, d in enumerate(dims)] for c in self.layout_of(like)]
             return src.rebuild(_Value([], False, src.type, source_coords, like.valid, None))
 
+        if isinstance(src.structure, MmaRows):
+            target = self.rows_broadcast_layout(src.structure, out_t, dims)
+            if target is not None:
+                regs = at(target)
+                return _Value(regs, False, out_t, target.coords, None, target.structure, rebuild=at)
         regs = at(_Value([], self.count(out_t.shape) == 1, out_t))
         return _Value(regs, self.count(out_t.shape) == 1, out_t, rebuild=at)
 
