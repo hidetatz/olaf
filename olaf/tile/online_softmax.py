@@ -51,6 +51,11 @@ from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, T
 
 BLOCK = 64  # rows of x and of y per tile; with 64-wide heads the five dots stay within registers
 WARPS = 4
+# Rows and warps of the tasks that loop over columns with one accumulator (forward, dQ). 128 rows
+# with 8 warps was measured slower on the RTX 3060 (forward 7.7 -> 10.6 ms, dQ 14.0 -> 18.9 ms
+# per step for GPT-2 small), so these stay at 64 and 4.
+FORWARD_ROWS = 64
+FORWARD_WARPS = 4
 
 
 @dataclass
@@ -603,8 +608,9 @@ def _causal_offset(p: _Program, f: _Forward) -> int | None:
 class _Builder:
     """Shared pieces of the fused forward and backward tasks."""
 
-    def __init__(self, p: _Program, f: _Forward) -> None:
+    def __init__(self, p: _Program, f: _Forward, rows: int = BLOCK, cols: int = BLOCK) -> None:
         self.p, self.f = p, f
+        self.rows, self.cols = rows, cols  # tile of the row label (x) and of the column label (y)
         c1 = f.c1
         self.rank = len(c1.out)
         self.labels = f.labels
@@ -614,30 +620,30 @@ class _Builder:
         self.causal = _causal_offset(p, f)
 
     def col_end(self, b: TileBuilder, row_start: TValue) -> TValue:
-        """End of the column loop for rows [row_start, row_start + BLOCK)."""
+        """End of the column loop for rows [row_start, row_start + rows)."""
         end = b.dim(self.shape[self.labels["col"]])
         if self.causal is None:
             return end
-        last = b.op("add", row_start, b.index(BLOCK + self.causal))
+        last = b.op("add", row_start, b.index(self.rows + self.causal))
         return b.op("min", end, last)
 
     def row_begin(self, b: TileBuilder, col_start: TValue) -> TValue:
-        """Start of the row loop for columns [col_start, col_start + BLOCK) (a multiple of BLOCK)."""
+        """Start of the row loop for columns [col_start, col_start + cols) (a multiple of rows)."""
         if self.causal is None:
             return b.index(0)
         first = b.op("sub", col_start, b.index(self.causal))
-        return b.op("mul", b.op("floordiv", first, b.index(BLOCK)), b.index(BLOCK))
+        return b.op("mul", b.op("floordiv", first, b.index(self.rows)), b.index(self.rows))
 
     def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None) -> tuple[TValue, TValue, list[TValue]]:
-        """X tile (rank-d, 1..1 x BLOCK x BLOCK) for the query and key tiles at these starts."""
+        """X tile (rank-d, 1..1 x rows x cols) for the query and key tiles at these starts."""
         b, f, lab = t.b, self.f, self.labels
         row, col, s = lab["row"], lab["col"], lab["sum"]
-        ext = {x: 1 for x in self.batch} | {row: BLOCK, col: BLOCK, s: self.head}
+        ext = {x: 1 for x in self.batch} | {row: self.rows, col: self.cols, s: self.head}
         starts = {**q_starts, **k_starts, s: b.index(0)}
         a = q_tile if q_tile is not None else _operand(t, f.c1, 0, starts, ext, row, s)
         k = _operand(t, f.c1, 1, starts, ext, s, col)
-        dot = b.op("dot", a, k, b.full((BLOCK, BLOCK), 0, DType.f32))
-        tile = tuple([1] * len(self.batch) + [BLOCK, BLOCK])
+        dot = b.op("dot", a, k, b.full((self.rows, self.cols), 0, DType.f32))
+        tile = tuple([1] * len(self.batch) + [self.rows, self.cols])
         s4 = b.op("reshape", dot, shape=tile)
         coords = [starts[x] for x in f.c1.out]
         x = s4 if f.t1 is None else _replay(t, self.p, f.t1, {f.s_arg_t1: s4}, tile, coords)
@@ -656,8 +662,9 @@ class _Builder:
         b = t.b
         pids = [TValue(TileType((), INDEX)) for _ in range(len(self.batch) + 1)]
         starts = {x: pid for x, pid in zip(self.batch, pids)}
-        starts[tiled] = b.op("mul", pids[-1], b.index(BLOCK))
-        grid = [self.shape[x] for x in self.batch] + [_ceil(self.shape[tiled], BLOCK)]
+        block = self.rows if tiled == self.labels["row"] else self.cols
+        starts[tiled] = b.op("mul", pids[-1], b.index(block))
+        grid = [self.shape[x] for x in self.batch] + [_ceil(self.shape[tiled], block)]
         return pids, starts, grid
 
 
@@ -668,20 +675,20 @@ def _ceil(d: Dim, t: int) -> Dim:
 def _forward_task(p: _Program, f: _Forward, write_stats: bool) -> Launch:
     from olaf.tile.online_softmax_backward import VALUE, _letter, _local
 
-    g = _Builder(p, f)
+    g = _Builder(p, f, rows=FORWARD_ROWS, cols=BLOCK)
     t = _Task()
     b = t.b
     lab = f.labels
     row, col = lab["row"], lab["col"]
     m2 = c2_mapping(f)
-    ext_v = {x: 1 for x in g.batch} | {col: BLOCK, VALUE: g.value_size}
+    ext_v = {x: 1 for x in g.batch} | {col: g.cols, VALUE: g.value_size}
     pids, q_starts, grid = g.pids(t, row)
-    rows_tile = tuple([1] * len(g.batch) + [BLOCK])
-    ext = {x: 1 for x in g.batch} | {row: BLOCK, col: BLOCK, lab["sum"]: g.head}
+    rows_tile = tuple([1] * len(g.batch) + [g.rows])
+    ext = {x: 1 for x in g.batch} | {row: g.rows, col: g.cols, lab["sum"]: g.head}
     q_tile = _operand(t, f.c1, 0, {**q_starts, lab["sum"]: b.index(0)}, ext, row, lab["sum"])
     m0 = b.full(rows_tile, float("-inf"), DType.f32)
     l0 = b.full(rows_tile, 0.0, DType.f32)
-    acc0 = b.full((BLOCK, g.value_size), 0.0, DType.f32)
+    acc0 = b.full((g.rows, g.value_size), 0.0, DType.f32)
     rank = g.rank
     t5_value, t5_producers = _value_of(p.launch(f.t5).task, "store")
     rounding = t5_producers[t5_value] if t5_producers[t5_value].kind == "cast" else None
@@ -702,30 +709,30 @@ def _forward_task(p: _Program, f: _Forward, write_stats: bool) -> Launch:
         c = inner.op("reshape", c, shape=rows_tile)
         l_new = inner.op("add", inner.op("mul", l, c), inner.op("reduce", e, fn="sum", axes=(rank - 1,)))
         pe = e if rounding is None else inner.op("cast", inner.op("cast", e, dtype=rounding.attr("dtype")), dtype=DType.f32)
-        p2 = inner.op("reshape", pe, shape=(BLOCK, BLOCK))
+        p2 = inner.op("reshape", pe, shape=(g.rows, g.cols))
         v_starts = _local(m2, {**q_starts, col: k0, VALUE: inner.index(0)})
         v = _operand(t, f.c2, f.v_operand, v_starts, _local(m2, ext_v), _letter(m2, col), _letter(m2, VALUE))
-        scale = inner.op("broadcast", inner.op("reshape", c, shape=(BLOCK,)), shape=(BLOCK, g.value_size), dims=(0,))
+        scale = inner.op("broadcast", inner.op("reshape", c, shape=(g.rows,)), shape=(g.rows, g.value_size), dims=(0,))
         acc_new = inner.op("dot", p2, v, inner.op("mul", acc, scale))
         return [m_new, l_new, acc_new]
 
-    m, l, acc = b.for_range(b.index(0), g.col_end(b, q_starts[row]), BLOCK, [m0, l0, acc0], body)
+    m, l, acc = b.for_range(b.index(0), g.col_end(b, q_starts[row]), g.cols, [m0, l0, acc0], body)
     t.b = b
     # O = acc / G(l, m): G is T5's divisor, replayed on the final statistics.
     coords = [q_starts.get(x, b.index(0)) for x in f.c1.out]
     row_tile = rows_tile + (1,)
     subs = {**{a: b.op("reshape", m, shape=row_tile) for a in f.m_arg_t5}, **{a: b.op("reshape", l, shape=row_tile) for a in f.l_arg_t5}, f.e_arg_t5: b.full(row_tile, 1.0, DType.f32)}
     divisor = _replay(t, p, f.t5, subs, row_tile, coords, target=division.inputs[1])
-    out = b.op("div", acc, b.op("broadcast", b.op("reshape", divisor, shape=(BLOCK,)), shape=(BLOCK, g.value_size), dims=(0,)))
+    out = b.op("div", acc, b.op("broadcast", b.op("reshape", divisor, shape=(g.rows,)), shape=(g.rows, g.value_size), dims=(0,)))
     c2 = f.c2
     o_starts = _local(m2, {**q_starts, VALUE: b.index(0)})
     out_arg = c2.launch.task.args[c2.out_arg]
-    _store(t, c2.output, out_arg.view, out_arg.dtype, c2.out, out, _letter(m2, row), _letter(m2, VALUE), o_starts, _local(m2, ext_v | {row: BLOCK}))
+    _store(t, c2.output, out_arg.view, out_arg.dtype, c2.out, out, _letter(m2, row), _letter(m2, VALUE), o_starts, _local(m2, ext_v | {row: g.rows}))
     if write_stats:
         for name, stat in ((p.written(f.rmax), m), (p.written(f.rsum), l)):
             buffer = p.buffers[name]
             b.emit("store", (stat, *(q_starts[x] for x in f.c1.out[:-1])), {"arg": t.arg(name, full_view(buffer.type.shape), buffer.type.dtype, True)})
-    return t.finish("attention", grid, pids, ("attention",))
+    return t.finish("attention", grid, pids, ("attention",), warps=FORWARD_WARPS)
 
 
 def fuse_online_softmax(program: Program) -> Program:

@@ -87,27 +87,32 @@ def _local(mapping: dict, values: dict) -> dict:
 
 
 def backward_tasks(p, f, back, g) -> list[Launch]:
-    from olaf.tile.online_softmax import BLOCK, _operand, _spread, _store, _Task, _replay
+    from olaf.tile.online_softmax import BLOCK, FORWARD_ROWS, FORWARD_WARPS, _Builder, _operand, _replay, _spread, _store, _Task
 
     maps = mappings(f, back)
     lab = f.labels
     batch = list(lab["batch"])
     row, col, s = lab["row"], lab["col"], lab["sum"]
     rank = g.rank
-    rows_tile = tuple([1] * len(batch) + [BLOCK])
     c3, m3 = back.c3, maps["c3"]
-    ext = {x: 1 for x in batch} | {row: BLOCK, col: BLOCK, s: g.head, VALUE: g.value_size}
+
+    def extents(g):
+        return {x: 1 for x in batch} | {row: g.rows, col: g.cols, s: g.head, VALUE: g.value_size}
+
+    def rows_tile(g):
+        return tuple([1] * len(batch) + [g.rows])
     m_name, l_name = p.written(f.rmax), p.written(f.rsum)
     d_name = p.written(back.rd)
     d_buffer = p.buffers[d_name]
 
-    def stat(t, name, starts):
+    def stat(t, g, name, starts):
         buffer = p.buffers[name]
-        return t.load(name, full_view(buffer.type.shape), buffer.type.dtype, [starts[x] for x in batch + [row]], rows_tile)
+        return t.load(name, full_view(buffer.type.shape), buffer.type.dtype, [starts[x] for x in batch + [row]], rows_tile(g))
 
     # D = rowsum(dO * O): one tile of rows per instance.
     t = _Task()
     b = t.b
+    ext = extents(g)
     pids, starts, grid = g.pids(t, row)
     starts[VALUE] = b.index(0)
     d_o = _operand(t, c3, back.do_operand_c3, _local(m3, starts), _local(m3, ext), _letter(m3, row), _letter(m3, VALUE))
@@ -115,23 +120,23 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     o_names = dict(zip(c2.out, [*f.c1.out[:-1], VALUE]))
     out_arg = c2.launch.task.args[c2.out_arg]
     o = t.load(c2.output, out_arg.view, out_arg.dtype, [starts[o_names[x]] for x in c2.out], [ext[o_names[x]] for x in c2.out])
-    o = b.op("reshape", o, shape=(BLOCK, g.value_size))
+    o = b.op("reshape", o, shape=(g.rows, g.value_size))
     d = b.op("reduce", b.op("mul", d_o, o), fn="sum", axes=(1,))
-    b.emit("store", (b.op("reshape", d, shape=rows_tile), *(starts[x] for x in batch + [row])), {"arg": t.arg(d_name, full_view(d_buffer.type.shape), d_buffer.type.dtype, True)})
+    b.emit("store", (b.op("reshape", d, shape=rows_tile(g)), *(starts[x] for x in batch + [row])), {"arg": t.arg(d_name, full_view(d_buffer.type.shape), d_buffer.type.dtype, True)})
     d_task = t.finish("attention_d", grid, pids, ("attention_d",))
 
-    def inner_step(t: _Task, starts: dict):
+    def inner_step(t: _Task, g, starts: dict):
         """Shared by both tasks: X, P (exact), dO, dP and dS for one (row tile, col tile)."""
         b = t.b
         x, q2d, coords = g.scores(t, {k: starts[k] for k in batch + [row]}, {col: starts[col]})
-        m_rows, l_rows = stat(t, m_name, starts), stat(t, l_name, starts)
+        m_rows, l_rows = stat(t, g, m_name, starts), stat(t, g, l_name, starts)
         prob = g.p_exact(t, x, coords, m_rows, l_rows)
         local3 = _local(m3, {**starts, VALUE: b.index(0), s: b.index(0)})
-        e3 = _local(m3, ext)
+        e3 = _local(m3, extents(g))
         d_o = _operand(t, c3, back.do_operand_c3, local3, e3, _letter(m3, row), _letter(m3, VALUE))
         v_t = _operand(t, c3, 1 - back.do_operand_c3, local3, e3, _letter(m3, VALUE), _letter(m3, col))
-        dp = b.op("reshape", b.op("dot", d_o, v_t, b.full((BLOCK, BLOCK), 0, DType.f32)), shape=x.type.shape)
-        d_rows = stat(t, d_name, starts)
+        dp = b.op("reshape", b.op("dot", d_o, v_t, b.full((g.rows, g.cols), 0, DType.f32)), shape=x.type.shape)
+        d_rows = stat(t, g, d_name, starts)
         tile = x.type.shape
         subs = {back.p_arg_t9: prob, back.dp_arg_t9: dp, **{a: _spread(b, d_rows, tile) for a in back.d_arg_t9}}
         ds = _replay(t, p, back.t9, subs, tile, coords)
@@ -147,41 +152,44 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
                 inside = b.op("cmp", coord, b.op("broadcast", b.dim(size), shape=tile, dims=()), fn="lt")
                 v = b.op("where", inside, v, zero)
             v = v if v.type.dtype is DType.f32 else b.op("cast", v, dtype=DType.f32)
-            return b.op("reshape", v, shape=(BLOCK, BLOCK))
+            return b.op("reshape", v, shape=(g.rows, g.cols))
 
         return widen(prob), widen(ds), d_o, q2d
 
-    def store(t, contract, mapping, value, rows_name, cols_name, starts):
+    def store(t, g, contract, mapping, value, rows_name, cols_name, starts):
         arg = contract.launch.task.args[contract.out_arg]
         local = _local(mapping, starts)
-        _store(t, contract.output, arg.view, arg.dtype, contract.out, value, _letter(mapping, rows_name), _letter(mapping, cols_name), local, _local(mapping, ext))
+        _store(t, contract.output, arg.view, arg.dtype, contract.out, value, _letter(mapping, rows_name), _letter(mapping, cols_name), local, _local(mapping, extents(g)))
 
-    # dK and dV: one tile of columns per instance, looping over rows.
+    # dK and dV: one tile of columns per instance, looping over rows. 64 x 64 tiles: this task
+    # holds two accumulators and four score-sized tiles per iteration.
+    g = _Builder(p, f, rows=BLOCK, cols=BLOCK)
     t = _Task()
     b = t.b
     pids, starts, grid = g.pids(t, col)
     starts.update({s: b.index(0), VALUE: b.index(0)})
-    zeros_k = b.full((BLOCK, g.head), 0.0, DType.f32)
-    zeros_v = b.full((BLOCK, g.value_size), 0.0, DType.f32)
+    zeros_k = b.full((g.cols, g.head), 0.0, DType.f32)
+    zeros_v = b.full((g.cols, g.value_size), 0.0, DType.f32)
 
     def kv_body(inner: TileBuilder, r0, carries):
         t.b = inner
         dk, dv = carries
-        prob, ds, d_o, q2d = inner_step(t, {**starts, row: r0})
+        prob, ds, d_o, q2d = inner_step(t, g, {**starts, row: r0})
         dv = inner.op("dot", inner.op("permute", prob, perm=(1, 0)), d_o, dv)
         dk = inner.op("dot", inner.op("permute", ds, perm=(1, 0)), q2d, dk)
         return [dk, dv]
 
-    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), BLOCK, [zeros_k, zeros_v], kv_body)
+    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body)
     t.b = b
-    store(t, back.dk, maps["dk"], dk, col, s, starts)
-    store(t, back.dv, maps["dv"], dv, col, VALUE, starts)
+    store(t, g, back.dk, maps["dk"], dk, col, s, starts)
+    store(t, g, back.dv, maps["dv"], dv, col, VALUE, starts)
     # 8 warps: this task holds two accumulators and four score-sized tiles per iteration, and
     # with 4 warps (32 registers per tile per thread) it spills. Nothing here needs warps
     # stacked along rows (its dots take operands from memory or staged accumulators).
     kv_task = t.finish("attention_dkv", grid, pids, ("attention_dkv",), warps=8)
 
-    # dQ: one tile of rows per instance, looping over columns.
+    # dQ: one tile of rows per instance, looping over columns (one accumulator: 128 rows).
+    g = _Builder(p, f, rows=FORWARD_ROWS, cols=BLOCK)
     t = _Task()
     b = t.b
     pids, starts, grid = g.pids(t, row)
@@ -190,14 +198,14 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     def q_body(inner: TileBuilder, c0, carries):
         t.b = inner
         (dq,) = carries
-        _, ds, _, _ = inner_step(t, {**starts, col: c0})
-        k2d = _operand(t, f.c1, 1, {**{x: starts[x] for x in batch}, col: c0, s: inner.index(0)}, ext, col, s)
+        _, ds, _, _ = inner_step(t, g, {**starts, col: c0})
+        k2d = _operand(t, f.c1, 1, {**{x: starts[x] for x in batch}, col: c0, s: inner.index(0)}, extents(g), col, s)
         return [inner.op("dot", ds, k2d, dq)]
 
-    (dq,) = b.for_range(b.index(0), g.col_end(b, starts[row]), BLOCK, [b.full((BLOCK, g.head), 0.0, DType.f32)], q_body)
+    (dq,) = b.for_range(b.index(0), g.col_end(b, starts[row]), g.cols, [b.full((g.rows, g.head), 0.0, DType.f32)], q_body)
     t.b = b
-    store(t, back.dq, maps["dq"], dq, row, s, starts)
-    q_task = t.finish("attention_dq", grid, pids, ("attention_dq",))
+    store(t, g, back.dq, maps["dq"], dq, row, s, starts)
+    q_task = t.finish("attention_dq", grid, pids, ("attention_dq",), warps=FORWARD_WARPS)
     return [d_task, kv_task, q_task]
 
 
