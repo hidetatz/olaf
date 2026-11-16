@@ -29,6 +29,10 @@ ELEMENTWISE_ELEMENTS = 1024
 # thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
 # chunk x 128 values (32 per thread).
 ROW_REDUCE_BLOCK = 1024
+# A split reduction aims at up to this many blocks per compute unit. More (16) was measured no
+# faster for GPT-2's bias gradients: those column sums are limited by per-element address and
+# mask arithmetic in the lowering, not by parallelism.
+SPLIT_BLOCKS_PER_UNIT = 4
 COLUMN_REDUCE_BLOCK = 32
 DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions
 # With a 16x8x16 matrix instruction: 128x128 output tiles over 8 warps (64x32 per warp) and a
@@ -385,7 +389,7 @@ class _Converter:
             return None
         axis = max(axes, key=lambda a: shape[a])
         parts = 1
-        while blocks * parts * 2 <= 4 * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
+        while blocks * parts * 2 <= SPLIT_BLOCKS_PER_UNIT * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
             parts *= 2
         return (axis, parts) if parts > 1 else None
 
