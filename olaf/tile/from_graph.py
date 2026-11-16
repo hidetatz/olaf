@@ -75,6 +75,66 @@ def _neutral(fn: str, dtype: DType) -> float | int:
     return int(np.iinfo(dtype.numpy).min)
 
 
+def _reshaped_strides(view: View, shape) -> tuple[int, ...] | None:
+    """Strides that show `view`'s elements in `shape` without copying, or None (as torch.Tensor.view).
+
+    Possible when every group of old axes that merges into, or splits into, new axes is itself
+    contiguous: the head split of a q/k/v slice of the fused qkv projection is (only the last
+    axis, stride 1, splits), and copying it would cost a pass over q, k and v per layer.
+    Static shapes only; the result has no source map (one buffer axis may become several).
+    """
+    old_shape, old_strides = view.shape, view.strides
+    if view.pad is not None or not all(isinstance(d, int) for d in (*old_shape, *old_strides, *shape)):
+        return None
+    old = [(d, st) for d, st in zip(old_shape, old_strides) if d != 1]
+    new = list(shape)
+    out: list[int] = []
+    i = 0
+    j = 0
+    while j < len(new):
+        if new[j] == 1:
+            out.append(0)
+            j += 1
+            continue
+        if i >= len(old):
+            return None
+        # Take old axes until their product covers the next run of new axes.
+        group = [old[i]]
+        size = old[i][0]
+        i += 1
+        run = [j]
+        total = new[j]
+        j += 1
+        while size != total:
+            if size < total:
+                if i >= len(old):
+                    return None
+                group.append(old[i])
+                size *= old[i][0]
+                i += 1
+            else:
+                while j < len(new) and new[j] == 1:
+                    run.append(j)
+                    j += 1
+                if j >= len(new):
+                    return None
+                run.append(j)
+                total *= new[j]
+                j += 1
+        for (d0, s0), (d1, s1) in zip(group, group[1:]):
+            if s0 != d1 * s1:
+                return None  # the merged old axes are not contiguous with each other
+        stride = group[-1][1]
+        run_strides = {}
+        for k in reversed(run):
+            run_strides[k] = stride if new[k] != 1 else 0
+            stride *= new[k]
+        out.extend(run_strides[k] for k in run)
+    if i != len(old):
+        return None
+    return tuple(out)
+
+
 def _shifted(source, axis: int, delta: Dim):
     """Source map after view axis `axis` is shifted so that new index = old index - delta."""
     if source is None:
@@ -219,6 +279,9 @@ class _Converter:
         if shape == ref.shape:
             return ref
         if not ref.view.is_contiguous:
+            strides = _reshaped_strides(ref.view, shape)
+            if strides is not None:
+                return replace(ref, view=View(tuple(shape), strides, ref.view.offset))
             ref = self.materialize(ref)
         return replace(ref, view=View(shape, contiguous_strides(shape), ref.view.offset))
 

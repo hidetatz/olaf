@@ -399,3 +399,27 @@ def test_epilogue_fusion_absorbs_elementwise_after_a_dot():
     after = fuse_epilogues(before)
     assert len(after.launches) == 1 < len(before.launches)
     assert rel(run_program(after, [x, w, bias])[0][0], interpret(graph, [x, w, bias])[0][0]) < 1e-5
+
+
+def test_reshape_of_strided_views_stays_a_view():
+    # The q/k/v slices of a fused projection split into heads without a copy.
+    def fn(x):
+        q = olaf.reshape(x[:, 4:8], (6, 2, 2))
+        return q * 2.0
+
+    x = R.normal(size=(6, 12)).astype(np.float32)
+    graph = lower(olaf.trace(fn, tt(6, 12)).graph)
+    program = to_tile(graph)
+    assert [launch.task.name for launch in program.launches] == ["mul"]
+    assert rel(run_program(program, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-7
+
+
+def test_epilogue_through_a_permuted_read():
+    from olaf.tile.fuse import fuse_epilogues
+
+    a, b = R.normal(size=(2, 6, 8)).astype(np.float32), R.normal(size=(2, 8, 4)).astype(np.float32)
+    graph = lower(olaf.trace(lambda x, y: olaf.transpose(olaf.einsum("bij,bjk->bik", x, y), 1, 2) * 3.0, tt(2, 6, 8), tt(2, 8, 4)).graph)
+    before = fuse(to_tile(graph))
+    after = fuse_epilogues(before)
+    assert len(after.launches) == 1 < len(before.launches)
+    assert rel(run_program(after, [a, b])[0][0], interpret(graph, [a, b])[0][0]) < 1e-5

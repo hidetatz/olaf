@@ -352,7 +352,7 @@ def _without_dead(program: Program, launches: list[Launch]) -> Program:
     return replace(program, buffers=buffers, launches=tuple(kept))
 
 
-def fuse_epilogues(program: Program) -> Program:
+def fuse_epilogues(program: Program, *, shared_cheap_only: bool = False) -> Program:
     """Absorb a dot task's only consumer, when pointwise, into the dot's epilogue.
 
     Producer inlining (fuse) cannot move a dot into its consumer, so a linear layer's output
@@ -363,6 +363,11 @@ def fuse_epilogues(program: Program) -> Program:
     Conditions: the dot's output is a temp written only by it through its full view and read
     only by the consumer, through its full view; the consumer writes a buffer of the same shape
     through its full view (so both tasks share one coordinate system).
+
+    shared_cheap_only: absorb only cheap consumers whose output has several readers. Run before
+    producer fusion, this keeps a bias add from being duplicated into each of its readers (each
+    then materializing its own copy), without hiding from later passes the structure they match
+    (the attention pass looks for the masking step after the score dot).
     """
     changed = True
     while changed:
@@ -375,41 +380,78 @@ def fuse_epilogues(program: Program) -> Program:
                 (writers if arg.writes else readers).setdefault(name, []).append(i)
         launches = list(program.launches)
         for i, launch in enumerate(launches):
-            if launch is None or not launch.task.origin or launch.task.origin[0] != "contract" or launch.offsets:
+            origin = launch.task.origin if launch is not None else ()
+            if launch is None or not origin or not (origin[0] == "contract" or origin[0].startswith("attention")) or launch.offsets:
                 continue
-            stores = [op for op in launch.task.body.ops if op.kind == "store"]
-            if len(stores) != 1:
-                continue
-            out = launch.buffers[stores[0].attr("arg")]
-            buffer = buffers[out]
-            if buffer.kind is not BufferKind.temp or writers.get(out) != [i] or len(readers.get(out, [])) != 1:
-                continue
-            j = readers[out][0]
-            consumer = launches[j]
-            if consumer is None or consumer.offsets or j < i:
-                continue
-            info = _pointwise(consumer, buffers)
-            if info is None:
-                continue
-            reads = [a for a, (n, arg) in enumerate(zip(consumer.buffers, consumer.task.args)) if n == out]
-            if len(reads) != 1 or consumer.task.args[reads[0]].view != full_view(buffer.type.shape):
-                continue
-            target = consumer.buffers[info.store.attr("arg")]
-            if buffers[target].type.shape != buffer.type.shape or launch.task.args[stores[0].attr("arg")].view != full_view(buffer.type.shape):
-                continue
-            # The consumer's other inputs must be ready when the dot runs.
-            others = {n for n, a in zip(consumer.buffers, consumer.task.args) if not a.writes and n != out}
-            if any(w > i for n in others for w in writers.get(n, [])):
-                continue
-            launches[i] = _absorb(launch, stores[0], consumer, info, reads[0])
-            launches[j] = None
-            changed = True
+            for store in [op for op in launch.task.body.ops if op.kind == "store"]:
+                absorbed = _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only)
+                if absorbed is not None:
+                    launches[i], j = absorbed
+                    launches[j] = None
+                    changed = True
+                    break
         program = replace(program, launches=tuple(l for l in launches if l is not None))
     used = {n for launch in program.launches for n in launch.buffers} | set(program.inputs) | set(program.outputs)
     return replace(program, buffers=tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp))
 
 
-def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int) -> Launch:
+def _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only):
+    """(new launch i, absorbed launch index) when launch i's `store` can take its consumer."""
+    launch = launches[i]
+    out = launch.buffers[store.attr("arg")]
+    buffer = buffers[out]
+    if buffer.kind is not BufferKind.temp or writers.get(out) != [i] or len(readers.get(out, [])) != 1:
+        return None
+    j = readers[out][0]
+    consumer = launches[j]
+    if consumer is None or consumer.offsets or j < i:
+        return None
+    info = _pointwise(consumer, buffers)
+    if info is None:
+        return None
+    if shared_cheap_only:
+        consumer_out = consumer.buffers[info.store.attr("arg")]
+        if info.cost > CHEAP_OPS or len(readers.get(consumer_out, [])) < 2:
+            return None
+    reads = [a for a, (n, arg) in enumerate(zip(consumer.buffers, consumer.task.args)) if n == out]
+    if len(reads) != 1 or launch.task.args[store.attr("arg")].view != full_view(buffer.type.shape):
+        return None
+    # The consumer reads the output whole, possibly with its axes permuted: perm[j] is
+    # the consumer axis of buffer axis j. Its other views and its output are permuted the
+    # same way, so the consumer can be evaluated on the producer's tile.
+    perm = _permutation(consumer.task.args[reads[0]].view, buffer.type.shape)
+    if perm is None:
+        return None
+    target = consumer.buffers[info.store.attr("arg")]
+    if tuple(buffers[target].type.shape[perm[j]] for j in range(len(perm))) != buffer.type.shape:
+        return None
+    # The consumer's other inputs must be ready when the producer runs.
+    others = {n for n, a in zip(consumer.buffers, consumer.task.args) if not a.writes and n != out}
+    if any(w > i for n in others for w in writers.get(n, [])):
+        return None
+    return _absorb(launch, store, consumer, info, reads[0], perm), j
+
+
+def _permutation(view: View, shape) -> list[int] | None:
+    """perm with view axis perm[j] = buffer axis j, when the view is the whole buffer permuted."""
+    if view.pad is not None or view.source is None or len(view.source) != len(shape) or view.rank != len(shape):
+        return None
+    perm = []
+    for j, (axis, start) in enumerate(view.source):
+        if axis is None or start != 0 or view.shape[axis] != shape[j]:
+            return None
+        perm.append(axis)
+    return perm if sorted(perm) == list(range(len(shape))) else None
+
+
+def _permuted(view: View, perm: list[int]) -> View:
+    """A consumer view re-indexed by producer axes: producer axis j is consumer axis perm[j]."""
+    pad = tuple(view.pad[a] for a in perm) if view.pad is not None else None
+    source = tuple((None if a is None else perm.index(a), s) for a, s in view.source) if view.source is not None else None
+    return View(tuple(view.shape[a] for a in perm), tuple(view.strides[a] for a in perm), view.offset, pad, view.fill, source)
+
+
+def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int, perm: list[int]) -> Launch:
     task = launch.task
     args: list[tuple[str, Arg]] = [(n, a) for n, a in zip(launch.buffers, task.args)]
 
@@ -435,9 +477,11 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
                 out = value
             else:
                 arg = consumer.task.args[a]
-                out = b.op("load", *starts, arg=arg_index(consumer.buffers[a], arg), shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
+                moved = replace(arg, view=_permuted(arg.view, perm))
+                out = b.op("load", *starts, arg=arg_index(consumer.buffers[a], moved), shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
         elif op.kind == "iota":
-            out = b.op("iota", starts[info.starts.index(op.inputs[0])], shape=tile, axis=op.attr("axis"))
+            axis = perm.index(op.attr("axis"))
+            out = b.op("iota", starts[axis], shape=tile, axis=axis)
         elif op.kind in ("full", "broadcast") and op.outputs[0].type.shape == p_tile and p_tile != ():
             out = b.op(op.kind, *ins, **{**dict(op.attrs), "shape": tile})
         else:
@@ -445,7 +489,8 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
         mapped[op.outputs[0]] = out
     result = mapped[info.store.inputs[0]]
     target = consumer.buffers[info.store.attr("arg")]
-    b.emit("store", (result, *starts), {"arg": arg_index(target, consumer.task.args[info.store.attr("arg")])})
+    target_arg = consumer.task.args[info.store.attr("arg")]
+    b.emit("store", (result, *starts), {"arg": arg_index(target, replace(target_arg, view=_permuted(target_arg.view, perm)))})
     body = Body(task.body.params, tuple(b.ops), task.body.results)
     used = sorted({op.attr("arg") for op in _walk(body) if op.kind in _MEMORY})
     remap = {old: new for new, old in enumerate(used)}

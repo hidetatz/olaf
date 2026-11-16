@@ -24,5 +24,8 @@ def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True
     """graph must be the output of lower_graph."""
     program = to_tile(graph, capability)
     if fused:
+        # Epilogues first as well: a cheap consumer of a dot (a bias add) read by several tasks
+        # would otherwise be duplicated into each of them, each materializing its own copy.
+        program = fuse_epilogues(program, shared_cheap_only=True)
         program = eliminate_copies(fuse_epilogues(fuse_online_softmax(fuse(program))))
     return hoist_offsets(align_rows(program))
