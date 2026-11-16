@@ -91,7 +91,8 @@ def _reduction(program: Program, index: int, shape) -> dict | None:
 
 
 def _statistics(program, buffers, writers, launch: Launch, shape) -> dict:
-    """buffer -> reduction parts, for the row statistics P reads (recursively), or {} if any fails."""
+    """buffer -> reduction parts, for the row statistics P reads (recursively) that row reductions
+    produce; statistics written otherwise stay ordinary inputs."""
     rank = len(shape)
     found: dict[str, dict] = {}
     pending = [launch]
@@ -101,13 +102,11 @@ def _statistics(program, buffers, writers, launch: Launch, shape) -> dict:
             if arg.writes or name in found or buffers[name].type.rank != rank - 1 or not _row_view(arg.view, rank):
                 continue
             if buffers[name].type.shape != tuple(shape[:-1]):
-                return {}
+                continue
             w = writers.get(name, [])
-            if len(w) != 1 or buffers[name].kind is not BufferKind.temp:
-                return {}
-            parts = _reduction(program, w[0], shape)
+            parts = _reduction(program, w[0], shape) if len(w) == 1 and buffers[name].kind is BufferKind.temp else None
             if parts is None:
-                return {}
+                continue  # computed elsewhere (another fused task, an input): read it as it is
             found[name] = parts
             pending.append(parts["launch"])
     return found
