@@ -383,3 +383,19 @@ def test_copies_into_state_and_outputs_are_eliminated():
     for a, e in zip(got, want):
         assert rel(a, e) < 1e-6
     assert rel(got_state["w"], want_state["w"]) < 1e-6
+
+
+def test_epilogue_fusion_absorbs_elementwise_after_a_dot():
+    from olaf.tile.fuse import fuse_epilogues
+
+    x, w = R.normal(size=(6, 40)).astype(np.float32), R.normal(size=(40, 24)).astype(np.float32)
+    bias = R.normal(size=(24,)).astype(np.float32)
+
+    def fn(a, b, c):
+        return olaf.tanh(a @ b + olaf.broadcast_to(c, (6, 24))) * 2.0
+
+    graph = lower(olaf.trace(fn, tt(6, 40), tt(40, 24), tt(24)).graph)
+    before = fuse(to_tile(graph))
+    after = fuse_epilogues(before)
+    assert len(after.launches) == 1 < len(before.launches)
+    assert rel(run_program(after, [x, w, bias])[0][0], interpret(graph, [x, w, bias])[0][0]) < 1e-5
