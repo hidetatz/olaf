@@ -443,3 +443,32 @@ def test_row_fusion_merges_layernorm(backward):
     assert any(launch.task.name == "rows" for launch in after.launches)
     assert len(after.launches) < len(before.launches)
     assert rel(run_program(after, [x, w, bias])[0][0], interpret(graph, [x, w, bias])[0][0]) < 1e-5
+
+
+def test_sibling_fusion_shares_loads_between_outputs():
+    from olaf.pipeline import to_program
+
+    m_state = olaf.state("m", tt(4, 300))
+    v_state = olaf.state("v", tt(4, 300))
+    p_state = olaf.state("p", tt(4, 300))
+
+    def fn(g):
+        m = m_state.read() * 0.9 + g * 0.1
+        v = v_state.read() * 0.99 + g * g * 0.01
+        m_state.write(m)
+        v_state.write(v)
+        p_state.write(p_state.read() - olaf.exp(m) / (olaf.sqrt(v) + 1e-8))
+        return olaf.sum(g)
+
+    graph = lower(olaf.trace(fn, tt(4, 300)).graph)
+    program = to_program(graph)
+    plain = fuse(to_tile(graph))
+    assert len(program.launches) < len(plain.launches)
+    g = R.normal(size=(4, 300)).astype(np.float32)
+    state = {name: R.normal(size=(4, 300)).astype(np.float32) for name in "mvp"}
+    state["v"] = np.abs(state["v"])
+    got, got_state = run_program(program, [g], state)
+    want, want_state = interpret(graph, [g], state)
+    assert rel(got[0], want[0]) < 1e-6
+    for name in "mvp":
+        assert rel(got_state[name], want_state[name]) < 1e-6

@@ -504,3 +504,86 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
     body = _renumber(body, remap)
     new = Task(task.name, task.grid, tuple(args[k][1] for k in used), body, task.warps, task.origin)
     return Launch(new, tuple(args[k][0] for k in used))
+
+
+def fuse_siblings(program: Program, window: int = 8) -> Program:
+    """Merge pointwise tasks over the same tile grid that read common inputs (horizontal fusion).
+
+    AdamW updates a parameter's moments and the parameter itself in separate tasks, each
+    reading the gradient (the parameter task recomputes the moments from their inputs): 11
+    memory passes where one task needs 7. Merged, every distinct load happens once and every
+    output is stored. A later task B moves to an earlier task A's place, so: B's inputs are all
+    written before A, nothing between them touches B's output, and B does not read A's output.
+    """
+    changed = True
+    while changed:
+        changed = False
+        buffers = {b.name: b for b in program.buffers}
+        launches = list(program.launches)
+        for i, a in enumerate(launches):
+            info_a = _pointwise(a, buffers) if not a.offsets else None
+            if info_a is None or len(launches) <= i + 1:
+                continue
+            for j in range(i + 1, min(len(launches), i + 1 + window)):
+                b = launches[j]
+                info_b = _pointwise(b, buffers) if not b.offsets else None
+                if info_b is None or b.task.grid != a.task.grid or info_b.store.inputs[0].type.shape != info_a.store.inputs[0].type.shape:
+                    continue
+                reads_a = {n for n, x in zip(a.buffers, a.task.args) if not x.writes}
+                reads_b = {n for n, x in zip(b.buffers, b.task.args) if not x.writes}
+                if not reads_a & reads_b:
+                    continue
+                written_between = {n for k in range(i, j) for n, x in zip(launches[k].buffers, launches[k].task.args) if x.writes}
+                b_out = {n for n, x in zip(b.buffers, b.task.args) if x.writes}
+                touched_between = {n for k in range(i + 1, j) for n in launches[k].buffers}
+                if reads_b & written_between or b_out & touched_between:
+                    continue
+                launches[i] = _merge(a, info_a, b, info_b)
+                del launches[j]
+                changed = True
+                break
+            if changed:
+                break
+        program = replace(program, launches=tuple(launches))
+    return program
+
+
+def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Launch:
+    """One task computing both pointwise tasks (same grid and tile), with shared loads."""
+    args: list[tuple[str, Arg]] = []
+
+    def arg_index(name: str, arg: Arg) -> int:
+        key = (name, arg)
+        if key not in args:
+            args.append(key)
+        return args.index(key)
+
+    builder = TileBuilder()
+    params = a.task.body.params
+    loads: dict[tuple, TValue] = {}
+    mapping_a: dict[TValue, TValue] = {}
+    for launch, info, mapping in ((a, info_a, mapping_a), (b, info_b, dict(zip(b.task.body.params, params)))):
+        # b's tile starts are a's (both tasks have the same grid and tile), as a's ops rebuilt here.
+        if launch is b:
+            mapping.update((sb, mapping_a.get(sa, sa)) for sb, sa in zip(info_b.starts, info_a.starts))
+        for op in launch.task.body.ops:
+            if op.outputs and set(op.outputs) <= info.coordinate and launch is b:
+                continue
+            ins = [mapping.get(v, v) for v in op.inputs]
+            if op.kind == "load":
+                arg = launch.task.args[op.attr("arg")]
+                name = launch.buffers[op.attr("arg")]
+                key = (name, arg, tuple(id(v) for v in ins), op.attr("shape"), op.attr("other"))
+                if key not in loads:
+                    loads[key] = builder.op("load", *ins, arg=arg_index(name, arg), shape=op.attr("shape"), dtype=op.attr("dtype"), other=op.attr("other"))
+                mapping[op.outputs[0]] = loads[key]
+                continue
+            if op.kind == "store":
+                arg = launch.task.args[op.attr("arg")]
+                builder.emit("store", tuple(ins), {"arg": arg_index(launch.buffers[op.attr("arg")], arg)})
+                continue
+            outs = builder.emit(op.kind, ins, dict(op.attrs), op.regions)
+            mapping.update(zip(op.outputs, outs))
+    body = Body(params, tuple(builder.ops), ())
+    task = Task(a.task.name, a.task.grid, tuple(x for _, x in args), body, a.task.warps, a.task.origin)
+    return Launch(task, tuple(n for n, _ in args))
