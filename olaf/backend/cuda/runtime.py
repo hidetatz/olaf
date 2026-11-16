@@ -109,13 +109,13 @@ class CudaProgram:
         env = self.bind(inputs, state)
         buffers = self.allocate(env)
         for name, array in zip(self.program.inputs, inputs):
-            buffers[name].upload(to_device_bytes(array, self.program.buffer(name).type.dtype))
+            buffers[name].upload(to_device_bytes(array, self.program.buffer(name).type.dtype), self.stream)
         for b in self.program.buffers:
             if b.kind is BufferKind.constant:
                 data = b.constant.array if b.type.dtype is not DType.bool else b.constant.array.astype(np.uint8)
-                buffers[b.name].upload(np.ascontiguousarray(data))
+                buffers[b.name].upload(np.ascontiguousarray(data), self.stream)
             elif b.kind is BufferKind.state_in:
-                buffers[b.name].upload(to_device_bytes(np.asarray(state[b.state.name]), b.type.dtype))
+                buffers[b.name].upload(to_device_bytes(np.asarray(state[b.state.name]), b.type.dtype), self.stream)
         self.enqueue(buffers, env)
         self.stream.synchronize()
 

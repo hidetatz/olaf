@@ -87,12 +87,26 @@ class DeviceBuffer:
                 pass
             self.ptr = 0
 
-    def upload(self, array: np.ndarray) -> None:
+    def upload(self, array: np.ndarray, stream: Stream | None = None) -> None:
+        """Copy host data in, ordered before later work on `stream`.
+
+        With a stream the copy is stream-ordered. Without one it is a synchronous copy on the
+        legacy stream; the caller must then not launch on a non-blocking stream until the device
+        is synchronized: from pageable memory, cuMemcpyHtoD may return before its DMA lands, and
+        a non-blocking stream does not wait for the legacy stream. (That raced: kernels read
+        partly uploaded inputs, intermittently.) For pageable memory the async copy stages the
+        host data before returning, so the array may be freed right after.
+        """
         array = np.ascontiguousarray(array)
         if array.nbytes != self.nbytes:
             raise ValueError(f"size mismatch: {array.nbytes} bytes for a {self.nbytes}-byte buffer")
-        if self.nbytes:
+        if not self.nbytes:
+            return
+        if stream is not None:
+            check(cu.cuMemcpyHtoDAsync(self.ptr, array.ctypes.data, self.nbytes, stream.handle))
+        else:
             check(cu.cuMemcpyHtoD(self.ptr, array.ctypes.data, self.nbytes))
+            check(cu.cuCtxSynchronize())
 
     def download(self, dtype, shape) -> np.ndarray:
         out = np.empty(shape, dtype)
