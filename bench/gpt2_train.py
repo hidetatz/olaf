@@ -5,7 +5,9 @@ autocast-style compute, AdamW (lr 6e-4, betas 0.9/0.95, weight decay 0.1 on matr
 Each side warms up, then 5 timings of STEPS steps are taken and the medians compared, as
 docs/design.md prescribes. The GPU is shared with the display: run the two back to back.
 
-    python bench/gpt2_train.py [torch|olaf|both]
+    python bench/gpt2_train.py [torch|olaf|olaf-tuned|both]
+
+olaf-tuned first searches dot schedules (search/tune.py, cached in ~/.cache/olaf).
 """
 
 import statistics
@@ -72,7 +74,7 @@ def torch_tokens_per_s() -> float:
     return BATCH * SEQ / ms * 1e3
 
 
-def olaf_tokens_per_s() -> float:
+def olaf_tokens_per_s(tuned: bool = False) -> float:
     from transformers import GPT2Config, GPT2LMHeadModel
     from test_gpt2 import split_params
     from test_training import lower, train_step
@@ -85,8 +87,16 @@ def olaf_tokens_per_s() -> float:
     model = GPT2LMHeadModel(GPT2Config(attn_implementation="eager")).eval()
     params = split_params(model)
     traced, initial = train_step(params, model.config, BATCH, SEQ)
+    graph = lower(traced.graph)
+    schedules = None
+    if tuned:
+        from olaf.search.tune import tune
+
+        start = time.time()
+        schedules = tune(graph, AMPERE_RTX3060)
+        print(f"olaf schedule search: {time.time() - start:.0f} s", flush=True)
     start = time.time()
-    compiled = CudaProgram(to_program(lower(traced.graph), AMPERE_RTX3060))
+    compiled = CudaProgram(to_program(graph, AMPERE_RTX3060, schedules=schedules))
     print(f"olaf compile: {time.time() - start:.0f} s, {len(compiled.program.launches)} launches, {len(compiled.kernels)} unique tasks", flush=True)
     session = Session(compiled, {})
     session.load_state(initial)
@@ -114,5 +124,7 @@ if __name__ == "__main__":
         results["torch"] = torch_tokens_per_s()
     if which in ("olaf", "both"):
         results["olaf"] = olaf_tokens_per_s()
+    if which == "olaf-tuned":
+        results["olaf"] = olaf_tokens_per_s(tuned=True)
     if len(results) == 2:
         print(f"olaf / torch.compile = {results['olaf'] / results['torch']:.2f}")
