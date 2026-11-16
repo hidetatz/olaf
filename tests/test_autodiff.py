@@ -138,6 +138,17 @@ def test_attention_with_mask():
     check_numeric(fn, R.normal(size=(3, 4)), R.normal(size=(3, 4)), R.normal(size=(3, 2)), tol=1e-5)
 
 
+def test_attention_with_fully_masked_rows():
+    # Query rows 0 and 1 see no key (left padding of two under a causal mask). Their output is
+    # defined as 0, so it is constant in q, k and v, and the gradients must be finite and match
+    # finite differences instead of being NaN.
+    def fn(qq, k, v):
+        mask = np.tril(np.ones((4, 4), bool)) & (np.arange(4) >= 2)[None, :]
+        return olaf.sum(olaf.attention(qq, k, v, olaf.constant(mask)) ** 2.0)
+
+    check_numeric(fn, R.normal(size=(4, 3)), R.normal(size=(4, 3)), R.normal(size=(4, 2)), tol=1e-5)
+
+
 class TestAgainstTorchSubgradients:
     def _grad(self, fn, x):
         traced = olaf.trace(lambda a: olaf.grad(fn)(a), tt(*x.shape))

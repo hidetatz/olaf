@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
-from olaf.graph.composite import attention_scores, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, reduced_mean
+from olaf.graph.composite import attention_probabilities, attention_scores, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, reduced_mean
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 
@@ -575,10 +575,13 @@ def _attention(b, op, c):
     mask = op.inputs[3] if len(op.inputs) == 4 else None
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
     scores, scale = attention_scores(b, q, k, mask)
-    p = b.op("softmax", scores, axis=scores.type.rank - 1)
+    # Not the softmax composite: the probabilities must match the forward decomposition, which gives
+    # rows with every key masked p = 0 instead of NaN.
+    p = attention_probabilities(b, scores, mask is not None)
     dv = b.op("contract", p, c, spec=f"{batch}xy,{batch}xz->{batch}yz")
     dp = b.op("contract", c, v, spec=f"{batch}xz,{batch}yz->{batch}xy")
-    # Masked positions have p = 0, so their score gradient is 0 without another where.
+    # Masked positions have p = 0, so their score gradient is 0 without another where. A fully
+    # masked row has p = 0 everywhere, so dq for it and its share of dk and dv are 0 too.
     ds = b.op("mul", _softmax_backward(b, p, dp, scores.type.rank - 1), scale)
     dq = b.op("contract", ds, k, spec=f"{batch}xy,{batch}yz->{batch}xz")
     dk = b.op("contract", ds, q, spec=f"{batch}xy,{batch}xz->{batch}yz")

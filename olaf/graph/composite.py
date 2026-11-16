@@ -133,12 +133,39 @@ def attention_scores(b: GraphBuilder, q: Value, k: Value, mask: Value | None) ->
     return scores, scale
 
 
+def attention_probabilities(b: GraphBuilder, scores: Value, masked: bool) -> Value:
+    """Softmax over the last axis, except that a row whose keys are all masked gets probabilities 0.
+
+    That row's attention output and its gradients are therefore 0, where a plain softmax gives 0/0 =
+    NaN (as PyTorch's math SDPA does). Such rows come from left padding, empty cross-attention
+    sources, or filler positions in packed sequences; their outputs are discarded, but a NaN would
+    still leak into gradients, since NaN * 0 is NaN. The P1 online softmax has to handle tiles whose
+    keys are all masked anyway (exp(-inf - -inf) is NaN), and once it does, a fully masked row ends
+    with a zero sum, so writing 0 there costs nothing. Without a mask no row can be empty, and this
+    is the plain softmax.
+    """
+    axis = scores.type.rank - 1
+    if not masked:
+        return _softmax(b, [scores], {"axis": axis})[0]
+    peak = b.op("reduce", scores, fn="max", axes=(axis,))
+    # A max of -inf means every key is masked. Shifting by 0 instead keeps exp at exp(-inf) = 0
+    # rather than exp(-inf - -inf) = NaN. Any row with a live key has a sum of at least exp(0) = 1, so
+    # the same flag tells exactly when the sum is 0 and the divisor must be replaced.
+    empty = b.op("cmp", peak, b.full_like(peak, -math.inf), fn="eq")
+    shift = b.op("where", empty, b.full_like(peak, 0.0), peak)
+    e = b.op("exp", b.op("sub", scores, keep_axes(b, shift, scores, (axis,))))
+    total = b.op("reduce", e, fn="sum", axes=(axis,))
+    total = b.op("where", empty, b.full_like(total, 1.0), total)
+    return b.op("div", e, keep_axes(b, total, e, (axis,)))
+
+
 @_rule("attention")
 def _attention(b, inputs, attrs):
     q, k, v = inputs[:3]
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
-    scores, _ = attention_scores(b, q, k, inputs[3] if len(inputs) == 4 else None)
-    weights = _softmax(b, [scores], {"axis": scores.type.rank - 1})[0]
+    masked = len(inputs) == 4
+    scores, _ = attention_scores(b, q, k, inputs[3] if masked else None)
+    weights = attention_probabilities(b, scores, masked)
     return [b.op("contract", weights, v, spec=f"{batch}xy,{batch}yz->{batch}xz")]
 
 

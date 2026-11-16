@@ -386,6 +386,21 @@ class TestCompositesAgainstTorch:
         ref = F.scaled_dot_product_attention(t, t, t, attn_mask=torch.from_numpy(mask))
         assert rel(out, ref.numpy()) < 1e-5
 
+    def test_attention_fully_masked_rows_are_zero(self):
+        # Causal plus left padding: in batch 0 the first two positions are padding, so query rows 0
+        # and 1 see only padded keys. PyTorch gives NaN there; olaf defines them as 0.
+        a = R.normal(size=(2, 4, 8)).astype(np.float32)
+        pad = np.array([2, 0])
+        live_keys = np.arange(4)[None, :] >= pad[:, None]
+        mask = np.tril(np.ones((4, 4), bool))[None] & live_keys[:, None, :]
+        out = olaf.trace(lambda x, m: olaf.attention(x, x, x, m), tt(2, 4, 8), tt(2, 4, 4, dtype=olaf.DType.bool)).eager(a, mask)[0]
+        empty = ~mask.any(axis=-1)
+        assert empty.sum() == 2
+        np.testing.assert_array_equal(out[empty], 0.0)
+        t = torch.from_numpy(a)
+        ref = F.scaled_dot_product_attention(t, t, t, attn_mask=torch.from_numpy(mask)).numpy()
+        assert rel(out[~empty], ref[~empty]) < 1e-5
+
 
 def run_graph(graph, *arrays):
     return interpret(graph, arrays)[0]
