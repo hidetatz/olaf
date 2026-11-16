@@ -24,7 +24,11 @@ from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides, full_view
 
 ELEMENTWISE_BLOCK = 128
-REDUCE_BLOCK = 128
+# Reduced chunk per loop step: wide for row reductions (one value per output, 8 registers per
+# thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
+# chunk x 128 values (32 per thread).
+ROW_REDUCE_BLOCK = 1024
+COLUMN_REDUCE_BLOCK = 32
 DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions
 # With a 16x8x16 matrix instruction: 128x128 output tiles over 8 warps (64x32 per warp) and a
 # 3-stage async copy pipeline over 32-wide K steps. 3 stages of bf16 A and B tiles take 48 KiB of
@@ -141,6 +145,7 @@ class _Converter:
         for p in self.graph.params:
             self.refs[p] = self.new_buffer(p.type, BufferKind.input)
             inputs.append(self.refs[p].buffer)
+        self.producers = {v: op for op in self.graph.ops for v in op.outputs}
         for op in self.graph.ops:
             if OPS[op.kind].composite:
                 raise ValueError(f"composite op {op.kind} must be decomposed before tile conversion")
@@ -254,7 +259,49 @@ class _Converter:
     def _op_reduce(self, op: Op, inputs: list[Ref]) -> Ref:
         (ref,) = inputs
         fn, axes = op.attr("fn"), op.attr("axes")
-        out_type = op.outputs[0].type
+        split = self._split(ref, axes)
+        if split is not None:
+            # Two passes: P slices of one reduced axis in parallel, then the P partials.
+            axis, parts = split
+            size = ref.shape[axis]
+            v = ref.view
+            shape = (*v.shape[:axis], parts, size // parts, *v.shape[axis + 1 :])
+            strides = (*v.strides[:axis], v.strides[axis] * (size // parts), v.strides[axis], *v.strides[axis + 1 :])
+            pad = None if v.pad is None else (*v.pad[:axis], (0, 0), (0, 0), *v.pad[axis + 1 :])
+            sliced = replace(ref, view=View(shape, strides, v.offset, pad, v.fill))
+            inner_axes = tuple(a if a < axis else a + 1 for a in axes)
+            kept_shape = tuple(d for i, d in enumerate(shape) if i not in inner_axes)
+            partial = self._reduce(sliced, fn, inner_axes, TensorType(kept_shape, ref.dtype))
+            position = sum(1 for a in range(axis) if a not in axes)
+            return self._reduce(partial, fn, (position,), op.outputs[0].type)
+        return self._reduce(ref, fn, axes, op.outputs[0].type)
+
+    def _split(self, ref: Ref, axes) -> tuple[int, int] | None:
+        """(axis, parts) when a reduction would leave most of the device idle, else None.
+
+        A column reduction (bias gradients: 4096 rows into 768 columns) runs as 6 blocks of 128
+        columns, each walking all rows, on a 28-SM GPU. Splitting the longest reduced axis into
+        parts that are reduced in parallel and then summed restores the parallelism.
+        """
+        units = self.capability.roofline.compute_units
+        shape = ref.shape
+        if units <= 1 or ref.view.pad is not None or not all(isinstance(d, int) for d in shape):
+            return None
+        rank = len(shape)
+        kept = [a for a in range(rank) if a not in axes]
+        inner = rank - 1 if rank - 1 in kept else None
+        blocks = 1
+        for a in kept:
+            blocks *= -(-shape[a] // (_block(shape[a], ELEMENTWISE_BLOCK) if a == inner else 1))
+        if blocks >= 2 * units:
+            return None
+        axis = max(axes, key=lambda a: shape[a])
+        parts = 1
+        while blocks * parts * 2 <= 4 * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
+            parts *= 2
+        return (axis, parts) if parts > 1 else None
+
+    def _reduce(self, ref: Ref, fn: str, axes: tuple[int, ...], out_type: TensorType) -> Ref:
         out = self.new_buffer(out_type, BufferKind.temp)
         shape, rank = ref.shape, ref.view.rank
         kept = [a for a in range(rank) if a not in axes]
@@ -263,8 +310,9 @@ class _Converter:
         extent = {a: 1 for a in range(rank)}
         if inner_kept is not None:
             extent[inner_kept] = _block(shape[inner_kept], ELEMENTWISE_BLOCK)
-        extent[inner_reduced] = _block(shape[inner_reduced], REDUCE_BLOCK)
+        extent[inner_reduced] = _block(shape[inner_reduced], COLUMN_REDUCE_BLOCK if inner_kept is not None else ROW_REDUCE_BLOCK)
         out_tile = tuple(extent[a] for a in kept)
+        tile_shape = tuple(extent[a] for a in range(rank))
         grid = tuple(_ceil_div(shape[a], extent[a]) for a in kept)
         init = _neutral(fn, ref.dtype)
         combine = "add" if fn == "sum" else "max"
@@ -275,17 +323,18 @@ class _Converter:
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in kept]
         out_starts = [p if extent[a] == 1 else b.op("mul", p, b.index(extent[a])) for p, a in zip(pids, kept)]
-        acc = b.full(out_tile, init, acc_dtype)
+        # The loops combine whole tiles elementwise and one reduce runs after them: a reduction
+        # across threads per loop step would cost a shared-memory round trip every step.
+        acc = b.full(tile_shape, init, acc_dtype)
         reduced = sorted(axes)
 
         def loop(builder: TileBuilder, depth: int, starts: dict[int, TValue], carry: TValue) -> TValue:
             if depth == len(reduced):
                 full_starts = [starts[a] if a in starts else out_starts[kept.index(a)] for a in range(rank)]
-                tile = builder.op("load", *full_starts, arg=0, shape=tuple(extent[a] for a in range(rank)), dtype=ref.dtype, other=init)
+                tile = builder.op("load", *full_starts, arg=0, shape=tile_shape, dtype=ref.dtype, other=init)
                 if acc_dtype is not ref.dtype:
                     tile = builder.op("cast", tile, dtype=acc_dtype)
-                part = builder.op("reduce", tile, fn=fn, axes=tuple(reduced))
-                return builder.op(combine, carry, part)
+                return builder.op(combine, carry, tile)
             axis = reduced[depth]
 
             def body(inner: TileBuilder, iv: TValue, carries: list[TValue]) -> list[TValue]:
@@ -293,7 +342,7 @@ class _Converter:
 
             return builder.for_range(builder.index(0), builder.dim(shape[axis]), extent[axis], [carry], body)[0]
 
-        result = loop(b, 0, {}, acc)
+        result = b.op("reduce", loop(b, 0, {}, acc), fn=fn, axes=tuple(reduced))
         if acc_dtype is not ref.dtype:
             result = b.op("cast", result, dtype=ref.dtype)
         b.emit("store", (result, *out_starts), {"arg": 1})
@@ -314,7 +363,10 @@ class _Converter:
         m_inner = m_labels[-1] if m_labels else None
         n_inner = n_labels[-1] if n_labels else None
         k_inner = [c for c in ta if c in k_labels][-1] if k_labels else None
-        matrix = any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == ra.dtype.value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
+        # An f32 operand that is a widened b16 value counts as b16: the dot can run on the b16
+        # values with an f32 accumulator, which is exact (products of b16 values fit in f32).
+        base = {self._matrix_dtype(v) for v in op.inputs}
+        matrix = len(base) == 1 and any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == next(iter(base)).value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
         bm, bn, bk = MATRIX_DOT_BLOCK if matrix else DOT_BLOCK
         stages, warps = (MATRIX_DOT_STAGES, MATRIX_DOT_WARPS) if matrix else (1, 4)
         extent = {c: 1 for c in size}
@@ -367,6 +419,12 @@ class _Converter:
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
         self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps)
         return out
+
+    def _matrix_dtype(self, value: Value) -> DType:
+        producer = self.producers.get(value)
+        if value.type.dtype is DType.f32 and producer is not None and producer.kind == "cast" and producer.inputs[0].type.dtype is DType.bf16:
+            return DType.bf16
+        return value.type.dtype
 
     # -- indexing -------------------------------------------------------------------------------
 

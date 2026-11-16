@@ -10,6 +10,7 @@ from olaf.passes.canonicalize import canonicalize
 from olaf.passes.decompose import decompose
 from olaf.passes.unroll import unroll_scans
 from olaf.tile.from_graph import to_tile
+from olaf.tile.fuse import fuse
 from olaf.tile.interp import run_program
 
 R = np.random.default_rng(0)
@@ -251,3 +252,54 @@ def test_gpt2_small_config_step_fused_matches_eager():
     errors = [rel(a, e) for a, e in zip(actual, expected)]
     assert max(errors) < 1e-5, max(errors)
     assert len(fused.launches) < len(unfused.launches) * 0.6
+
+
+def test_hoisted_offsets_share_templates_across_unrolled_blocks():
+    from test_gpt2 import IDS_SMALL, small_model, split_params, trace_step
+
+    from olaf.pipeline import to_program
+
+    model = small_model()
+    params = split_params(model)
+    graph = lower(trace_step(params, model.config).graph)
+    plain = fuse(to_tile(graph))
+    hoisted = to_program(graph)
+    leaves = olaf.tree_flatten((params, IDS_SMALL))[0]
+    for a, e in zip(run_program(hoisted, leaves)[0], interpret(graph, leaves)[0]):
+        assert rel(a, e) < 1e-5
+    # The two blocks differ only in where their weights start.
+    assert len(hoisted.tasks()) < len(plain.tasks())
+
+
+def test_align_rows_restrides_ragged_bf16_buffers():
+    # A bf16 intermediate with 13-element rows, read transposed, sliced and padded: after
+    # align_rows its rows start every 16 elements and every reader still sees the same values.
+    from olaf.graph.ir import bf16_round
+    from olaf.tile.normalize import align_rows
+
+    x = bf16_round(R.normal(size=(6, 13)))
+    specs = [tt(6, 13, dtype=olaf.bf16)]
+
+    def fn(a):
+        t = a * 2.0
+        return olaf.transpose(t, 0, 1)[2:9] + 1.0, olaf.pad(t[1:], (1, 0), (0, 2)), olaf.sum(t, axis=0)
+
+    graph = lower(olaf.trace(fn, *specs).graph)
+    program = to_tile(graph)
+    aligned = align_rows(program)
+    padded = [b for b in aligned.buffers if b.strides is not None]
+    assert padded and all(b.strides[-2] == 16 for b in padded)
+    for a, e in zip(run_program(aligned, [x])[0], interpret(graph, [x])[0]):
+        assert rel(a, e) < 1e-6
+
+
+@pytest.mark.parametrize("shape,axes", [((1024, 256), (0,)), ((4, 512, 256), (0, 1)), ((2048, 64), (0,))])
+def test_split_reductions_preserve_values(shape, axes):
+    # With 28 SMs, these column reductions would run as 1-2 blocks; they are split in two passes.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    x = R.normal(size=shape).astype(np.float32)
+    graph = lower(olaf.trace(lambda a: olaf.sum(a, axis=axes), tt(*shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    assert len(program.launches) == 2
+    assert rel(run_program(program, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-5

@@ -7,6 +7,7 @@ import olaf
 from olaf.graph.interp import interpret
 from olaf.graph.ir import bf16_round
 from olaf.tile.from_graph import to_tile
+from olaf.pipeline import to_program
 from olaf.tile.fuse import fuse
 
 from test_tile import FUSION_CASES, R, X, Y, lower, rel, tt
@@ -21,9 +22,7 @@ def run_both(fn, arrays, specs=None, fused=False, tol=1e-5):
 
     specs = specs or [tt(*a.shape, dtype=_dtype(a)) for a in arrays]
     graph = lower(olaf.trace(fn, *specs).graph)
-    program = to_tile(graph)
-    if fused:
-        program = fuse(program)
+    program = to_program(graph, fused=fused)
     expected, _ = interpret(graph, list(arrays))
     actual, _ = CudaProgram(program).run(list(arrays))
     for a, e in zip(actual, expected):
@@ -131,7 +130,7 @@ def test_gpt2_small_config_step():
     graph = lower(trace_step(params, model.config).graph)
     leaves = olaf.tree_flatten((params, IDS_SMALL))[0]
     expected, _ = interpret(graph, leaves)
-    actual, _ = CudaProgram(fuse(to_tile(graph))).run(leaves)
+    actual, _ = CudaProgram(to_program(graph)).run(leaves)
     errors = [rel(a, e) for a, e in zip(actual, expected)]
     assert max(errors) < 1e-5, max(errors)
 
@@ -174,3 +173,53 @@ def test_matrix_instruction_dot_falls_back_when_unaligned():
     for s in (13, 64):
         a, b = bf16_round(R.normal(size=(64, s))), bf16_round(R.normal(size=(s, 48)))
         assert rel(device.run([a, b])[0][0], interpret(graph, [a, b])[0][0]) < 1e-2
+
+
+def test_matrix_instruction_dot_with_ragged_rows_and_padding():
+    # K = 50 is ragged in 16-byte chunks (partial zero-filled copies); the A operand is a padded
+    # view (as the gradient of logits[:, :-1] is), whose pad rows are zero-filled.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.lower import lower_task
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    a = bf16_round(R.normal(size=(140, 56)))
+    b = bf16_round(R.normal(size=(56, 72)))
+
+    def fn(x, y):
+        return olaf.pad(x[:, :50], (0, 0), (3, 0)) @ olaf.pad(y[:50], (0, 0), (0, 0))
+
+    specs = [tt(140, 56, dtype=olaf.bf16), tt(56, 72, dtype=olaf.bf16)]
+    graph = lower(olaf.trace(fn, *specs).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert any("nvvm.mma.sync" in lower_task(launch.task).text for launch in program.launches)
+    assert rel(CudaProgram(program).run([a, b])[0][0], interpret(graph, [a, b])[0][0]) < 1e-2
+
+
+@pytest.mark.parametrize(
+    "shape,axes",
+    [
+        ((4, 6, 20), (0,)),  # kept inner extent 32: partials of 4 threads combined in shared memory
+        ((4, 6, 300), (0, 1)),  # 128 outputs, each thread's own: no exchange
+        ((5, 16), (1,)),  # 16-wide rows: butterfly within groups of 16 lanes
+        ((3, 8), (1,)),  # 8-wide rows, most lanes empty
+        ((2, 3000), (1,)),  # long rows: warp butterflies and warp partials
+        ((7,), (0,)),
+    ],
+)
+@pytest.mark.parametrize("fn", ["sum", "max"])
+def test_reduce_layouts(shape, axes, fn):
+    x = R.normal(size=shape).astype(np.float32)
+    reduce = olaf.sum if fn == "sum" else olaf.max
+    run_both(lambda a: reduce(a, axis=axes), [x])
+    run_both(lambda a: reduce(a, axis=axes), [R.integers(-50, 50, shape).astype(np.int32)])
+
+
+def test_split_column_reduction_on_device():
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    x = R.normal(size=(4, 1024, 768)).astype(np.float32)
+    graph = lower(olaf.trace(lambda a: olaf.sum(a, axis=(0, 1)), tt(4, 1024, 768)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert len(program.launches) == 2
+    assert rel(CudaProgram(program).run([x])[0][0], interpret(graph, [x])[0][0]) < 1e-5

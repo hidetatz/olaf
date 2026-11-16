@@ -176,13 +176,25 @@ def attention_probabilities(b: GraphBuilder, scores: Value, masked: bool) -> Val
     return b.op("div", e, keep_axes(b, total, e, (axis,)))
 
 
+def round_probabilities(b: GraphBuilder, p: Value, source: DType | None) -> Value:
+    """Attention probabilities rounded to the inputs' dtype before they multiply v.
+
+    The one exception to computing a bf16 composite in f32: PyTorch (`.type(value.dtype)` in
+    HF's attention, and FlashAttention) multiplies bf16 probabilities with v, and doing the same
+    lets that product run on bf16 matrix instructions. The rounded values are exact in f32.
+    """
+    if source is DType.bf16 and p.type.dtype is DType.f32:
+        return b.op("cast", b.op("cast", p, dtype=DType.bf16), dtype=DType.f32)
+    return p
+
+
 @_rule("attention")
 def _attention(b, inputs, attrs):
     q, k, v = inputs[:3]
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
     masked = len(inputs) == 4
     scores, _ = attention_scores(b, q, k, inputs[3] if masked else None)
-    weights = attention_probabilities(b, scores, masked)
+    weights = round_probabilities(b, attention_probabilities(b, scores, masked), attrs.get("source_dtype"))
     return [b.op("contract", weights, v, spec=f"{batch}xy,{batch}yz->{batch}xz")]
 
 

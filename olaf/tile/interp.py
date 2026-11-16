@@ -81,9 +81,10 @@ def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarr
         else:
             # NaN (or an extreme integer) instead of zeros, so a task that reads an unwritten element shows up in the result.
             fill = np.nan if b.type.dtype.is_float else 0
-            storage[b.name] = np.full(int(np.prod(shape, dtype=np.int64)), fill, b.type.dtype.numpy)
+            storage[b.name] = np.full(evaluate(b.elements(), env), fill, b.type.dtype.numpy)
     for launch in program.launches:
-        _run_task(launch.task, [storage[n] for n in launch.buffers], env)
+        arrays = [storage[n][evaluate(launch.offset(i), env) :] for i, n in enumerate(launch.buffers)]
+        _run_task(launch.task, arrays, env)
 
     def shaped(name: str) -> np.ndarray:
         b = program.buffer(name)

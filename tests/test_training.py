@@ -132,3 +132,59 @@ def test_mixed_precision_steps_on_device_match_eager_and_torch():
     # f32 difference (2.1e-5) on these steps; 1e-3 leaves room without hiding a real error.
     np.testing.assert_allclose(ours, reference, rtol=1e-3)
     assert ours[-1] < ours[0] * 0.9, ours
+
+
+def test_arena_never_overlaps_live_buffers():
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import plan_arena
+    from olaf.pipeline import to_program
+    from olaf.tile.ir import BufferKind
+
+    model = small_model()
+    params = split_params(model)
+    traced, _ = train_step(params, model.config, 2, 16)
+    program = to_program(lower(traced.graph), AMPERE_RTX3060)
+    offsets, total = plan_arena(program, {})
+    first, last = {}, {}
+    for i, launch in enumerate(program.launches):
+        for name in launch.buffers:
+            first.setdefault(name, i)
+            last[name] = i
+    from olaf.backend.cuda.lower import element_bytes
+
+    size = {b.name: int(np.prod(b.type.shape)) * element_bytes(b.type.dtype) for b in program.buffers}
+    names = sorted(offsets)
+    for i, a in enumerate(names):
+        for b in names[i + 1 :]:
+            live_together = not (last[a] < first[b] or last[b] < first[a])
+            apart = offsets[a] + size[a] <= offsets[b] or offsets[b] + size[b] <= offsets[a]
+            assert apart or not live_together, (a, b)
+    temps = sum(size[b.name] for b in program.buffers if b.kind is BufferKind.temp)
+    assert total < temps / 2
+
+
+@pytest.mark.gpu
+def test_session_with_graph_replay_matches_per_step_runs():
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram, Session
+    from olaf.pipeline import to_program
+
+    model = small_model()
+    params = split_params(model)
+    traced, initial = train_step(params, model.config, 2, 16)
+    compiled = CudaProgram(to_program(lower(traced.graph), AMPERE_RTX3060))
+    data = batches(5, 2, 16, model.config.vocab_size)
+    state, expected = dict(initial), []
+    for ids in data:
+        (loss,), state = compiled.run([ids], state)
+        expected.append(float(loss))
+    session = Session(compiled, {})
+    session.load_state(initial)
+    got = []
+    for ids in data:
+        session.step([ids])
+        got.append(float(session.outputs()[0]))
+    # Same kernels, same order: only the atomics' order may differ between runs.
+    np.testing.assert_allclose(got, expected, rtol=1e-6)
+    final = session.read_state()
+    assert np.allclose(final["params.wte.weight"], state["params.wte.weight"], rtol=1e-5, atol=1e-7)

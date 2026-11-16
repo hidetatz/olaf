@@ -14,7 +14,8 @@ def decompose(graph: Graph) -> Graph:
     for op in graph.ops:
         inputs = [subst.get(v, v) for v in op.inputs]
         if OPS[op.kind].composite:
-            results = RULES[op.kind](b, widen_bf16(b, inputs), op.attr_dict)
+            # source_dtype tells a rule what dtype the composite had before widen_bf16.
+            results = RULES[op.kind](b, widen_bf16(b, inputs), {**op.attr_dict, "source_dtype": op.inputs[0].type.dtype})
             subst.update(zip(op.outputs, narrow_like(b, results, op.outputs), strict=True))
         else:
             b.append(Op(op.kind, tuple(inputs), op.outputs, op.attrs, tuple(decompose(r) for r in op.regions)))

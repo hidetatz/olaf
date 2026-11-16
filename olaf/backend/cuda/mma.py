@@ -19,8 +19,9 @@ Chunk c of row r is stored at position c ^ ((r // rep) % min(chunks_per_row, 8))
 one ldmatrix 8x8 read touches then fall into 8 different 16-byte bank groups, so the reads are
 conflict-free for 64-byte rows (A tiles of 32 K values) and 256-byte rows (128-wide tiles) alike.
 
-16-byte copies need every non-contiguous stride, the view offset and the contiguous extent to be
-multiples of 8 elements. Static violations reject the pattern; symbolic ones are recorded as
+16-byte copies need every non-contiguous stride and the view offset to be multiples of 8
+elements; the last chunk of a row copies only the elements that exist (cp.async zero-fills the
+rest), so the contiguous extent may be ragged, and rows in a view's padding are zero-filled. Static violations reject the pattern; symbolic ones are recorded as
 Lowered.aligned and checked at launch, with the general kernel as the fallback.
 """
 
@@ -62,11 +63,19 @@ class _Operand:
 
 
 def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tuple[TOp, list[int]] | None:
-    """Follow reshape/permute back to a load. Returns the load and the tile axes of the 2-D (rows, cols)."""
+    """Follow reshape/permute (and one exact b16 -> f32 cast) back to a load.
+
+    Returns the load and the tile axes of the 2-D (rows, cols). A widening cast is exact, so an
+    f32 dot of widened b16 values is the b16 dot with an f32 accumulator.
+    """
     chain = []
-    while value in producers and producers[value].kind in ("reshape", "permute"):
-        chain.append(producers[value])
-        value = producers[value].inputs[0]
+    while value in producers and producers[value].kind in ("reshape", "permute", "cast"):
+        op = producers[value]
+        if op.kind == "cast" and not (op.inputs[0].type.dtype in _PTX_TYPE and op.attr("dtype") is DType.f32):
+            return None
+        if op.kind != "cast":
+            chain.append(op)
+        value = op.inputs[0]
     load = producers.get(value)
     if load is None or load.kind != "load":
         return None
@@ -90,7 +99,7 @@ def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tu
 
 def _operand(e, region, load: TOp, axes: list[int]) -> _Operand | None:
     view = e.task.args[load.attr("arg")].view
-    if view.pad is not None or load.attr("dtype") not in _PTX_TYPE:
+    if load.attr("dtype") not in _PTX_TYPE:
         return None
     rows_axis, cols_axis = axes
     shape = load.attr("shape")
@@ -101,13 +110,17 @@ def _operand(e, region, load: TOp, axes: list[int]) -> _Operand | None:
     else:
         return None
     contiguous = cols_axis if contiguous_cols else rows_axis
-    required: list[Dim] = [view.offset, view.shape[contiguous], *(s for i, s in enumerate(view.strides) if i != contiguous)]
+    if view.pad is not None and view.pad[contiguous] != (0, 0):
+        return None  # padding inside a 16-byte chunk would need per-element fill
+    # Chunk starts must be 16-byte aligned; a ragged contiguous extent is handled by partial copies.
+    required: list[Dim] = [view.offset, *(s for i, s in enumerate(view.strides) if i != contiguous)]
     for d in required:
         if isinstance(d, int):
             if d % 8:
                 return None
         elif d not in e.aligned:
             e.aligned.append(d)
+    e.aligned_args.add(load.attr("arg"))  # its launch offset (tile.normalize) is checked at launch
     iv = region.params[0]
     for s in load.inputs:
         if s is not iv and s not in e.values:
@@ -137,13 +150,15 @@ def lower_matrix_loop(e, op: TOp, args):
             if producer.kind == "load":
                 break
             v = producer.inputs[0]
-    if used != set(region.ops):
+    # Inlined producers can leave scalar constants behind (their index arithmetic); they are pure.
+    extra = set(region.ops) - used
+    if any(o.kind not in ("full", "dim") or o.outputs[0].type.shape != () for o in extra):
         return None
-    if a_val.type.dtype is not b_val.type.dtype or dot.outputs[0].type.dtype is not DType.f32:
+    if dot.outputs[0].type.dtype is not DType.f32:
         return None
     a = _operand(e, region, *traced[0])
     b = _operand(e, region, *traced[1])
-    if a is None or b is None:
+    if a is None or b is None or traced[0][0].attr("dtype") is not traced[1][0].attr("dtype"):
         return None
     em, ek = a.rows, a.cols
     en = b.cols
@@ -156,7 +171,7 @@ def lower_matrix_loop(e, op: TOp, args):
         chunks = operand.stored_rows * operand.row_elems // 8
         if chunks % e.threads or operand.row_elems % 8:
             return None
-    return _MatrixLoop(e, a, b, em, en, ek, grid, op.attr("stages"), a_val.type.dtype).emit(lo, hi, step, carries[0], region)
+    return _MatrixLoop(e, a, b, em, en, ek, grid, op.attr("stages"), traced[0][0].attr("dtype")).emit(lo, hi, step, carries[0], region)
 
 
 def _warp_grid(warps: int, em: int, en: int) -> tuple[int, int] | None:
@@ -306,10 +321,18 @@ class _MatrixLoop:
             coords = list(starts)
             coords[strided] = e.emit(f"llvm.add {starts[strided]}, {row} : i32")
             coords[contiguous] = e.emit(f"llvm.add {starts[contiguous]}, {e.emit(f'llvm.mul {chunk}, {e.i32(8)} : i32')} : i32")
-            offset, inside, _ = e.view_address(operand.view, coords)
+            offset, inside, padded = e.view_address(operand.view, coords)
             inside = inside or e.const(True, "i1")
+            if padded is not None:
+                live = e.emit(f"llvm.xor {padded}, {e.const(True, 'i1')} : i1")
+                inside = e.emit(f"llvm.and {inside}, {live} : i1")
             safe = e.emit(f"llvm.select {inside}, {offset}, {e.i32(0)} : i1, i32")
-            size = e.emit(f"llvm.select {inside}, {e.i32(16)}, {e.i32(0)} : i1, i32")
+            # Copy only the elements before the end of the contiguous axis; cp.async fills the
+            # rest of the 16 bytes with zeros, which add nothing to the dot.
+            remaining = e.emit(f"llvm.sub {e.dim(operand.view.shape[contiguous])}, {coords[contiguous]} : i32")
+            count = e.emit(f"llvm.intr.smin({remaining}, {e.i32(8)}) : (i32, i32) -> i32")
+            full = e.emit(f"llvm.mul {count}, {e.i32(2)} : i32")
+            size = e.emit(f"llvm.select {inside}, {full}, {e.i32(0)} : i1, i32")
             src = e.global_ptr(operand.arg, safe, DType.bf16)
             byte = e.emit(f"llvm.add {stage_base}, {e.emit(f'llvm.add {smem_offset}, {e.i32(offset_in_stage)} : i32')} : i32")
             dst = e.emit(f"llvm.getelementptr {base}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")

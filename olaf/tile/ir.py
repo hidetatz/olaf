@@ -167,13 +167,20 @@ class BufferKind(StrEnum):
 
 @dataclass(frozen=True)
 class Buffer:
-    """Contiguous storage of product(type.shape) elements."""
+    """Storage of a tensor: contiguous, or with the physical `strides` of tile.normalize.align_rows."""
 
     name: str
     type: TensorType
     kind: BufferKind
     constant: ConstantData | None = None
     state: StateDecl | None = None
+    strides: tuple[Dim, ...] | None = None
+
+    def elements(self) -> Dim:
+        """Number of elements to allocate."""
+        if self.strides is None:
+            return product(self.type.shape)
+        return self.type.shape[0] * self.strides[0] if self.type.shape else 1
 
     def __str__(self) -> str:
         text = f"%{self.name}: {self.kind} {self.type}"
@@ -181,13 +188,24 @@ class Buffer:
             text += f" = {self.constant}"
         if self.state is not None:
             text += f" @{self.state.name}"
+        if self.strides is not None:
+            text += f" strides=[{','.join(map(str, self.strides))}]"
         return text
 
 
 @dataclass(frozen=True)
 class Launch:
+    """A task bound to buffers. `offsets` (elements, one per argument, empty for all zero) are
+    added to each buffer's base address: per-launch addressing that is not part of the template,
+    so the unrolled blocks of a scan, which differ only in where their weights start, share one
+    template (tile.normalize.hoist_offsets)."""
+
     task: Task
     buffers: tuple[str, ...]
+    offsets: tuple[Dim, ...] = ()
+
+    def offset(self, i: int) -> Dim:
+        return self.offsets[i] if self.offsets else 0
 
 
 @dataclass(frozen=True, eq=False)
@@ -218,7 +236,8 @@ class Program:
             lines.append(f"template t{index}:")
             lines += ["  " + line for line in self.tasks()[digest].text().splitlines()]
         for launch in self.launches:
-            lines.append(f"launch t{templates[launch.task.digest()]}({', '.join('%' + n for n in launch.buffers)})  # {launch.task.name}")
+            bound = ", ".join("%" + n + (f"+{launch.offset(i)}" if launch.offset(i) != 0 else "") for i, n in enumerate(launch.buffers))
+            lines.append(f"launch t{templates[launch.task.digest()]}({bound})  # {launch.task.name}")
         return "\n".join(lines) + "\n"
 
 

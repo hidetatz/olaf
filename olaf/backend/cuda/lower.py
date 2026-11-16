@@ -51,6 +51,7 @@ class Lowered:
     # Dimensions that must be multiples of 8 for this kernel to be valid (16-byte async copies of
     # bf16). The host checks them per launch and uses `fallback` when one is not.
     aligned: list[Dim] = field(default_factory=list)
+    aligned_args: list[int] = field(default_factory=list)  # arguments whose launch offset must be a multiple of 8
     fallback: Lowered | None = None
 
 
@@ -90,6 +91,7 @@ class _Emitter:
     blocks: int = 0
     entry_constants: list[str] = field(default_factory=list)
     aligned: list[Dim] = field(default_factory=list)
+    aligned_args: set[int] = field(default_factory=set)
 
     @property
     def threads(self) -> int:
@@ -566,8 +568,128 @@ class _Emitter:
         return self.make(out_t, regs)
 
     def reduce(self, op: TOp, src: _Value, out_t: TileType) -> _Value:
+        fast = self.fast_reduce(op, src, out_t)
+        if fast is not None:
+            return fast
+        return self.general_reduce(op, src, out_t)
+
+    def fast_reduce(self, op: TOp, src: _Value, out_t: TileType) -> _Value | None:
+        """Reductions whose thread layout is known statically (the cyclic layout of src).
+
+        (A) every element a thread owns belongs to one output (a reduction over leading axes):
+            each thread combines its own slots, then threads holding parts of one output are
+            combined through shared memory;
+        (B) the reduced axes are trailing (output = element // R): with R a multiple of the
+            thread count, a butterfly within each warp and the warps' partials through shared
+            memory; with R <= 32, a butterfly within groups of R lanes.
+        Anything else returns None.
+        """
+        import numpy as np
+
+        if src.replicated or src.coords is not None:
+            return None
+        axes = op.attr("axes")
+        fn = op.attr("fn")
+        dtype = src.type.dtype
+        shape = src.type.shape
+        n, t = self.count(shape), self.threads
+        kept = [i for i in range(len(shape)) if i not in axes]
+        out_shape = out_t.shape
+        n_out = self.count(out_shape)
+        coords = np.unravel_index(np.arange(n), shape)
+        out_index = np.ravel_multi_index([coords[i] for i in kept], out_shape) if kept else np.zeros(n, np.int64)
+        combine = "add" if fn == "sum" else "max"
+        neutral = 0 if fn == "sum" else (float("-inf") if dtype.is_float else -(2**31))
+        thirty_two = _BYTES[dtype] == 4
+
+        def fold(values: list[str]) -> str:
+            acc = values[0]
+            for v in values[1:]:
+                acc = self.scalar_op(combine, [acc, v], dtype, {})
+            return acc
+
+        def slot_value(slot: int) -> str:
+            guard = self.valid(shape, slot)
+            reg = src.regs[slot]
+            return reg if guard is None else self.emit(f"llvm.select {guard}, {reg}, {self.typed_const(neutral, dtype)} : i1, {_LLVM[dtype]}")
+
+        # Trailing reductions first: a butterfly beats any shared-memory pass when it applies.
+        r = n // n_out
+        trailing = np.array_equal(out_index, np.arange(n) // r) and thirty_two
+        if trailing and r % t == 0:
+            per = r // t
+            warps = t // 32
+            self.shared_bytes = max(self.shared_bytes, n_out * warps * _BYTES[dtype])
+            lane = self.entry(f"llvm.urem %tid, {self.i32(32)} : i32")
+            warp = self.entry(f"llvm.udiv %tid, {self.i32(32)} : i32")
+            totals = [self.butterfly(fold([src.regs[o * per + k] for k in range(per)]), 32, dtype, combine) for o in range(n_out)]
+            self.barrier()
+            first = self.emit(f"llvm.icmp \"eq\" {lane}, {self.i32(0)} : i32")
+            for o, total in enumerate(totals):
+                index = self.emit(f"llvm.add {warp}, {self.i32(o * warps)} : i32")
+                self.guarded(first, lambda index=index, total=total: self.store_shared(index, total, dtype))
+            self.barrier()
+            finals = [fold([self.load_shared(self.i32(o * warps + w), dtype) for w in range(warps)]) for o in range(n_out)]
+            if n_out == 1:
+                return self.make(out_t, finals)
+            regs = []
+            for slot in range(self.slots(out_shape)):
+                value = finals[0]
+                index = self.flat_index(slot)
+                for o in range(1, n_out):
+                    is_o = self.emit(f"llvm.icmp \"eq\" {index}, {self.i32(o)} : i32")
+                    value = self.emit(f"llvm.select {is_o}, {finals[o]}, {value} : i1, {_LLVM[dtype]}")
+                regs.append(value)
+            return self.make(out_t, regs)
+        if trailing and r <= 32 and t % r == 0 and r & (r - 1) == 0:
+            self.shared_bytes = max(self.shared_bytes, n_out * _BYTES[dtype])
+            self.barrier()
+            leader = self.emit(f"llvm.icmp \"eq\" {self.emit(f'llvm.urem %tid, {self.i32(r)} : i32')}, {self.i32(0)} : i32")
+            for slot in range(len(src.regs)):
+                total = self.butterfly(slot_value(slot), r, dtype, combine)
+                index = self.emit(f"llvm.udiv {self.flat_index(slot)}, {self.i32(r)} : i32")
+                guard = self.conj(leader, self.valid(shape, slot))
+                self.guarded(guard, lambda index=index, total=total: self.store_shared(index, total, dtype))
+            self.barrier()
+            regs = []
+            for slot in range(self.slots(out_shape)):
+                index = self.flat_index(slot)
+                guard = self.valid(out_shape, slot)
+                if guard is not None:
+                    index = self.emit(f"llvm.select {guard}, {index}, {self.i32(0)} : i1, i32")
+                regs.append(self.load_shared(index, dtype))
+            return self.make(out_t, regs)
+        lanes = np.arange(min(n, t))
+        if all(out_index[e] == out_index[e % t] for e in range(n)) and n_out <= t and t % n_out == 0 and np.array_equal(out_index[lanes], lanes % n_out):
+            partial = fold([slot_value(s) for s in range(len(src.regs))])
+            if n_out == t:
+                return self.make(out_t, [partial])
+            contributors = min(n, t) // n_out if n >= t else -(-n // n_out)
+            self.shared_bytes = max(self.shared_bytes, t * _BYTES[dtype])
+            self.barrier()
+            self.store_shared("%tid", partial, dtype) if n >= t else self.guarded(self.emit(f"llvm.icmp \"ult\" %tid, {self.i32(n)} : i32"), lambda: self.store_shared("%tid", partial, dtype))
+            self.barrier()
+            owner = "%tid" if n_out > 1 else self.i32(0)
+            if n_out > 1:
+                owner = self.emit(f"llvm.select {self.valid(out_shape, 0) or self.const(True, 'i1')}, %tid, {self.i32(0)} : i1, i32")
+            parts = [self.load_shared(owner if k == 0 else self.emit(f"llvm.add {owner}, {self.i32(k * n_out)} : i32"), dtype) for k in range(contributors)]
+            return self.make(out_t, [fold(parts)])
+
+        return None
+
+    def butterfly(self, value: str, width: int, dtype: DType, combine: str) -> str:
+        """Combine `value` across groups of `width` consecutive lanes; every lane gets the result."""
+        t = _LLVM[dtype]
+        offset = width // 2
+        while offset:
+            other = self.emit(f"nvvm.shfl.sync bfly {self.const(-1, 'i32')}, {value}, {self.i32(offset)}, {self.i32(31)} : {t} -> {t}")
+            value = self.scalar_op(combine, [value, other], dtype, {})
+            offset //= 2
+        return value
+
+    def general_reduce(self, op: TOp, src: _Value, out_t: TileType) -> _Value:
         # Every thread computes the output elements it owns by walking the reduced elements in
-        # shared memory in row-major order. Correct for any shape; fast reductions use shuffles.
+        # shared memory in row-major order. Correct for any shape, and slow.
         axes = op.attr("axes")
         fn = op.attr("fn")
         dtype = src.type.dtype
@@ -763,8 +885,8 @@ class _Emitter:
         ]
         text = "\n".join(header + prologue + self.entry_constants + self.lines + ["  }", "}", "}"]) + "\n"
         dims = [d for _, d in sorted(self.dims.values(), key=lambda t: t[0])]
-        lowered = Lowered(text, dims, self.shared_bytes, self.threads, list(self.aligned))
-        if self.aligned:
+        lowered = Lowered(text, dims, self.shared_bytes, self.threads, list(self.aligned), sorted(self.aligned_args))
+        if self.aligned or self.aligned_args:
             lowered.fallback = _Emitter(self.task, use_matrix=False).run()
         return lowered
 

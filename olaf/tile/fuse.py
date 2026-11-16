@@ -7,9 +7,13 @@ composed with View.source, and a replay of the producer's ops on the consumer's 
 intermediate buffer, and the launch that wrote it, disappear when no reader is left.
 
 Policy (the rules a cost model will later replace):
-- An intermediate read once is inlined, except into a dot operand when the producer is not cheap:
-  each dot operand tile is reloaded once per output tile along the other dimension (24 times for
-  GPT-2's 768-wide projections with 32-wide tiles), and so would its recomputation be.
+- Nothing is inlined into a dot operand except an exact widening cast of a b16 load (bf16 ->
+  f32). Each operand tile is reloaded once per output tile along the other dimension (24 times
+  for GPT-2's 768-wide projections with 32-wide tiles), and so would its recomputation be; and a
+  matrix-instruction dot copies operands to shared memory with 16-byte async copies, which need
+  plain b16 loads. The widening cast is the exception because it is exact: the dot can run on
+  the b16 values with an f32 accumulator (backend/cuda/mma.py).
+- An intermediate read once is otherwise inlined.
 - An intermediate read several times is duplicated into every reader only when it is cheap.
 "Cheap" counts arithmetic ops; casts, broadcasts of scalars and index arithmetic are free.
 
@@ -24,6 +28,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from olaf.graph.dim import Dim
+from olaf.graph.types import DType
 from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, TileType, TOp, TValue, View, full_view
 
@@ -117,6 +122,11 @@ class _Rewriter:
         self.args: list[tuple[str, Arg]] = list(zip(launch.buffers, launch.task.args))
         self.into_dot = _contains(launch.task.body, "dot")
         self.consumer_pointwise = _pointwise(launch, buffers) is not None
+        # A task that only widens a b16 load to f32 stays as it is: inlining its producer would
+        # turn it into an f32 computation, and it could no longer be inlined into a dot as an
+        # exact widening (which is what lets the dot run on b16 matrix instructions).
+        consumer = _pointwise(launch, buffers)
+        self.keep = consumer is not None and _widening_cast(consumer)
         self.changed = False
 
     def arg_index(self, buffer: str, arg: Arg) -> int:
@@ -126,7 +136,7 @@ class _Rewriter:
         return self.args.index(key)
 
     def allowed(self, op: TOp) -> _Pointwise | None:
-        if op.kind != "load":
+        if op.kind != "load" or self.keep:
             return None
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
@@ -138,7 +148,7 @@ class _Rewriter:
         cheap = recipe.cost <= CHEAP_OPS
         if self.readers[name] > 1 and not cheap:
             return None
-        if self.into_dot and not cheap:
+        if self.into_dot and not _widening_cast(recipe):
             return None
         return recipe
 
@@ -200,10 +210,12 @@ class _Rewriter:
                 if hi != 0:
                     high = b.op("broadcast", b.dim(consumer_view.shape[axis] - hi), shape=tile, dims=())
                     result = b.op("where", b.op("cmp", coord, high, fn="lt"), result, fill)
-        if not self.consumer_pointwise:
+        exact_zero = _widening_cast(recipe) and load.attr("other") == 0
+        if not self.consumer_pointwise and not exact_zero:
             # Lanes outside the consumer's view must read `other` (0 for a sum, -inf for a max), as
             # the replaced load would have; the inlined computation would give f(0, ...) there.
-            # A pointwise consumer discards those lanes at its masked store, so it needs no select.
+            # A pointwise consumer discards those lanes at its masked store, so it needs no select,
+            # and a widening cast reads 0 there already (its own load is masked with 0).
             other = b.full(tile, load.attr("other"), result.type.dtype)
             for axis, (extent, size) in enumerate(zip(tile, consumer_view.shape)):
                 if extent > 1:
@@ -226,6 +238,8 @@ class _Rewriter:
         body = _renumber(body, remap)
         args = tuple(self.args[i][1] for i in used)
         task = Task(self.launch.task.name, self.launch.task.grid, args, body, self.launch.task.warps)
+        if self.launch.offsets:
+            raise ValueError("fuse runs before tile.normalize.hoist_offsets")
         return Launch(task, tuple(self.args[i][0] for i in used))
 
 
@@ -254,6 +268,17 @@ def _compose(inner: View, outer: View) -> View:
     # Keeping the consumer's padding means padded positions never touch memory: their producer
     # coordinates lie outside the producer's range, where the address would be out of bounds.
     return View(outer.shape, tuple(strides), offset, outer.pad, outer.fill, source)
+
+
+def _widening_cast(recipe: _Pointwise) -> bool:
+    """The producer only casts one b16 load to f32 (exact)."""
+    ops = [op for op in recipe.launch.task.body.ops if op.kind not in ("store",) and not set(op.outputs) <= recipe.coordinate]
+    kinds = [op.kind for op in ops if op.kind != "full"]
+    if kinds != ["load", "cast"]:
+        return False
+    load = next(op for op in ops if op.kind == "load")
+    cast = next(op for op in ops if op.kind == "cast")
+    return load.attr("dtype") is DType.bf16 and cast.attr("dtype") is DType.f32 and recipe.store.inputs[0] is cast.outputs[0]
 
 
 def _contains(body: Body, kind: str) -> bool:

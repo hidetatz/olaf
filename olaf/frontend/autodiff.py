@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
-from olaf.graph.composite import attention_probabilities, attention_scores, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, widen_bf16
+from olaf.graph.composite import attention_probabilities, attention_scores, round_probabilities, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, widen_bf16
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 from olaf.graph.types import DType
@@ -265,7 +265,8 @@ def _vjp(b: GraphBuilder, op: Op, cot: Value) -> list[Value | None]:
     # A bf16 composite's backward computes in f32 too, matching its forward (graph.composite.widen_bf16).
     # The rule receives an f32 stand-in for the op. Its outputs are casts of the bf16 outputs
     # (softmax's VJP reads its output), as PyTorch's softmax backward reads the bf16 output.
-    wide = Op(op.kind, tuple(widen_bf16(b, op.inputs)), tuple(widen_bf16(b, op.outputs)), op.attrs)
+    attrs = tuple(sorted((*op.attrs, ("source_dtype", op.inputs[0].type.dtype))))
+    wide = Op(op.kind, tuple(widen_bf16(b, op.inputs)), tuple(widen_bf16(b, op.outputs)), attrs)
     return narrow_like(b, _RULES[op.kind](b, wide, widen_bf16(b, [cot])[0]), op.inputs)
 
 
@@ -588,12 +589,17 @@ def _attention(b, op, c):
     scores, scale = attention_scores(b, q, k, mask)
     # Not the softmax composite: the probabilities must match the forward decomposition, which gives
     # rows with every key masked p = 0 instead of NaN.
-    p = attention_probabilities(b, scores, mask is not None)
+    # Rounded as in the forward (graph.composite.round_probabilities), as PyTorch's backward
+    # uses the bf16 probabilities it saved.
+    p = round_probabilities(b, attention_probabilities(b, scores, mask is not None), op.attr("source_dtype", None))
     dv = b.op("contract", p, c, spec=f"{batch}xy,{batch}xz->{batch}yz")
     dp = b.op("contract", c, v, spec=f"{batch}xz,{batch}yz->{batch}xy")
     # Masked positions have p = 0, so their score gradient is 0 without another where. A fully
     # masked row has p = 0 everywhere, so dq for it and its share of dk and dv are 0 too.
     ds = b.op("mul", _softmax_backward(b, p, dp, scores.type.rank - 1), scale)
+    # dS is rounded like the probabilities before it multiplies q and k, as in PyTorch's bf16
+    # backward and FlashAttention's: those two products then run on bf16 matrix instructions.
+    ds = round_probabilities(b, ds, op.attr("source_dtype", None))
     dq = b.op("contract", ds, k, spec=f"{batch}xy,{batch}yz->{batch}xz")
     dk = b.op("contract", ds, q, spec=f"{batch}xy,{batch}xz->{batch}yz")
     return [dq, dk, dv] + ([None] if mask is not None else [])
