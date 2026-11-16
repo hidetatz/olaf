@@ -172,7 +172,7 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         dk = inner.op("dot", inner.op("permute", ds, perm=(1, 0)), q2d, dk)
         return [dk, dv]
 
-    dk, dv = b.for_range(b.index(0), b.dim(g.shape[row]), BLOCK, [zeros_k, zeros_v], kv_body)
+    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), BLOCK, [zeros_k, zeros_v], kv_body)
     t.b = b
     store(t, back.dk, maps["dk"], dk, col, s, starts)
     store(t, back.dv, maps["dv"], dv, col, VALUE, starts)
@@ -191,7 +191,7 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         k2d = _operand(t, f.c1, 1, {**{x: starts[x] for x in batch}, col: c0, s: inner.index(0)}, ext, col, s)
         return [inner.op("dot", ds, k2d, dq)]
 
-    (dq,) = b.for_range(b.index(0), b.dim(g.shape[col]), BLOCK, [b.full((BLOCK, g.head), 0.0, DType.f32)], q_body)
+    (dq,) = b.for_range(b.index(0), g.col_end(b, starts[row]), BLOCK, [b.full((BLOCK, g.head), 0.0, DType.f32)], q_body)
     t.b = b
     store(t, back.dq, maps["dq"], dq, row, s, starts)
     q_task = t.finish("attention_dq", grid, pids, ("attention_dq",))

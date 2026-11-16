@@ -565,6 +565,41 @@ def _masked(t: _Task, value: TValue, starts: list[TValue], limits: list[tuple[in
     return value
 
 
+def _causal_offset(p: _Program, f: _Forward) -> int | None:
+    """d when X is where(col <= row + d, ..., -inf) (a causal mask), else None.
+
+    Read from T1's body: the stored value is a where whose false branch loads a -inf constant
+    and whose condition compares iotas along the column and row axes (le: d = 0, lt: d = -1).
+    Tiles entirely past that diagonal contribute exactly nothing, so loops can skip them.
+    """
+    if f.t1 is None:
+        return None
+    launch = p.launch(f.t1)
+    value, producers = _value_of(launch.task, "store")
+    where = producers.get(value)
+    if where is None or where.kind != "where":
+        return None
+    other = producers.get(where.inputs[2])
+    if other is None or other.kind != "load":
+        return None
+    constant = p.buffers[launch.buffers[other.attr("arg")]].constant
+    if constant is None or constant.array.size != 1 or not (float(constant.array.reshape(())) == float("-inf")):
+        return None
+    cmp = producers.get(where.inputs[0])
+    if cmp is None or cmp.kind != "cmp" or cmp.attr("fn") not in ("le", "lt"):
+        return None
+    axes = []
+    for v in cmp.inputs:
+        iota = producers.get(v)
+        if iota is None or iota.kind != "iota":
+            return None
+        axes.append(iota.attr("axis"))
+    rank = len(f.c1.out)
+    if axes != [rank - 1, rank - 2]:
+        return None
+    return 0 if cmp.attr("fn") == "le" else -1
+
+
 class _Builder:
     """Shared pieces of the fused forward and backward tasks."""
 
@@ -576,6 +611,22 @@ class _Builder:
         self.batch = list(f.labels["batch"])
         self.shape = dict(zip(c1.out, p.buffers[c1.output].type.shape))
         self.head, self.value_size = _head_sizes(c1, f.c2, f.v_operand, f.labels)
+        self.causal = _causal_offset(p, f)
+
+    def col_end(self, b: TileBuilder, row_start: TValue) -> TValue:
+        """End of the column loop for rows [row_start, row_start + BLOCK)."""
+        end = b.dim(self.shape[self.labels["col"]])
+        if self.causal is None:
+            return end
+        last = b.op("add", row_start, b.index(BLOCK + self.causal))
+        return b.op("min", end, last)
+
+    def row_begin(self, b: TileBuilder, col_start: TValue) -> TValue:
+        """Start of the row loop for columns [col_start, col_start + BLOCK) (a multiple of BLOCK)."""
+        if self.causal is None:
+            return b.index(0)
+        first = b.op("sub", col_start, b.index(self.causal))
+        return b.op("mul", b.op("floordiv", first, b.index(BLOCK)), b.index(BLOCK))
 
     def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None) -> tuple[TValue, TValue, list[TValue]]:
         """X tile (rank-d, 1..1 x BLOCK x BLOCK) for the query and key tiles at these starts."""
@@ -658,7 +709,7 @@ def _forward_task(p: _Program, f: _Forward, write_stats: bool) -> Launch:
         acc_new = inner.op("dot", p2, v, inner.op("mul", acc, scale))
         return [m_new, l_new, acc_new]
 
-    m, l, acc = b.for_range(b.index(0), b.dim(g.shape[col]), BLOCK, [m0, l0, acc0], body)
+    m, l, acc = b.for_range(b.index(0), g.col_end(b, q_starts[row]), BLOCK, [m0, l0, acc0], body)
     t.b = b
     # O = acc / G(l, m): G is T5's divisor, replayed on the final statistics.
     coords = [q_starts.get(x, b.index(0)) for x in f.c1.out]

@@ -344,3 +344,17 @@ def test_online_softmax_fusion(backward):
     assert len(after.launches) < len(before.launches)
     for a, e in zip(run_program(after, args)[0], interpret(graph, args)[0]):
         assert rel(a, e) < 1e-2, rel(a, e)
+
+
+def test_online_softmax_skips_masked_tiles_of_a_causal_mask():
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.tile.online_softmax import _causal_offset, _match_forward, _Program, fuse_online_softmax
+
+    graph, args = _attention_case(True, s=200)
+    before = fuse(to_tile(graph, AMPERE_RTX3060))
+    p = _Program(before)
+    forward = next(f for f in (_match_forward(p, i) for i in range(len(before.launches))) if f is not None)
+    assert _causal_offset(p, forward) == 0
+    after = fuse_online_softmax(before)
+    for a, e in zip(run_program(after, args)[0], interpret(graph, args)[0]):
+        assert rel(a, e) < 1e-2
