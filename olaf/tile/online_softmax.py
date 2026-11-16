@@ -477,8 +477,8 @@ class _Task:
     def load(self, buffer: str, view: View, dtype: DType, starts, shape, other=0) -> TValue:
         return self.b.op("load", *starts, arg=self.arg(buffer, view, dtype), shape=tuple(shape), dtype=dtype, other=other)
 
-    def finish(self, name: str, grid, pids, origin) -> Launch:
-        task = Task(name, tuple(grid), tuple(a for _, a in self.args), self.b.finish(pids), WARPS, origin)
+    def finish(self, name: str, grid, pids, origin, warps: int = WARPS) -> Launch:
+        task = Task(name, tuple(grid), tuple(a for _, a in self.args), self.b.finish(pids), warps, origin)
         return Launch(task, tuple(n for n, _ in self.args))
 
 

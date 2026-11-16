@@ -176,7 +176,10 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     t.b = b
     store(t, back.dk, maps["dk"], dk, col, s, starts)
     store(t, back.dv, maps["dv"], dv, col, VALUE, starts)
-    kv_task = t.finish("attention_dkv", grid, pids, ("attention_dkv",))
+    # 8 warps: this task holds two accumulators and four score-sized tiles per iteration, and
+    # with 4 warps (32 registers per tile per thread) it spills. Nothing here needs warps
+    # stacked along rows (its dots take operands from memory or staged accumulators).
+    kv_task = t.finish("attention_dkv", grid, pids, ("attention_dkv",), warps=8)
 
     # dQ: one tile of rows per instance, looping over columns.
     t = _Task()

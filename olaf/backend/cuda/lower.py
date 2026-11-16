@@ -998,7 +998,26 @@ class _Emitter:
         view = self.task.args[arg].view
         dtype = op.attr("dtype")
 
+        broadcast_scalar = index is None and view.pad is None and all(st == 0 for st in view.strides)
+        scalar = None
+        if broadcast_scalar:
+            # Every element is the same address: read it once. Lanes outside the view still get
+            # `other` (reductions rely on it), which is a compare and a select instead of a load.
+            zeros = [self.i32(0)] * len(view.shape)
+            scalar = self.masked_load(arg, view, zeros, dtype, 0, view.fill, None)
+
         def at(like):
+            if scalar is not None:
+                regs = []
+                other = self.typed_const(op.attr("other"), dtype)
+                for slot, coords in enumerate(self.layout_of(like)):
+                    tile = self.tile_coords(starts, out_t.shape, coords)
+                    inside = self.valid_of(like, slot)
+                    for axis, c in enumerate(tile):
+                        if out_t.shape[axis] != 1 or not isinstance(view.shape[axis], int) or view.shape[axis] != 1:
+                            inside = self.conj(inside, self.emit(f"llvm.icmp \"ult\" {c}, {self.dim(view.shape[axis])} : i32"))
+                    regs.append(scalar if inside is None else self.emit(f"llvm.select {inside}, {scalar}, {other} : i1, {_LLVM[dtype]}"))
+                return regs
             regs = []
             for slot, coords in enumerate(self.layout_of(like)):
                 tile = self.tile_coords(starts, out_t.shape, coords)
@@ -1017,6 +1036,8 @@ class _Emitter:
 
     def store(self, op: TOp, args: list[_Value]) -> None:
         value, *starts = args
+        if self.paired_store(op, value, starts):
+            return
         arg = op.attr("arg")
         view = self.task.args[arg].view
         dtype = value.type.dtype
@@ -1034,6 +1055,47 @@ class _Emitter:
             stored = self.emit(f"llvm.zext {reg} : i1 to i8") if dtype is DType.bool else reg
             ptr = self.global_ptr(arg, offset, dtype)
             self.guarded(ok, lambda ptr=ptr, stored=stored: self.raw(f"llvm.store {stored}, {ptr} : {_MEMORY_TYPE[dtype]}, !llvm.ptr<1>"))
+
+    def paired_store(self, op: TOp, value: _Value, starts: list[_Value]) -> bool:
+        """Store an accumulator tile two adjacent columns at a time (one 4- or 8-byte store).
+
+        Fragment slots q and q+1 are columns c and c+1 of one row, with c even. When the store's
+        column axis is the view's contiguous axis and every other stride and the offset are
+        even, the pair is one aligned vector store; the launch offset of the argument is checked
+        at launch (Lowered.aligned_args). A pair that straddles the end of a ragged row is
+        stored element by element.
+        """
+        acc = value.structure
+        arg = op.attr("arg")
+        view = self.task.args[arg].view
+        dtype = value.type.dtype
+        if not isinstance(acc, MmaAcc) or dtype not in (DType.bf16, DType.f32) or view.pad is not None or self.task.args[arg].dtype is not dtype:
+            return False
+        col = acc.col_axis
+        if view.strides[col] != 1:
+            return False
+        for d in [view.offset, *(st for i, st in enumerate(view.strides) if i != col)]:
+            if not isinstance(d, int) or d % 2:
+                return False
+        self.aligned_args.add(arg)
+        t = _MEMORY_TYPE[dtype]
+        coords_all = self.layout_of(value)
+        for slot in range(0, len(value.regs), 2):
+            tile = self.tile_coords(starts, value.type.shape, coords_all[slot])
+            offset, inside, _ = self.view_address(view, tile)
+            inside = inside or self.const(True, "i1")
+            nxt = self.emit(f"llvm.add {tile[col]}, {self.i32(1)} : i32")
+            second = self.emit(f"llvm.icmp \"ult\" {nxt}, {self.dim(view.shape[col])} : i32")
+            both = self.emit(f"llvm.and {inside}, {second} : i1")
+            past = self.emit(f"llvm.xor {second}, {self.const(True, 'i1')} : i1")
+            only = self.emit(f"llvm.and {inside}, {past} : i1")
+            vec = self.emit(f"llvm.mlir.undef : vector<2x{t}>")
+            vec = self.emit(f"llvm.insertelement {value.regs[slot]}, {vec}[{self.i32(0)} : i32] : vector<2x{t}>")
+            vec = self.emit(f"llvm.insertelement {value.regs[slot + 1]}, {vec}[{self.i32(1)} : i32] : vector<2x{t}>")
+            ptr = self.global_ptr(arg, offset, dtype)
+            self.guarded(both, lambda ptr=ptr, vec=vec: self.raw(f"llvm.store {vec}, {ptr} {{alignment = {2 * _BYTES[dtype]} : i64}} : vector<2x{t}>, !llvm.ptr<1>"))
+            self.guarded(only, lambda ptr=ptr, reg=value.regs[slot]: self.raw(f"llvm.store {reg}, {ptr} : {t}, !llvm.ptr<1>"))
+        return True
 
     def atomic_add(self, op: TOp, args: list[_Value]) -> None:
         index, value, *starts = args
