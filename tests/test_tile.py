@@ -189,3 +189,65 @@ def test_gpt2_small_config_step_matches_eager():
     assert max(errors) < 1e-5, max(errors)
     # Both layers' tasks share templates: unrolling must not multiply the unique task count.
     assert len(program.tasks()) < len(program.launches) / 2
+
+
+FUSION_CASES = [
+    (lambda x, y: olaf.exp(x) * olaf.tanh(y) - x / (olaf.abs(y) + 1.0), (X, Y)),
+    (lambda x, y: olaf.softmax(x * 3.0, axis=1) + y, (X, Y)),
+    (lambda x: olaf.layernorm(olaf.transpose(x, 0, 1) * 2.0), (X,)),
+    (lambda x, y: olaf.einsum("ik,jk->ij", olaf.cast(x > 0.0, F32) * x, y), (X, Y)),
+    (lambda x: olaf.sum(olaf.exp(x - 1.0), axis=0) + olaf.max(olaf.exp(x) * -1.0, axis=0), (X,)),
+    (lambda x: olaf.concat([olaf.exp(x), x * 2.0], axis=1), (X,)),
+]
+
+
+@pytest.mark.parametrize("index", range(len(FUSION_CASES)))
+def test_fusion_preserves_values(index):
+    from olaf.tile.fuse import fuse
+
+    fn, arrays = FUSION_CASES[index]
+    graph = lower(olaf.trace(fn, *(tt(*a.shape) for a in arrays)).graph)
+    unfused = to_tile(graph)
+    fused = fuse(unfused)
+    expected, _ = interpret(graph, list(arrays))
+    actual, _ = run_program(fused, list(arrays))
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-5
+    assert len(fused.launches) < len(unfused.launches)
+
+
+def test_fusion_makes_elementwise_chain_one_task():
+    from olaf.tile.fuse import fuse
+
+    graph = lower(olaf.trace(FUSION_CASES[0][0], tt(3, 5), tt(3, 5)).graph)
+    assert len(fuse(to_tile(graph)).launches) == 1
+
+
+def test_fusion_masks_inlined_lanes_for_reductions():
+    # 300 is not a multiple of the 128-wide reduction tile: the overhanging lanes of the inlined
+    # exp(x) must read as -inf for the max, not exp(0) = 1, or every row max would be at least 1.
+    from olaf.tile.fuse import fuse
+
+    x = R.normal(size=(4, 300)).astype(np.float32) - 10.0
+    graph = lower(olaf.trace(lambda a: olaf.max(olaf.exp(a), axis=1), tt(4, 300)).graph)
+    fused = fuse(to_tile(graph))
+    assert len(fused.launches) == 1
+    assert rel(run_program(fused, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-6
+
+
+def test_gpt2_small_config_step_fused_matches_eager():
+    from test_gpt2 import IDS_SMALL, small_model, split_params, trace_step
+
+    from olaf.tile.fuse import fuse
+
+    model = small_model()
+    params = split_params(model)
+    graph = lower(trace_step(params, model.config).graph)
+    unfused = to_tile(graph)
+    fused = fuse(unfused)
+    leaves = olaf.tree_flatten((params, IDS_SMALL))[0]
+    expected, _ = interpret(graph, leaves)
+    actual, _ = run_program(fused, leaves)
+    errors = [rel(a, e) for a, e in zip(actual, expected)]
+    assert max(errors) < 1e-5, max(errors)
+    assert len(fused.launches) < len(unfused.launches) * 0.6

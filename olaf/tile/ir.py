@@ -77,6 +77,12 @@ class View:
     `shape` is the logical shape. With `pad`, logical index i on an axis maps to stored index
     i - low, and positions in [0, low) or [shape - high, shape) read `fill` instead of memory. That
     keeps pad and concat as address arithmetic instead of materialized copies.
+
+    `source` says which buffer element a view element is, in the buffer's own coordinates: for
+    each buffer axis, (view axis or None, start), meaning buffer index = view index + start, or
+    just start when no view axis moves along it (a broadcast or a size-1 axis). Strides alone
+    give only the address, and fusion needs coordinates: inlining a producer into a consumer means
+    evaluating the producer at the consumer's coordinates. None after a reshape, which mixes axes.
     """
 
     shape: tuple[Dim, ...]
@@ -84,6 +90,7 @@ class View:
     offset: Dim = 0
     pad: tuple[tuple[Dim, Dim], ...] | None = None
     fill: float = 0.0
+    source: tuple[tuple[int | None, Dim], ...] | None = None
 
     @property
     def rank(self) -> int:
@@ -99,7 +106,14 @@ class View:
             text += f" offset={self.offset}"
         if self.pad is not None:
             text += " pad=[" + ",".join(f"{lo}:{hi}" for lo, hi in self.pad) + f"] fill={self.fill!r}"
+        if self.source is not None:
+            text += " source=[" + ",".join(f"{'_' if a is None else a}+{s}" for a, s in self.source) + "]"
         return text
+
+
+def full_view(shape) -> View:
+    """The whole of a contiguous buffer."""
+    return View(tuple(shape), contiguous_strides(shape), 0, None, 0.0, tuple((i, 0) for i in range(len(shape))))
 
 
 def contiguous_strides(shape) -> tuple[Dim, ...]:

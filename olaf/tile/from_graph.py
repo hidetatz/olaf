@@ -20,7 +20,7 @@ from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 from olaf.graph.types import DType, TensorType
 from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
-from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides
+from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides, full_view
 
 ELEMENTWISE_BLOCK = 128
 REDUCE_BLOCK = 128
@@ -64,6 +64,21 @@ def _neutral(fn: str, dtype: DType) -> float | int:
     return int(np.iinfo(dtype.numpy).min)
 
 
+def _shifted(source, axis: int, delta: Dim):
+    """Source map after view axis `axis` is shifted so that new index = old index - delta."""
+    if source is None:
+        return None
+    return tuple((a, s + delta) if a == axis else (a, s) for a, s in source)
+
+
+def _placed(ref: Ref, shape, dims):
+    """Source map after view axis i moves to dims[i] in `shape` (broadcast semantics)."""
+    if ref.view.source is None:
+        return None
+    moved = {i: d for i, d in enumerate(dims) if ref.shape[i] == shape[d]}
+    return tuple((moved.get(a) if a is not None else None, s) for a, s in ref.view.source)
+
+
 def to_tile(graph: Graph) -> Program:
     return _Converter(graph).run()
 
@@ -81,7 +96,7 @@ class _Converter:
     def new_buffer(self, type: TensorType, kind: BufferKind, **fields) -> Ref:
         name = f"b{len(self.buffers)}"
         self.buffers[name] = Buffer(name, TensorType(type.shape, type.dtype), kind, **fields)
-        return Ref(name, View(type.shape, contiguous_strides(type.shape)), type.dtype)
+        return Ref(name, full_view(type.shape), type.dtype)
 
     def launch(self, name: str, grid: Sequence[Dim], refs: Sequence[tuple[Ref, bool]], body) -> None:
         args = tuple(Arg(r.view, r.dtype, writes) for r, writes in refs)
@@ -167,7 +182,7 @@ class _Converter:
             stop = start + ref.shape[axis]
             pad = tuple((start, total - stop) if i == axis else (0, 0) for i in range(ref.view.rank))
             shape = tuple(total if i == axis else d for i, d in enumerate(ref.shape))
-            padded.append(replace(ref, view=replace(ref.view, shape=shape, pad=pad)))
+            padded.append(replace(ref, view=replace(ref.view, shape=shape, pad=pad, source=_shifted(ref.view.source, axis, -start))))
             ends.append(stop)
             start = stop
 
@@ -185,16 +200,19 @@ class _Converter:
 
     def _op_reshape(self, op: Op, inputs: list[Ref]) -> Ref:
         (ref,) = inputs
+        shape = op.attr("shape")
+        if shape == ref.shape:
+            return ref
         if not ref.view.is_contiguous:
             ref = self.materialize(ref)
-        shape = op.attr("shape")
         return replace(ref, view=View(shape, contiguous_strides(shape), ref.view.offset))
 
     def _op_permute(self, op: Op, inputs: list[Ref]) -> Ref:
         (ref,) = inputs
         perm, v = op.attr("perm"), ref.view
         pad = tuple(v.pad[p] for p in perm) if v.pad is not None else None
-        return replace(ref, view=View(tuple(v.shape[p] for p in perm), tuple(v.strides[p] for p in perm), v.offset, pad, v.fill))
+        source = tuple((None if a is None else perm.index(a), s) for a, s in v.source) if v.source is not None else None
+        return replace(ref, view=View(tuple(v.shape[p] for p in perm), tuple(v.strides[p] for p in perm), v.offset, pad, v.fill, source))
 
     def _op_broadcast(self, op: Op, inputs: list[Ref]) -> Ref:
         ref = self.plain(inputs[0])
@@ -202,19 +220,25 @@ class _Converter:
         strides: list[Dim] = [0] * len(shape)
         for i, d in enumerate(dims):
             strides[d] = ref.view.strides[i] if ref.shape[i] == shape[d] else 0
-        return replace(ref, view=View(tuple(shape), tuple(strides), ref.view.offset))
+        return replace(ref, view=View(tuple(shape), tuple(strides), ref.view.offset, source=_placed(ref, shape, dims)))
 
     def _op_slice(self, op: Op, inputs: list[Ref]) -> Ref:
         ref = self.plain(inputs[0])
         starts, stops, v = op.attr("starts"), op.attr("stops"), ref.view
         offset = v.offset + sum((s * st for s, st in zip(starts, v.strides)), 0)
-        return replace(ref, view=View(tuple(e - s for s, e in zip(starts, stops)), v.strides, offset))
+        source = v.source
+        for axis, start in enumerate(starts):
+            source = _shifted(source, axis, start)
+        return replace(ref, view=View(tuple(e - s for s, e in zip(starts, stops)), v.strides, offset, source=source))
 
     def _op_pad(self, op: Op, inputs: list[Ref]) -> Ref:
         ref = self.plain(inputs[0])
         low, high, v = op.attr("low"), op.attr("high"), ref.view
         shape = tuple(lo + d + hi for lo, d, hi in zip(low, v.shape, high))
-        return replace(ref, view=View(shape, v.strides, v.offset, tuple(zip(low, high)), float(op.attr("value"))))
+        source = v.source
+        for axis, lo in enumerate(low):
+            source = _shifted(source, axis, -lo)
+        return replace(ref, view=View(shape, v.strides, v.offset, tuple(zip(low, high)), float(op.attr("value")), source))
 
     # -- reductions -----------------------------------------------------------------------------
 
@@ -331,10 +355,11 @@ class _Converter:
         """View the index tensor over the gather output (or scatter update) shape."""
         index = self.plain(index)
         n_index = index.view.rank - batch_dims
+        dims = tuple(i if i < batch_dims else axis + i - batch_dims for i in range(index.view.rank))
         strides: list[Dim] = [0] * len(shape)
-        for i in range(index.view.rank):
-            strides[i if i < batch_dims else axis + i - batch_dims] = index.view.strides[i]
-        return replace(index, view=View(shape, tuple(strides), index.view.offset)), n_index
+        for i, d in enumerate(dims):
+            strides[d] = index.view.strides[i]
+        return replace(index, view=View(shape, tuple(strides), index.view.offset, source=_placed(index, shape, dims))), n_index
 
     @staticmethod
     def _axis_map(rank: int, axis: int, n_index: int) -> tuple[int, ...]:
