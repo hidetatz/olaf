@@ -136,7 +136,9 @@ class _Rewriter:
         return self.args.index(key)
 
     def allowed(self, op: TOp) -> _Pointwise | None:
-        if op.kind != "load" or self.keep:
+        if op.kind not in ("load", "load_indexed") or self.keep:
+            return None
+        if op.kind == "load_indexed" and not self.indexed_ok(op):
             return None
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
@@ -152,10 +154,26 @@ class _Rewriter:
             return None
         return recipe
 
+    def indexed_ok(self, op: TOp) -> bool:
+        """A gather may evaluate its producer at the gathered positions (GPT-2's loss reads 4096
+        of 4096 x 50257 shifted logits): no iota in the producer (its coordinates come from the
+        index there), and no reduction or dot in the consumer, whose store drops every lane
+        outside the tensor, so no mask is needed."""
+        name = self.launch.buffers[op.attr("arg")]
+        recipe = self.recipes.get(name)
+        if recipe is None or any(o.kind == "iota" for o in recipe.launch.task.body.ops):
+            return False
+        return not (_contains(self.launch.task.body, "reduce") or _contains(self.launch.task.body, "dot"))
+
     def body(self, body: Body, subst: dict[TValue, TValue]) -> Body:
         b = TileBuilder()
         for op in body.ops:
             recipe = self.allowed(op)
+            if recipe is not None and op.kind == "load_indexed":
+                index, *starts = [subst.get(v, v) for v in op.inputs]
+                subst[op.outputs[0]] = self.inline(b, op, recipe, starts, index=index)
+                self.changed = True
+                continue
             if recipe is not None:
                 subst[op.outputs[0]] = self.inline(b, op, recipe, [subst.get(v, v) for v in op.inputs])
                 self.changed = True
@@ -170,7 +188,7 @@ class _Rewriter:
             b.ops.append(TOp(op.kind, tuple(subst.get(v, v) for v in op.inputs), outputs, attrs, regions))
         return Body(body.params, tuple(b.ops), tuple(subst.get(v, v) for v in body.results))
 
-    def inline(self, b: TileBuilder, load: TOp, recipe: _Pointwise, starts: Sequence[TValue]) -> TValue:
+    def inline(self, b: TileBuilder, load: TOp, recipe: _Pointwise, starts: Sequence[TValue], index: TValue | None = None) -> TValue:
         consumer_view = self.launch.task.args[load.attr("arg")].view
         tile = load.attr("shape")
         producer = recipe.launch
@@ -183,8 +201,11 @@ class _Rewriter:
             if op.kind == "load":
                 arg = producer.task.args[op.attr("arg")]
                 view = _compose(arg.view, consumer_view)
-                index = self.arg_index(producer.buffers[op.attr("arg")], Arg(view, arg.dtype, False))
-                out = b.op("load", *starts, arg=index, shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
+                slot = self.arg_index(producer.buffers[op.attr("arg")], Arg(view, arg.dtype, False))
+                if index is not None:
+                    out = b.op("load_indexed", index, *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), axis_map=load.attr("axis_map"), other=op.attr("other"))
+                else:
+                    out = b.op("load", *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
             elif op.kind == "iota":
                 axis = recipe.starts.index(op.inputs[0])
                 out = self.coordinate(b, consumer_view, starts, tile, axis)
@@ -197,6 +218,8 @@ class _Rewriter:
         result = mapped[recipe.store.inputs[0]]
         if result.type.shape != tile:
             result = b.op("broadcast", result, shape=tile, dims=())
+        if index is not None:
+            return result
         if consumer_view.pad is not None:
             # The replaced load read `fill` there; the inlined ops would give f(fill, ...).
             fill = b.full(tile, consumer_view.fill, result.type.dtype)

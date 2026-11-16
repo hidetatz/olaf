@@ -612,7 +612,12 @@ def _cross_entropy(b, op, c):
     axis = logits.type.rank - 1
     per_item = b.op("div", c, element_count(b, labels.type.shape, logits.type.dtype))
     p = b.op("softmax", logits, axis=axis)
-    spread = b.op("mul", p, b.op("broadcast", per_item, shape=logits.type.shape, dims=()))
-    picked = b.op("broadcast", per_item, shape=labels.type.shape, dims=()) if labels.type.shape else per_item
-    # Scatter -1/N into the softmax term directly instead of building a one-hot N x V tensor and subtracting it.
-    return [b.op("scatter_add", spread, labels, b.op("neg", picked), axis=axis, batch_dims=axis), None]
+    shape = logits.type.shape
+    # The one-hot is a comparison of the class index with the label, not a materialized N x V
+    # tensor: after fusion the whole gradient is one pass that writes (p - [i == label]) / N.
+    # (A scatter_add of -1/N into p would need p materialized in f32 first, then a second and a
+    # third pass to scatter and to cast: three passes over GPT-2's 4096 x 50257 logits.)
+    hit = b.op("cmp", b.op("iota", shape=shape, axis=axis, dtype=labels.type.dtype), b.op("broadcast", labels, shape=shape, dims=tuple(range(axis))), fn="eq")
+    onehot = b.op("cast", hit, dtype=logits.type.dtype)
+    scale = b.op("broadcast", per_item, shape=shape, dims=())
+    return [b.op("mul", b.op("sub", p, onehot), scale), None]
