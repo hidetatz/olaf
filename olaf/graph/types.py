@@ -25,13 +25,13 @@ class DType(StrEnum):
 
     @property
     def numpy(self) -> np.dtype:
-        # NumPy has no bf16. Correct rounding emulation of bf16 arithmetic arrives in P1, where bf16 is
-        # first executed. Silently computing in f32 would make the reference meaningless, so stop here.
-        # Constants do not go through this: ConstantData stores bf16 as bit patterns, so bf16 graphs
-        # can be traced, decomposed and lowered before eager bf16 exists.
-        if self is DType.bf16:
-            raise NotImplementedError("eager execution of bf16 is implemented in P1")
-        return np.dtype({"f32": "float32", "f64": "float64", "i32": "int32", "i64": "int64", "u32": "uint32", "bool": "bool"}[self.value])
+        """The NumPy dtype that holds values of this type in the reference interpreters.
+
+        NumPy has no bf16, so bf16 values are held in float32 arrays, restricted to the bf16 grid:
+        the interpreters round every bf16 result (graph.ir.bf16_round). Constants keep the bf16 bit
+        patterns instead (ConstantData), and device buffers store the 16-bit encoding.
+        """
+        return np.dtype({"f32": "float32", "bf16": "float32", "f64": "float64", "i32": "int32", "i64": "int64", "u32": "uint32", "bool": "bool"}[self.value])
 
 
 class StateKind(Enum):

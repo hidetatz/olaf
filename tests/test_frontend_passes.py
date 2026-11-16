@@ -7,6 +7,7 @@ import olaf
 from olaf.backend.capability import AMPERE_RTX3060, CPU, AsyncCopy
 from olaf.graph.builder import GraphBuilder, verify
 from olaf.graph.interp import interpret
+from olaf.graph.ir import bf16_round
 from olaf.graph.types import StateKind, TensorType
 from olaf.passes.canonicalize import canonicalize
 from olaf.passes.decompose import decompose
@@ -162,15 +163,35 @@ class TestTrace:
         traced = olaf.trace(lambda x: olaf.where(olaf.equal(x, 0.0), olaf.constant(False), True), tt(3))
         np.testing.assert_array_equal(traced.eager(np.array([0, 1, 0], np.float32))[0], [False, True, False])
 
-    def test_bf16_training_graph_traces_and_decomposes(self):
-        # bf16 eager arrives in P1, but the graph must already be buildable for lowering.
+    def test_bf16_training_graph_error_is_comparable_to_torch_bf16(self):
+        # Judged against the f64 truth as a multiple of PyTorch bf16's own error, not with the
+        # fixed 1e-2: the layernorm gradient over 4 elements cancels strongly, and PyTorch bf16
+        # is itself several percent away from the truth here (CLAUDE.md, the testing section).
         def loss(w, x):
             return olaf.sum(olaf.gelu(olaf.layernorm(x * w + 1.0), "tanh"))
 
-        traced = olaf.trace(lambda w, x: olaf.value_and_grad(loss)(w, x), tt(4, dtype=olaf.bf16), tt(3, 4, dtype=olaf.bf16))
+        rng = np.random.default_rng(5)
+        w, x = (bf16_round(rng.normal(size=s)) for s in [(4,), (3, 4)])
+        step = lambda dtype: olaf.trace(lambda w, x: olaf.value_and_grad(loss)(w, x), tt(4, dtype=dtype), tt(3, 4, dtype=dtype))  # noqa: E731
+        traced = step(olaf.bf16)
         verify(decompose(traced.graph))
-        with pytest.raises(NotImplementedError):
-            traced.eager(np.ones(4, np.float32), np.ones((3, 4), np.float32))
+        (value, grad), _ = traced.eager(w, x)
+        (ref_value, ref_grad), _ = step(olaf.f64).eager(w.astype(np.float64), x.astype(np.float64))
+        assert grad.dtype == np.float32 and np.array_equal(bf16_round(grad), grad)
+
+        tw = torch.tensor(w, dtype=torch.bfloat16, requires_grad=True)
+        torch_loss = F.gelu(F.layer_norm(torch.tensor(x, dtype=torch.bfloat16) * tw + 1.0, (4,)), approximate="tanh").sum()
+        torch_loss.backward()
+        torch_error = rel(tw.grad.float().numpy(), ref_grad)
+        assert rel(grad, ref_grad) < 3 * torch_error, (rel(grad, ref_grad), torch_error)
+        assert rel(value, ref_value) < 3 * max(rel(torch_loss.item(), ref_value), 1e-3)
+
+    def test_bf16_rounds_contract_once_from_the_exact_sum(self):
+        # Rounding the exact sum 1 + 2^-8 + 2^-9 gives 1 + 2^-7. Rounding after each addition gives 1:
+        # 1 + 2^-8 is a tie between 1 and 1 + 2^-7 and rounds to even.
+        a = np.array([1.0, 2.0**-8, 2.0**-9], np.float32)
+        out, _ = olaf.trace(lambda v: olaf.einsum("i,i->", v, olaf.ones((3,), olaf.bf16)), tt(3, dtype=olaf.bf16)).eager(a)
+        assert out == np.float32(1.0 + 2.0**-7)
 
 
 class TestControlFlowCapture:

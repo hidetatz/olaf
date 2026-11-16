@@ -74,6 +74,11 @@ def bf16_values(bits: np.ndarray) -> np.ndarray:
     return (np.asarray(bits, dtype=np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32)
 
 
+def bf16_round(value) -> np.ndarray:
+    """Round to the nearest bf16 (ties to even), held in float32: the reference form of bf16 values."""
+    return bf16_values(bf16_bits(value)).reshape(np.shape(value))
+
+
 @dataclass(frozen=True, eq=False)
 class Op:
     kind: str

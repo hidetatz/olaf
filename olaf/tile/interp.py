@@ -18,7 +18,7 @@ import numpy as np
 from scipy.special import erf
 
 from olaf.graph.dim import as_symbol, bind, evaluate
-from olaf.graph.ir import Graph, Value, symbol_table
+from olaf.graph.ir import Graph, Value, bf16_round, bf16_values, symbol_table
 from olaf.graph.types import DType
 from olaf.tile.ir import Body, BufferKind, Program, Task, TOp, TValue, View
 
@@ -73,9 +73,11 @@ def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarr
             array = given[b.name]
             if array.shape != shape or array.dtype != b.type.dtype.numpy:
                 raise TypeError(f"buffer {b.name} expects {b.type} = {shape}, got {array.dtype}{array.shape}")
-            storage[b.name] = np.ascontiguousarray(array).reshape(-1).copy()
+            flat = np.ascontiguousarray(array).reshape(-1).copy()
+            storage[b.name] = bf16_round(flat) if b.type.dtype is DType.bf16 else flat
         elif b.kind is BufferKind.constant:
-            storage[b.name] = np.asarray(b.constant.array).reshape(-1).copy()
+            data = b.constant.array
+            storage[b.name] = (bf16_values(data) if b.type.dtype is DType.bf16 else np.asarray(data)).reshape(-1).copy()
         else:
             # NaN (or an extreme integer) instead of zeros, so a task that reads an unwritten element shows up in the result.
             fill = np.nan if b.type.dtype.is_float else 0
@@ -150,6 +152,8 @@ class _Run:
             outputs = self.op(op, [self.values[v] for v in op.inputs])
             for v, array in zip(op.outputs, outputs, strict=True):
                 array = np.asarray(array)
+                if v.type.dtype is DType.bf16 and array.dtype in (np.float32, np.float64):
+                    array = bf16_round(array)
                 if array.shape != v.type.shape or array.dtype != v.type.dtype.numpy:
                     raise TypeError(f"{op.kind} produced {array.dtype}{array.shape}, declared {v.type}")
                 self.values[v] = array
@@ -178,6 +182,8 @@ class _Run:
         if kind == "where":
             return [np.where(*args)]
         if kind == "cast":
+            if op.attr("dtype") is DType.bf16:
+                return [args[0].astype(np.float64)]  # rounded once in body()
             return [args[0].astype(op.attr("dtype").numpy)]
         if kind == "full":
             return [np.full(op.attr("shape"), op.attr("value"), op.attr("dtype").numpy)]

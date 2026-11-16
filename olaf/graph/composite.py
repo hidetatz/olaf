@@ -19,6 +19,23 @@ Rule = Callable[[GraphBuilder, Sequence[Value], dict], list[Value]]
 RULES: dict[str, Rule] = {}
 
 
+def widen_bf16(b: GraphBuilder, values: Sequence[Value]) -> list[Value]:
+    """Cast bf16 values to f32 (others pass through): composites compute bf16 inputs in f32.
+
+    PyTorch (and autocast) compute the inside of layernorm, softmax, gelu and cross entropy in f32
+    for bf16 tensors and round only the outputs. Decomposing in bf16 would round every
+    intermediate (mean, variance, max, exp sums) instead, which measurably moves the loss: on a
+    small layernorm-gelu graph the bf16 loss error grew from below 1e-3 to 9e-3. Matching
+    PyTorch's convention is what lets a bf16 training run follow PyTorch's loss curve.
+    """
+    return [b.op("cast", v, dtype=DType.f32) if v.type.dtype is DType.bf16 else v for v in values]
+
+
+def narrow_like(b: GraphBuilder, values: Sequence[Value | None], like: Sequence[Value]) -> list[Value | None]:
+    """Cast results computed in f32 back to the dtype of the corresponding original value."""
+    return [v if v is None or v.type.dtype is ref.type.dtype else b.op("cast", v, dtype=ref.type.dtype) for v, ref in zip(values, like, strict=True)]
+
+
 def _rule(name: str):
     def wrap(fn: Rule) -> Rule:
         RULES[name] = fn

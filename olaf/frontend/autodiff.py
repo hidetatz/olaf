@@ -19,9 +19,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
-from olaf.graph.composite import attention_probabilities, attention_scores, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, reduced_mean
+from olaf.graph.composite import attention_probabilities, attention_scores, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, widen_bf16
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
+from olaf.graph.types import DType
 
 Cot = Value | None
 VJP = Callable[[GraphBuilder, Op, Value], Sequence[Cot]]
@@ -252,10 +253,20 @@ def _reverse(b: GraphBuilder, ops: Sequence[Op], cots: dict[Value, Value], activ
             continue
         if op.kind in _NOT_DIFFERENTIABLE:
             continue
-        inputs_cots = _RULES[op.kind](b, op, cots[op.outputs[0]])
+        inputs_cots = _vjp(b, op, cots[op.outputs[0]])
         for value, cot in zip(op.inputs, inputs_cots, strict=True):
             if cot is not None and value in active:
                 _accumulate(b, cots, value, cot)
+
+
+def _vjp(b: GraphBuilder, op: Op, cot: Value) -> list[Value | None]:
+    if not OPS[op.kind].composite or not any(v.type.dtype is DType.bf16 for v in (*op.inputs, *op.outputs)):
+        return _RULES[op.kind](b, op, cot)
+    # A bf16 composite's backward computes in f32 too, matching its forward (graph.composite.widen_bf16).
+    # The rule receives an f32 stand-in for the op. Its outputs are casts of the bf16 outputs
+    # (softmax's VJP reads its output), as PyTorch's softmax backward reads the bf16 output.
+    wide = Op(op.kind, tuple(widen_bf16(b, op.inputs)), tuple(widen_bf16(b, op.outputs)), op.attrs)
+    return narrow_like(b, _RULES[op.kind](b, wide, widen_bf16(b, [cot])[0]), op.inputs)
 
 
 def _reverse_scan(b: GraphBuilder, op: Op, record: _ScanRecord, cots: dict[Value, Value], active: set[Value]) -> None:

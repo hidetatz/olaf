@@ -13,9 +13,9 @@ import numpy as np
 from scipy.special import erf
 
 from olaf.graph.dim import as_symbol, bind, evaluate
-from olaf.graph.ir import Graph, Op, Value, symbol_table
+from olaf.graph.ir import Graph, Op, Value, bf16_round, bf16_values, symbol_table
 from olaf.graph.ops import OPS
-from olaf.graph.types import TensorType
+from olaf.graph.types import DType, TensorType
 
 Observer = Callable[[Value, np.ndarray], None]
 
@@ -79,7 +79,15 @@ class _Run:
         return tuple(evaluate(d, self.env) for d in dims)
 
     def check(self, value: Value, array: np.ndarray) -> np.ndarray:
+        """Check an op result against its type. bf16 results are rounded here, once per op.
+
+        Elementwise ops compute in f32 on bf16 inputs and are then rounded to bf16, as a device
+        does. Ops whose definition is "exact, then rounded" (contract, reduce sum, cast) produce
+        the f64 value and are rounded from it directly: rounding to f32 first would round twice.
+        """
         expected = self.shape(value.type.shape)
+        if value.type.dtype is DType.bf16 and array.dtype in (np.float32, np.float64):
+            array = bf16_round(array)
         if array.shape != expected or array.dtype != value.type.dtype.numpy:
             raise TypeError(f"value does not match type: {array.dtype}{array.shape} / {value.type} = {expected}")
         return array
@@ -143,6 +151,8 @@ _elementwise("where", np.where)
 
 @_handler("cast")
 def _cast(run, op, args):
+    if op.attr("dtype") is DType.bf16:
+        return [args[0].astype(np.float64)]  # rounded once by check
     return [args[0].astype(op.attr("dtype").numpy)]
 
 
@@ -157,6 +167,8 @@ def _reduce(run, op, args):
     x, axes = args[0], op.attr("axes")
     if op.attr("fn") == "sum":
         # Without an explicit dtype, integer sums widen to i64 and disagree with the declared type.
+        if op.inputs[0].type.dtype is DType.bf16:
+            return [np.sum(x, axis=axes, dtype=np.float64)]  # rounded once by check
         if x.dtype == np.float32:
             return [np.sum(x, axis=axes, dtype=np.float64).astype(np.float32)]
         return [np.sum(x, axis=axes, dtype=x.dtype)]
@@ -171,6 +183,8 @@ def _contract(run, op, args):
     # f32 accumulates in f64 and then rounds: a reference must not depend on BLAS summation order.
     # GPT-2 logits sit near -100 and differ by only about 3 across the vocabulary. Accumulating in
     # f32 grows the error in those differences, which drive the loss, to about 1e-4 (a norm ratio shows only 3e-7).
+    if op.inputs[0].type.dtype is DType.bf16:
+        return [np.einsum(op.attr("spec"), *(a.astype(np.float64) for a in args), optimize=True)]  # rounded once by check
     if args[0].dtype == np.float32:
         wide = np.einsum(op.attr("spec"), *(a.astype(np.float64) for a in args), optimize=True)
         return [wide.astype(np.float32)]
@@ -254,7 +268,8 @@ def _scatter_add(run, op, args):
 
 @_handler("constant")
 def _constant(run, op, args):
-    return [op.attr("value").array]
+    data = op.attr("value")
+    return [bf16_values(data.array).reshape(data.shape) if data.dtype is DType.bf16 else data.array]
 
 
 @_handler("iota")
