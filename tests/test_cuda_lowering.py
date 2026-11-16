@@ -262,3 +262,20 @@ def test_short_row_reduction_result_is_used_by_every_thread():
     # broadcast back over the row, so every thread must hold it, not only thread 0.
     x = R.normal(size=(4, 5)).astype(np.float32)
     run_both(lambda a: a - olaf.broadcast_to(olaf.reshape(olaf.max(a, axis=1), (4, 1)), (4, 5)), [x], fused=True)
+
+
+def test_kernel_cache_skips_lowering_on_the_second_compile(tmp_path, monkeypatch):
+    # Not a GPU test at heart: lowering and PTX generation need no device.
+    import olaf.backend.cuda.runtime as runtime
+
+    monkeypatch.setenv("OLAF_CACHE_DIR", str(tmp_path))
+    graph = lower(olaf.trace(lambda x: olaf.tanh(x) * 2.0, tt(3, 5)).graph)
+    task = to_program(graph).launches[0].task
+    first = runtime._compiled(task, "sm_86")
+
+    def fail(task):
+        raise AssertionError("lowered again")
+
+    monkeypatch.setattr(runtime, "lower_task", fail)
+    second = runtime._compiled(task, "sm_86")
+    assert second[1] == first[1] and second[0].text == first[0].text

@@ -21,9 +21,9 @@ def lower_graph(graph: Graph) -> Graph:
     return eliminate_common_subexpressions(canonicalize(unroll_scans(decompose(graph))))
 
 
-def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True) -> Program:
-    """graph must be the output of lower_graph."""
-    program = to_tile(graph, capability)
+def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True, schedules=None) -> Program:
+    """graph must be the output of lower_graph. schedules: search.tune results (None: defaults)."""
+    program = to_tile(graph, capability, schedules)
     if fused:
         # Epilogues first as well: a cheap consumer of a dot (a bias add) read by several tasks
         # would otherwise be duplicated into each of them, each materializing its own copy.

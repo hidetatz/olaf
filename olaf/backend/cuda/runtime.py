@@ -53,12 +53,71 @@ class _Kernel:
         return self
 
 
-def _load(lowered: Lowered, target: str) -> _Kernel:
-    function = driver.Module(compile_ptx(lowered.text, target)).function("task")
+def _load(lowered: Lowered, ptx: dict[str, str]) -> _Kernel:
+    function = driver.Module(ptx[lowered.text]).function("task")
     if lowered.shared_bytes > 48 * 1024:
         function.set_shared_bytes(lowered.shared_bytes)
-    fallback = _load(lowered.fallback, target) if lowered.fallback is not None else None
+    fallback = _load(lowered.fallback, ptx) if lowered.fallback is not None else None
     return _Kernel(lowered, function, fallback)
+
+
+def _compiled(task, target: str) -> tuple[Lowered, dict[str, str]]:
+    """Lowered task and the PTX of it (and of its fallback), from the disk cache when possible.
+
+    The key is the task's template text, the target and a fingerprint of the compiler's own
+    source, so any change to olaf invalidates every entry. Lowering in Python is most of the
+    cost (GPT-2 small's step takes about 30 s cold), so the cache is consulted before lowering.
+    """
+    import hashlib
+    import pickle
+
+    key = hashlib.sha256(f"{task.text()}\n{target}\n{_fingerprint()}".encode()).hexdigest()
+    path = _cache_dir() / f"{key}.pickle"
+    if path.exists():
+        try:
+            return pickle.loads(path.read_bytes())
+        except Exception:
+            pass  # a damaged or incompatible entry is recompiled
+    lowered = lower_task(task)
+    ptx = {}
+    current = lowered
+    while current is not None:
+        ptx[current.text] = compile_ptx(current.text, target)
+        current = current.fallback
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(pickle.dumps((lowered, ptx)))
+        tmp.replace(path)
+    except OSError:
+        pass  # the cache is an optimization only
+    return lowered, ptx
+
+
+def _cache_dir():
+    import os
+    from pathlib import Path
+
+    return Path(os.environ.get("OLAF_CACHE_DIR", Path.home() / ".cache" / "olaf")) / "kernels"
+
+
+_FINGERPRINT: list[str] = []
+
+
+def _fingerprint() -> str:
+    if not _FINGERPRINT:
+        import hashlib
+        from pathlib import Path
+
+        import olaf
+
+        root = Path(olaf.__file__).resolve().parent
+        digest = hashlib.sha256()
+        for source in sorted(root.rglob("*.py")):
+            digest.update(source.relative_to(root).as_posix().encode())
+            digest.update(source.read_bytes())
+        _FINGERPRINT.append(digest.hexdigest())
+    return _FINGERPRINT[0]
 
 
 class CudaProgram:
@@ -68,7 +127,7 @@ class CudaProgram:
         target = chip(dev.compute_capability)
         self.kernels: dict[str, _Kernel] = {}
         for key, task in program.tasks().items():
-            self.kernels[key] = _load(lower_task(task), target)
+            self.kernels[key] = _load(*_compiled(task, target))
         self.symbols = _symbols(program)
         self.stream = driver.Stream()
 

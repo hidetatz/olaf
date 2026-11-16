@@ -1,4 +1,10 @@
+import os
+import tempfile
+
 import pytest
+
+# Compiled kernels go to a cache per test session, not to the user's ~/.cache/olaf.
+os.environ.setdefault("OLAF_CACHE_DIR", tempfile.mkdtemp(prefix="olaf-test-cache-"))
 
 
 def pytest_collection_modifyitems(config, items):

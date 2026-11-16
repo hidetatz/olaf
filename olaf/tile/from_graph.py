@@ -169,15 +169,20 @@ def _placed(ref: Ref, shape, dims):
     return tuple((moved.get(a) if a is not None else None, s) for a, s in ref.view.source)
 
 
-def to_tile(graph: Graph, capability: Capability = CPU) -> Program:
-    """Default tile shapes come from the capability: matrix instructions change the dot tiles."""
-    return _Converter(graph, capability).run()
+def to_tile(graph: Graph, capability: Capability = CPU, schedules=None) -> Program:
+    """Default tile shapes come from the capability: matrix instructions change the dot tiles.
+
+    schedules maps search.schedule.dot_key -> DotSchedule (found by search.tune); dots without
+    an entry use the defaults below.
+    """
+    return _Converter(graph, capability, schedules or {}).run()
 
 
 class _Converter:
-    def __init__(self, graph: Graph, capability: Capability) -> None:
+    def __init__(self, graph: Graph, capability: Capability, schedules=None) -> None:
         self.graph = graph
         self.capability = capability
+        self.schedules = schedules or {}
         self.buffers: dict[str, Buffer] = {}
         self.launches: list[Launch] = []
         self.refs: dict[Value, Ref] = {}
@@ -452,6 +457,12 @@ class _Converter:
         matrix = len(base) == 1 and any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == next(iter(base)).value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
         bm, bn, bk = MATRIX_DOT_BLOCK if matrix else DOT_BLOCK
         stages, warps = (MATRIX_DOT_STAGES, MATRIX_DOT_WARPS) if matrix else (1, 4)
+        if matrix:
+            from olaf.search.schedule import dot_key
+
+            chosen = self.schedules.get(dot_key(op.attr("spec"), [v.type.shape for v in op.inputs], next(iter(base)).value, self.capability.digest()))
+            if chosen is not None:
+                bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
         extent = {c: 1 for c in size}
         if m_inner:
             extent[m_inner] = _block(size[m_inner], bm)
