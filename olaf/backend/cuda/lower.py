@@ -1,8 +1,8 @@
 """Lowering of one Tile IR task to an NVVM-dialect MLIR module (per-thread code).
 
-Thread mapping. One CUDA block of THREADS threads runs one grid instance. A tile of N > 1
-elements is spread cyclically: element e (row-major) lives in thread e % THREADS, register slot
-e // THREADS. Every tile with the same element count therefore has the same layout, so reshape is
+Thread mapping. One CUDA block of T = 32 * task.warps threads runs one grid instance. A tile of
+N > 1 elements is spread cyclically: element e (row-major) lives in thread e % T, register slot
+e // T. Every tile with the same element count therefore has the same layout, so reshape is
 free and elementwise ops work slot by slot; consecutive threads own consecutive elements, so loads
 along the last axis coalesce. A tile of one element (scalars, tile starts, row results) is
 replicated in every thread instead: it is what every thread needs to address memory.
@@ -28,7 +28,7 @@ from olaf.graph.types import DType
 from olaf.tile.builder import INDEX
 from olaf.tile.ir import Body, Task, TileType, TOp, TValue, View
 
-THREADS = 128
+DEFAULT_WARPS = 4
 
 _LLVM = {DType.f32: "f32", DType.f64: "f64", DType.bf16: "bf16", DType.i32: "i32", DType.i64: "i64", DType.u32: "i32", DType.bool: "i1"}
 _MEMORY_TYPE = {**_LLVM, DType.bool: "i8"}
@@ -46,8 +46,12 @@ class Lowered:
 
     text: str
     dims: list[Dim]  # runtime i32 parameters after the buffer pointers, in order
-    shared_bytes: int
-    threads: int = THREADS
+    shared_bytes: int  # dynamic shared memory per block
+    threads: int
+    # Dimensions that must be multiples of 8 for this kernel to be valid (16-byte async copies of
+    # bf16). The host checks them per launch and uses `fallback` when one is not.
+    aligned: list[Dim] = field(default_factory=list)
+    fallback: Lowered | None = None
 
 
 def _compute_type(dtype: DType) -> str:
@@ -56,16 +60,25 @@ def _compute_type(dtype: DType) -> str:
 
 @dataclass
 class _Value:
-    """A lowered tile: one SSA name per register slot, or one replicated name."""
+    """A lowered tile: one SSA name per register slot, or one replicated name.
+
+    The layout is the cyclic one of _Emitter.coords unless `coords` gives each slot's tile
+    coordinates explicitly (with `valid`, the optional per-slot guard). Explicit layouts come from
+    matrix instructions, whose accumulator fragments put elements in fixed (row, col) positions;
+    elementwise ops, cast, permute and unit reshapes then work on them without moving data.
+    """
 
     regs: list[str]
     replicated: bool
     type: TileType
+    coords: list[list[str]] | None = None
+    valid: list[str | None] | None = None
 
 
 @dataclass
 class _Emitter:
     task: Task
+    use_matrix: bool = True
     lines: list[str] = field(default_factory=list)
     counter: int = 0
     dims: dict[str, tuple[int, Dim]] = field(default_factory=dict)
@@ -76,6 +89,11 @@ class _Emitter:
     coords_cache: dict[tuple[int, ...], list[list[str]]] = field(default_factory=dict)
     blocks: int = 0
     entry_constants: list[str] = field(default_factory=list)
+    aligned: list[Dim] = field(default_factory=list)
+
+    @property
+    def threads(self) -> int:
+        return 32 * self.task.warps
 
     # -- basic emission -------------------------------------------------------------------------
 
@@ -155,12 +173,12 @@ class _Emitter:
 
     def slots(self, shape) -> int:
         n = self.count(shape)
-        return 1 if n == 1 else -(-n // THREADS)
+        return 1 if n == 1 else -(-n // self.threads)
 
     def flat_index(self, slot: int) -> str:
         key = ("flat", slot)
         if key not in self.constants:
-            self.constants[key] = self.entry(f"llvm.add %tid, {self.i32(slot * THREADS)} : i32") if slot else "%tid"
+            self.constants[key] = self.entry(f"llvm.add %tid, {self.i32(slot * self.threads)} : i32") if slot else "%tid"
         return self.constants[key]
 
     def coords(self, shape: tuple[int, ...]) -> list[list[str]]:
@@ -186,15 +204,55 @@ class _Emitter:
     def valid(self, shape, slot: int) -> str | None:
         """i1 'this slot holds an element' when the last slot is partial, else None."""
         n = self.count(shape)
-        if n == 1 or n % THREADS == 0 or slot < self.slots(shape) - 1:
+        if n == 1 or n % self.threads == 0 or slot < self.slots(shape) - 1:
             return None
         key = ("valid", n, slot)
         if key not in self.constants:
             self.constants[key] = self.entry(f"llvm.icmp \"ult\" {self.flat_index(slot)}, {self.i32(n)} : i32")
         return self.constants[key]
 
-    def make(self, t: TileType, regs: list[str]) -> _Value:
+    def make(self, t: TileType, regs: list[str], like: _Value | None = None) -> _Value:
+        """A value in the cyclic layout of t, or in the explicit layout of `like`."""
+        if like is not None and like.coords is not None:
+            return _Value(regs, False, t, like.coords, like.valid)
         return _Value(regs, self.count(t.shape) == 1, t)
+
+    def layout_of(self, v: _Value) -> list[list[str]]:
+        return v.coords if v.coords is not None else self.coords(v.type.shape)
+
+    def valid_of(self, v: _Value, slot: int) -> str | None:
+        if v.coords is not None:
+            return v.valid[slot] if v.valid is not None else None
+        return self.valid(v.type.shape, slot)
+
+    def relayout(self, v: _Value, like: _Value) -> _Value:
+        """v's elements in the layout of `like` (same shape), through shared memory."""
+        if v.coords is like.coords or (v.replicated and like.coords is None):
+            return v
+        if v.replicated:
+            return _Value([v.regs[0]] * len(like.regs), False, v.type, like.coords, like.valid)
+        self.to_shared(v)
+        regs = []
+        for slot, coords in enumerate(self.layout_of(like)):
+            index = self.linear(coords, v.type.shape)
+            guard = self.valid_of(like, slot)
+            if guard is not None:
+                index = self.emit(f"llvm.select {guard}, {index}, {self.i32(0)} : i1, i32")
+            regs.append(self.load_shared(index, v.type.dtype))
+        if like.coords is None:
+            return self.make(v.type, regs)
+        return _Value(regs, False, v.type, like.coords, like.valid)
+
+    def cyclic(self, v: _Value) -> _Value:
+        if v.coords is None:
+            return v
+        return self.relayout(v, _Value([], self.count(v.type.shape) == 1, v.type))
+
+    def unify(self, args: list[_Value]) -> list[_Value]:
+        explicit = next((a for a in args if a.coords is not None), None)
+        if explicit is None:
+            return args
+        return [self.relayout(a, explicit) for a in args]
 
     def spread(self, v: _Value, t: TileType) -> list[str]:
         """Registers of v in the layout of shape t (only for replicated v)."""
@@ -213,10 +271,11 @@ class _Emitter:
         if v.replicated:
             self.store_shared(self.i32(0), v.regs[0], v.type.dtype)
         else:
+            layout = self.layout_of(v)
             for slot, reg in enumerate(v.regs):
-                index = self.flat_index(slot)
-                guard = self.valid(v.type.shape, slot)
-                self.guarded(guard, lambda: self.store_shared(index, reg, v.type.dtype))
+                index = self.flat_index(slot) if v.coords is None else self.linear(layout[slot], v.type.shape)
+                guard = self.valid_of(v, slot)
+                self.guarded(guard, lambda index=index, reg=reg: self.store_shared(index, reg, v.type.dtype))
         self.barrier()
 
     def store_shared(self, index: str, reg: str, dtype: DType) -> None:
@@ -428,22 +487,40 @@ class _Emitter:
             axis = attrs["axis"]
             return [self.make(out_t, [self.emit(f"llvm.add {start}, {c[axis]} : i32") for c in coords])]
         if kind == "reshape":
-            return [self.make(out_t, list(args[0].regs))]
+            src = args[0]
+            if src.coords is None:
+                return [self.make(out_t, list(src.regs))]
+            if [d for d in src.type.shape if d != 1] != [d for d in out_t.shape if d != 1]:
+                return [self.make(out_t, list(self.cyclic(src).regs))]
+            # Only unit axes appear or disappear: relabel the coordinates.
+            zero = self.i32(0)
+            coords = []
+            for c in src.coords:
+                big = [x for x, d in zip(c, src.type.shape) if d != 1]
+                coords.append([big.pop(0) if d != 1 else zero for d in out_t.shape])
+            return [_Value(list(src.regs), False, out_t, coords, src.valid)]
+        if kind == "permute" and args[0].coords is not None:
+            perm = attrs["perm"]
+            src = args[0]
+            return [_Value(list(src.regs), False, out_t, [[c[p] for p in perm] for c in src.coords], src.valid)]
         if kind in ("broadcast", "permute"):
-            return [self.exchange(op, args[0], out_t)]
+            return [self.exchange(op, self.cyclic(args[0]), out_t)]
+        if kind in ("cmp", "where") or (kind not in ("full", "dim", "iota", "cast", "reduce", "dot", "load", "load_indexed", "store", "atomic_add_indexed", "for")):
+            args = self.unify(args)
         if kind == "cmp":
             a, b = args
-            return [self.make(out_t, [self.compare(attrs["fn"], x, y, a.type.dtype) for x, y in zip(a.regs, b.regs)])]
+            return [self.make(out_t, [self.compare(attrs["fn"], x, y, a.type.dtype) for x, y in zip(a.regs, b.regs)], a)]
         if kind == "where":
             c, a, b = args
             t = _LLVM[a.type.dtype]
-            return [self.make(out_t, [self.emit(f"llvm.select {p}, {x}, {y} : i1, {t}") for p, x, y in zip(c.regs, a.regs, b.regs)])]
+            return [self.make(out_t, [self.emit(f"llvm.select {p}, {x}, {y} : i1, {t}") for p, x, y in zip(c.regs, a.regs, b.regs)], a)]
         if kind == "cast":
-            return [self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs])]
+            return [self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs], args[0])]
         if kind == "reduce":
-            return [self.reduce(op, args[0], out_t)]
+            return [self.reduce(op, self.cyclic(args[0]), out_t)]
         if kind == "dot":
-            return [self.dot(*args)]
+            a, b, acc = args
+            return [self.dot(self.cyclic(a), self.cyclic(b), self.cyclic(acc))]
         if kind == "load":
             return [self.load(op, args, out_t)]
         if kind == "load_indexed":
@@ -455,12 +532,18 @@ class _Emitter:
             self.atomic_add(op, args)
             return []
         if kind == "for":
+            if self.use_matrix and op.attr("stages", 1) > 1:
+                from olaf.backend.cuda.mma import lower_matrix_loop
+
+                lowered = lower_matrix_loop(self, op, args)
+                if lowered is not None:
+                    return lowered
             return self.loop(op, args)
         # Elementwise.
         dtype = args[0].type.dtype
         n = max(len(a.regs) for a in args)
         regs = [self.scalar_op(kind, [a.regs[i] if len(a.regs) > 1 else a.regs[0] for a in args], dtype, attrs) for i in range(n)]
-        return [self.make(out_t, regs)]
+        return [self.make(out_t, regs, next((a for a in args if a.coords is not None), None))]
 
     def exchange(self, op: TOp, src: _Value, out_t: TileType) -> _Value:
         attrs = dict(op.attrs)
@@ -580,14 +663,14 @@ class _Emitter:
         arg = op.attr("arg")
         view = self.task.args[arg].view
         dtype = value.type.dtype
-        coords_all = self.coords(value.type.shape)
+        coords_all = self.layout_of(value)
         # A replicated tile is stored by thread 0 only: every thread holds the same value, and
         # one store per element keeps atomics-free reductions into it well defined.
         slots = [0] if value.replicated else range(len(value.regs))
         for slot in slots:
             tile = self.tile_coords(starts, value.type.shape, coords_all[slot])
             offset, inside, _ = self.view_address(view, tile)
-            ok = self.conj(inside, self.valid(value.type.shape, slot))
+            ok = self.conj(inside, self.valid_of(value, slot))
             if value.replicated:
                 ok = self.conj(ok, self.emit(f"llvm.icmp \"eq\" %tid, {self.i32(0)} : i32"))
             reg = value.regs[slot]
@@ -597,6 +680,7 @@ class _Emitter:
 
     def atomic_add(self, op: TOp, args: list[_Value]) -> None:
         index, value, *starts = args
+        index, value = self.cyclic(index), self.cyclic(value)
         arg = op.attr("arg")
         view = self.task.args[arg].view
         dtype = value.type.dtype
@@ -636,11 +720,11 @@ class _Emitter:
         position = 0
         carried = []
         for p, c in zip(region.params[1:], carries):
-            v = _Value(params[position : position + len(c.regs)], c.replicated, c.type)
+            v = _Value(params[position : position + len(c.regs)], c.replicated, c.type, c.coords, c.valid)
             position += len(c.regs)
             self.values[p] = v
             carried.append(v)
-        results = self.body(region)
+        results = [self.relayout(r, c) for r, c in zip(self.body(region), carries)]
         nxt = self.emit(f"llvm.add {iv}, {step.regs[0]} : i32")
         out = [r for v in results for r in v.regs]
         self.raw(f"llvm.br {header}({', '.join([nxt, *out])} : {', '.join(['i32', *types])})")
@@ -669,16 +753,20 @@ class _Emitter:
 
         pointer_args = [f"%arg{i}: !llvm.ptr<1>" for i in range(len(task.args))]
         dim_args = [f"%dim{i}: i32" for i in range(len(self.dims))]
-        smem = max(self.shared_bytes, 16)
         header = [
             "module attributes {gpu.container_module} {",
             "gpu.module @kernels {",
-            f"  llvm.mlir.global internal @smem() {{addr_space = 3 : i32, alignment = 16 : i64}} : !llvm.array<{smem} x i8>",
+            # Dynamic shared memory (sized at launch): static allocations stop at 48 KiB.
+            "  llvm.mlir.global external @smem() {addr_space = 3 : i32, alignment = 16 : i64} : !llvm.array<0 x i8>",
             *sorted(self.externs),
-            f"  llvm.func @task({', '.join(pointer_args + dim_args)}) attributes {{nvvm.kernel, nvvm.maxntid = array<i32: {THREADS}, 1, 1>}} {{",
+            f"  llvm.func @task({', '.join(pointer_args + dim_args)}) attributes {{nvvm.kernel, nvvm.maxntid = array<i32: {self.threads}, 1, 1>}} {{",
         ]
         text = "\n".join(header + prologue + self.entry_constants + self.lines + ["  }", "}", "}"]) + "\n"
-        return Lowered(text, [d for _, d in sorted(self.dims.values(), key=lambda t: t[0])], self.shared_bytes)
+        dims = [d for _, d in sorted(self.dims.values(), key=lambda t: t[0])]
+        lowered = Lowered(text, dims, self.shared_bytes, self.threads, list(self.aligned))
+        if self.aligned:
+            lowered.fallback = _Emitter(self.task, use_matrix=False).run()
+        return lowered
 
 
 def lower_task(task: Task) -> Lowered:

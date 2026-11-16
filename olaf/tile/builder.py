@@ -140,14 +140,17 @@ class TileBuilder:
     def full(self, shape: tuple[int, ...], value, dtype: DType) -> TValue:
         return self.op("full", shape=tuple(shape), value=value, dtype=dtype)
 
-    def for_range(self, lo: TValue, hi: TValue, step: int, carries: Sequence[TValue], fn) -> list[TValue]:
-        """fn(builder, iv, carries) -> next carries. Builds the region in a fresh builder."""
+    def for_range(self, lo: TValue, hi: TValue, step: int, carries: Sequence[TValue], fn, **attrs) -> list[TValue]:
+        """fn(builder, iv, carries) -> next carries. Builds the region in a fresh builder.
+
+        attrs: `stages`, the software pipeline depth for the loads in the body (1 = none).
+        """
         inner = TileBuilder()
         iv = TValue(TileType((), INDEX))
         params = [TValue(c.type) for c in carries]
         results = fn(inner, iv, params)
         region = Body((iv, *params), tuple(inner.ops), tuple(results))
-        return list(self.emit("for", (lo, hi, self.index(step), *carries), {}, (region,)))
+        return list(self.emit("for", (lo, hi, self.index(step), *carries), attrs, (region,)))
 
     def finish(self, params: Sequence[TValue], results: Sequence[TValue] = ()) -> Body:
         return Body(tuple(params), tuple(self.ops), tuple(results))

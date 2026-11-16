@@ -15,6 +15,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from olaf.backend.capability import CPU, Capability
 from olaf.graph.dim import Dim, product
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
@@ -24,7 +25,13 @@ from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileTyp
 
 ELEMENTWISE_BLOCK = 128
 REDUCE_BLOCK = 128
-DOT_BLOCK = (32, 32, 32)  # M, N, K
+DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions
+# With a 16x8x16 matrix instruction: 128x128 output tiles over 8 warps (64x32 per warp) and a
+# 3-stage async copy pipeline over 32-wide K steps. 3 stages of bf16 A and B tiles take 48 KiB of
+# shared memory, which leaves room on Ampere (100 KiB per SM) for two blocks per SM.
+MATRIX_DOT_BLOCK = (128, 128, 32)
+MATRIX_DOT_WARPS = 8
+MATRIX_DOT_STAGES = 3
 
 
 @dataclass(frozen=True)
@@ -79,13 +86,15 @@ def _placed(ref: Ref, shape, dims):
     return tuple((moved.get(a) if a is not None else None, s) for a, s in ref.view.source)
 
 
-def to_tile(graph: Graph) -> Program:
-    return _Converter(graph).run()
+def to_tile(graph: Graph, capability: Capability = CPU) -> Program:
+    """Default tile shapes come from the capability: matrix instructions change the dot tiles."""
+    return _Converter(graph, capability).run()
 
 
 class _Converter:
-    def __init__(self, graph: Graph) -> None:
+    def __init__(self, graph: Graph, capability: Capability) -> None:
         self.graph = graph
+        self.capability = capability
         self.buffers: dict[str, Buffer] = {}
         self.launches: list[Launch] = []
         self.refs: dict[Value, Ref] = {}
@@ -98,9 +107,9 @@ class _Converter:
         self.buffers[name] = Buffer(name, TensorType(type.shape, type.dtype), kind, **fields)
         return Ref(name, full_view(type.shape), type.dtype)
 
-    def launch(self, name: str, grid: Sequence[Dim], refs: Sequence[tuple[Ref, bool]], body) -> None:
+    def launch(self, name: str, grid: Sequence[Dim], refs: Sequence[tuple[Ref, bool]], body, warps: int = 4) -> None:
         args = tuple(Arg(r.view, r.dtype, writes) for r, writes in refs)
-        self.launches.append(Launch(Task(name, tuple(grid), args, body), tuple(r.buffer for r, _ in refs)))
+        self.launches.append(Launch(Task(name, tuple(grid), args, body, warps), tuple(r.buffer for r, _ in refs)))
 
     def elementwise(self, name: str, out_type: TensorType, inputs: Sequence[Ref], compute: Callable, out: Ref | None = None, kind: BufferKind = BufferKind.temp) -> Ref:
         """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile."""
@@ -298,7 +307,9 @@ class _Converter:
         m_inner = m_labels[-1] if m_labels else None
         n_inner = n_labels[-1] if n_labels else None
         k_inner = [c for c in ta if c in k_labels][-1] if k_labels else None
-        bm, bn, bk = DOT_BLOCK
+        matrix = any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == ra.dtype.value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
+        bm, bn, bk = MATRIX_DOT_BLOCK if matrix else DOT_BLOCK
+        stages, warps = (MATRIX_DOT_STAGES, MATRIX_DOT_WARPS) if matrix else (1, 4)
         extent = {c: 1 for c in size}
         if m_inner:
             extent[m_inner] = _block(size[m_inner], bm)
@@ -337,7 +348,8 @@ class _Converter:
             def body(inner: TileBuilder, iv: TValue, carries: list[TValue]) -> list[TValue]:
                 return [loop(inner, depth + 1, {**starts, label: iv}, carries[0])]
 
-            return builder.for_range(builder.index(0), builder.dim(size[label]), extent[label], [acc], body)[0]
+            pipelined = stages if label == k_inner else 1
+            return builder.for_range(builder.index(0), builder.dim(size[label]), extent[label], [acc], body, stages=pipelined)[0]
 
         acc = loop(b, 0, dict(out_starts), b.full((em, en), 0, acc_dtype))
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
@@ -346,7 +358,7 @@ class _Converter:
             result = b.op("permute", result, perm=(1, 0))
         result = b.op("reshape", result, shape=tuple(extent[c] for c in out_labels))
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
-        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids))
+        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps)
         return out
 
     # -- indexing -------------------------------------------------------------------------------

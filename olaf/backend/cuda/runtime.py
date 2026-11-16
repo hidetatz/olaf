@@ -42,6 +42,21 @@ def from_device(buffer: driver.DeviceBuffer, dtype: DType, shape) -> np.ndarray:
 class _Kernel:
     lowered: Lowered
     function: driver.Kernel
+    fallback: _Kernel | None = None
+
+    def select(self, env: dict[str, int]) -> _Kernel:
+        """The specialized kernel when its alignment assumptions hold for these sizes, else the general one."""
+        if self.fallback is not None and any(evaluate(d, env) % 8 for d in self.lowered.aligned):
+            return self.fallback
+        return self
+
+
+def _load(lowered: Lowered, target: str) -> _Kernel:
+    function = driver.Module(compile_ptx(lowered.text, target)).function("task")
+    if lowered.shared_bytes > 48 * 1024:
+        function.set_shared_bytes(lowered.shared_bytes)
+    fallback = _load(lowered.fallback, target) if lowered.fallback is not None else None
+    return _Kernel(lowered, function, fallback)
 
 
 class CudaProgram:
@@ -51,10 +66,7 @@ class CudaProgram:
         target = chip(dev.compute_capability)
         self.kernels: dict[str, _Kernel] = {}
         for key, task in program.tasks().items():
-            lowered = lower_task(task)
-            ptx = compile_ptx(lowered.text, target)
-            function = driver.Module(ptx).function("task")
-            self.kernels[key] = _Kernel(lowered, function)
+            self.kernels[key] = _load(lower_task(task), target)
         self.symbols = _symbols(program)
         self.stream = driver.Stream()
 
@@ -83,13 +95,13 @@ class CudaProgram:
 
     def enqueue(self, buffers: dict[str, driver.DeviceBuffer], env: dict[str, int]) -> None:
         for launch in self.program.launches:
-            kernel = self.kernels[launch.task.digest()]
+            kernel = self.kernels[launch.task.digest()].select(env)
             blocks = int(np.prod([evaluate(d, env) for d in launch.task.grid], dtype=np.int64))
             if blocks == 0:
                 continue
             args = [(buffers[name].ptr, driver.POINTER) for name in launch.buffers]
             args += [(evaluate(d, env), driver.I32) for d in kernel.lowered.dims]
-            kernel.function.launch((blocks, 1, 1), (kernel.lowered.threads, 1, 1), args, stream=self.stream)
+            kernel.function.launch((blocks, 1, 1), (kernel.lowered.threads, 1, 1), args, shared_bytes=kernel.lowered.shared_bytes, stream=self.stream)
 
     def run(self, inputs: Sequence, state: Mapping[str, np.ndarray] | None = None) -> tuple[list[np.ndarray], dict[str, np.ndarray]]:
         state = dict(state or {})

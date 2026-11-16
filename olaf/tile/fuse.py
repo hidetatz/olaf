@@ -225,7 +225,7 @@ class _Rewriter:
         remap = {old: new for new, old in enumerate(used)}
         body = _renumber(body, remap)
         args = tuple(self.args[i][1] for i in used)
-        task = Task(self.launch.task.name, self.launch.task.grid, args, body)
+        task = Task(self.launch.task.name, self.launch.task.grid, args, body, self.launch.task.warps)
         return Launch(task, tuple(self.args[i][0] for i in used))
 
 

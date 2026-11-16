@@ -134,3 +134,43 @@ def test_gpt2_small_config_step():
     actual, _ = CudaProgram(fuse(to_tile(graph))).run(leaves)
     errors = [rel(a, e) for a, e in zip(actual, expected)]
     assert max(errors) < 1e-5, max(errors)
+
+
+@pytest.mark.parametrize("spec", ["ik,kj->ij", "ik,jk->ij", "ki,kj->ij", "ki,jk->ij"])
+def test_matrix_instruction_dot_all_orientations(spec):
+    """mma.sync path (Ampere tiles): every operand orientation, with edges that cut tiles."""
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.lower import lower_task
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    m, n, k = 200, 136, 96
+    shape = {"i": m, "j": n, "k": k}
+    ta, tb = spec.split("->")[0].split(",")
+    a = bf16_round(R.normal(size=[shape[c] for c in ta]))
+    b = bf16_round(R.normal(size=[shape[c] for c in tb]))
+    graph = lower(olaf.trace(lambda x, y: olaf.einsum(spec, x, y), tt(*a.shape, dtype=olaf.bf16), tt(*b.shape, dtype=olaf.bf16)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    assert "nvvm.mma.sync" in lower_task(program.launches[0].task).text
+    expected = interpret(graph, [a, b])[0][0]
+    actual = CudaProgram(program).run([a, b])[0][0]
+    # Both sides round the same f32-accurate sums to bf16; they differ only where f32 summation
+    # order moves a value across a bf16 rounding boundary.
+    assert rel(actual, expected) < 1e-2
+
+
+def test_matrix_instruction_dot_falls_back_when_unaligned():
+    # K = S is symbolic: 16-byte copies need S % 8 == 0, so S = 13 must take the general kernel
+    # chosen at launch, and S = 64 the mma kernel.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.lower import lower_task
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    S = olaf.sym("S")
+    graph = lower(olaf.trace(lambda x, y: x @ y, tt(64, S, dtype=olaf.bf16), tt(S, 48, dtype=olaf.bf16)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    lowered = lower_task(program.launches[0].task)
+    assert lowered.aligned and lowered.fallback is not None
+    device = CudaProgram(program)
+    for s in (13, 64):
+        a, b = bf16_round(R.normal(size=(64, s))), bf16_round(R.normal(size=(s, 48)))
+        assert rel(device.run([a, b])[0][0], interpret(graph, [a, b])[0][0]) < 1e-2

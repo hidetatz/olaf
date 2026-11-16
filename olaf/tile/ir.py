@@ -132,16 +132,22 @@ class Arg:
 
 @dataclass(frozen=True, eq=False)
 class Task:
-    """Body params are one i32 program id per grid axis."""
+    """Body params are one i32 program id per grid axis.
+
+    `warps` is a schedule choice (how many 32-wide execution groups run one instance); like tile
+    shapes and the pipeline depth of a loop (the `stages` attribute of `for`), it lives in the IR
+    so that the schedule search changes the IR and the cache key covers it.
+    """
 
     name: str
     grid: tuple[Dim, ...]
     args: tuple[Arg, ...]
     body: Body
+    warps: int = 4
 
     def text(self) -> str:
         """Template text: the cache key. The name is a debugging label and is left out."""
-        lines = [f"task grid=[{','.join(map(str, self.grid))}]"]
+        lines = [f"task grid=[{','.join(map(str, self.grid))}] warps={self.warps}"]
         lines += [f"  arg{i}: {a}" for i, a in enumerate(self.args)]
         lines += _print_body(self.body, "body", 1)
         return "\n".join(lines) + "\n"
