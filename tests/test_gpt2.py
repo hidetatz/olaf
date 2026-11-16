@@ -42,10 +42,24 @@ def param_specs(params, dtype=olaf.f32):
     return olaf.tree_map(lambda a: olaf.TensorType(a.shape, dtype), params)
 
 
-def block(x, p, mask, n_head, activation):
+def _to(x, dtype):
+    return x if dtype is None or x.dtype is dtype else olaf.cast(x, dtype)
+
+
+def linear(x, w, b, compute=None):
+    """HF Conv1D (x @ w + b). With compute=bf16, as under torch.autocast: all three in bf16."""
+    return olaf.einsum("bsd,de->bse", _to(x, compute), _to(w, compute)) + _to(b, compute)
+
+
+def residual(x, y):
+    # f32 + bf16 promotes to f32 in PyTorch, so the residual stream stays in the parameters' dtype.
+    return x + _to(y, x.dtype)
+
+
+def block(x, p, mask, n_head, activation, compute=None):
     B, S, D = x.shape
     a = olaf.layernorm(x, p["ln_1.weight"], p["ln_1.bias"], eps=1e-5)
-    qkv = olaf.einsum("bsd,de->bse", a, p["attn.c_attn.weight"]) + p["attn.c_attn.bias"]
+    qkv = linear(a, p["attn.c_attn.weight"], p["attn.c_attn.bias"], compute)
 
     def heads(t):
         return olaf.transpose(t.reshape(B, S, n_head, D // n_head), 1, 2)
@@ -53,26 +67,27 @@ def block(x, p, mask, n_head, activation):
     qq, k, v = (heads(qkv[..., i * D : (i + 1) * D]) for i in range(3))
     attended = olaf.attention(qq, k, v, olaf.broadcast_to(mask, (B, n_head, S, S)))
     merged = olaf.transpose(attended, 1, 2).reshape(B, S, D)
-    x = x + olaf.einsum("bsd,de->bse", merged, p["attn.c_proj.weight"]) + p["attn.c_proj.bias"]
+    x = residual(x, linear(merged, p["attn.c_proj.weight"], p["attn.c_proj.bias"], compute))
 
     m = olaf.layernorm(x, p["ln_2.weight"], p["ln_2.bias"], eps=1e-5)
-    hidden = olaf.gelu(olaf.einsum("bsd,de->bse", m, p["mlp.c_fc.weight"]) + p["mlp.c_fc.bias"], activation)
-    return x + olaf.einsum("bsd,de->bse", hidden, p["mlp.c_proj.weight"]) + p["mlp.c_proj.bias"]
+    hidden = olaf.gelu(linear(m, p["mlp.c_fc.weight"], p["mlp.c_fc.bias"], compute), activation)
+    return residual(x, linear(hidden, p["mlp.c_proj.weight"], p["mlp.c_proj.bias"], compute))
 
 
-def forward(params, ids, config, *, folded=True):
+def forward(params, ids, config, *, folded=True, compute=None):
+    """Logits. compute=bf16 mirrors torch.autocast(bfloat16): bf16 linears and logits, f32 elsewhere."""
     B, S = ids.shape
     x = olaf.take(params["wte.weight"], ids) + olaf.take(params["wpe.weight"], olaf.iota((S,)))
     mask = olaf.iota((S, S), axis=0) >= olaf.iota((S, S), axis=1)
     activation = gelu_kind(config)
-    step_block = lambda h, p: block(h, p, mask, config.n_head, activation)  # noqa: E731
+    step_block = lambda h, p: block(h, p, mask, config.n_head, activation, compute)  # noqa: E731
     if folded:
         x = olaf.repeat(step_block, config.n_layer, x, params["h"])
     else:
         for i in range(config.n_layer):
             x = step_block(x, {k: v[i] for k, v in params["h"].items()})
     x = olaf.layernorm(x, params["ln_f.weight"], params["ln_f.bias"], eps=1e-5)
-    return olaf.einsum("bsd,vd->bsv", x, params["wte.weight"])
+    return olaf.einsum("bsd,vd->bsv", _to(x, compute), _to(params["wte.weight"], compute))
 
 
 def trace_step(params, config, *, folded=True, dtype=olaf.f32):

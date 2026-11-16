@@ -268,17 +268,22 @@ class _Converter:
         grid = tuple(_ceil_div(shape[a], extent[a]) for a in kept)
         init = _neutral(fn, ref.dtype)
         combine = "add" if fn == "sum" else "max"
+        # A bf16 sum accumulates in f32 and rounds once at the store ("exact, then rounded"):
+        # adding thousands of bf16 values in bf16 loses everything past the 8th bit. A max is exact in any dtype.
+        acc_dtype = accumulator_dtype(ref.dtype) if fn == "sum" else ref.dtype
 
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in kept]
         out_starts = [p if extent[a] == 1 else b.op("mul", p, b.index(extent[a])) for p, a in zip(pids, kept)]
-        acc = b.full(out_tile, init, ref.dtype)
+        acc = b.full(out_tile, init, acc_dtype)
         reduced = sorted(axes)
 
         def loop(builder: TileBuilder, depth: int, starts: dict[int, TValue], carry: TValue) -> TValue:
             if depth == len(reduced):
                 full_starts = [starts[a] if a in starts else out_starts[kept.index(a)] for a in range(rank)]
                 tile = builder.op("load", *full_starts, arg=0, shape=tuple(extent[a] for a in range(rank)), dtype=ref.dtype, other=init)
+                if acc_dtype is not ref.dtype:
+                    tile = builder.op("cast", tile, dtype=acc_dtype)
                 part = builder.op("reduce", tile, fn=fn, axes=tuple(reduced))
                 return builder.op(combine, carry, part)
             axis = reduced[depth]
@@ -289,6 +294,8 @@ class _Converter:
             return builder.for_range(builder.index(0), builder.dim(shape[axis]), extent[axis], [carry], body)[0]
 
         result = loop(b, 0, {}, acc)
+        if acc_dtype is not ref.dtype:
+            result = b.op("cast", result, dtype=ref.dtype)
         b.emit("store", (result, *out_starts), {"arg": 1})
         self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids))
         return out
