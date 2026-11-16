@@ -472,3 +472,19 @@ def test_sibling_fusion_shares_loads_between_outputs():
     assert rel(got[0], want[0]) < 1e-6
     for name in "mvp":
         assert rel(got_state[name], want_state[name]) < 1e-6
+
+
+def test_scan_gradient_stacks_are_written_in_place():
+    # The per-iteration weight gradients of an unrolled scan are stored straight into their
+    # slices of the stacked gradient: no concat task remains.
+    from olaf.pipeline import to_program
+
+    w = R.normal(size=(3, 5, 5)).astype(np.float32) * 0.3
+
+    def fn(x, ws):
+        return olaf.grad(lambda ws: olaf.sum(olaf.scan(lambda h, w: (olaf.tanh(h @ w), None), x, ws)[0]))(ws)
+
+    graph = lower(olaf.trace(fn, tt(3, 5), tt(3, 5, 5)).graph)
+    program = to_program(graph)
+    assert not any(launch.task.origin == ("concat",) for launch in program.launches)
+    assert rel(run_program(program, [X, w])[0][0], interpret(graph, [X, w])[0][0]) < 1e-5

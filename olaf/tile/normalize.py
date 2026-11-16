@@ -141,3 +141,104 @@ def _pure_copy(task: Task) -> bool:
     stores = [op for op in task.body.ops if op.kind == "store"]
     loads = {op.outputs[0]: op for op in task.body.ops if op.kind == "load"}
     return len(stores) == 1 and len(loads) == 1 and stores[0].inputs[0] in loads and loads[stores[0].inputs[0]].attr("arg") == 0
+
+
+def eliminate_concats(program: Program) -> Program:
+    """Let the producers of a concat's inputs store into their slices of its output.
+
+    Unrolled scans stack each layer's weight gradients with concat (passes.unroll): 12 tensors
+    per weight kind, written once by their producers and then copied into the stack. When input
+    j is a contiguous buffer that only the concat reads, and its slice of the output is one
+    contiguous block (the concat axis is outermost, or every axis before it has size 1), its
+    producer can store there directly, at an offset, and the concat disappears.
+    """
+    from olaf.tile.ir import full_view
+
+    buffers = {b.name: b for b in program.buffers}
+    readers: dict[str, list[int]] = {}
+    writers: dict[str, list[int]] = {}
+    for i, launch in enumerate(program.launches):
+        for name, arg in zip(launch.buffers, launch.task.args):
+            (writers if arg.writes else readers).setdefault(name, []).append(i)
+    launches = list(program.launches)
+    removed: set[int] = set()
+    for i, launch in enumerate(program.launches):
+        if launch.task.origin != ("concat",) or launch.offsets or not _pure_select(launch.task):
+            continue
+        outs = [(n, a) for n, a in zip(launch.buffers, launch.task.args) if a.writes]
+        if len(outs) != 1:
+            continue
+        out, out_arg = outs[0]
+        target = buffers[out]
+        if out_arg.view != full_view(target.type.shape) or writers.get(out) != [i] or target.strides is not None:
+            continue
+        if any(r < i for r in readers.get(out, [])):
+            continue
+        plan = _concat_plan(program, launch, target, buffers, readers, writers, i)
+        if plan is None:
+            continue
+        for j, view in plan:
+            producer = launches[j]
+            name = next(n for n, a in zip(producer.buffers, producer.task.args) if a.writes)
+            args = tuple(replace(a, view=view) if n == name and a.writes else a for n, a in zip(producer.buffers, producer.task.args))
+            task = producer.task
+            launches[j] = Launch(Task(task.name, task.grid, args, task.body, task.warps, task.origin), tuple(out if n == name else n for n in producer.buffers))
+        removed.add(i)
+    if not removed:
+        return program
+    kept = [launch for i, launch in enumerate(launches) if i not in removed]
+    used = {n for launch in kept for n in launch.buffers} | set(program.inputs) | set(program.outputs)
+    return replace(program, launches=tuple(kept), buffers=tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp))
+
+
+def _pure_select(task: Task) -> bool:
+    """A concat body: loads selected by iota bounds, nothing computed from the values."""
+    return {op.kind for op in task.body.ops} <= {"load", "store", "full", "mul", "add", "iota", "cmp", "where", "broadcast", "dim"} and not any(
+        op.kind in ("mul", "add") and op.outputs[0].type.dtype.is_float for op in task.body.ops
+    )
+
+
+def _concat_plan(program: Program, launch: Launch, target, buffers, readers, writers, index: int):
+    """[(producer launch index, its store view into the concat output)] for every input, or None."""
+    from olaf.graph.dim import product
+    from olaf.tile.ir import full_view
+
+    shape = target.type.shape
+    plan = []
+    for name, arg in zip(launch.buffers, launch.task.args):
+        if arg.writes:
+            continue
+        view = arg.view
+        if all(s == 0 for s in view.strides):
+            continue  # a constant bound
+        padded = [k for k, (lo, hi) in enumerate(view.pad or ()) if lo != 0 or hi != 0]
+        if view.pad is None or len(padded) != 1 or view.offset != 0:
+            return None
+        axis = padded[0]
+        if any(shape[k] != 1 for k in range(axis)):
+            return None  # the slice would not be one contiguous block
+        lo, hi = view.pad[axis]
+        logical = tuple(shape[k] - lo - hi if k == axis else d for k, d in enumerate(shape))
+        source = buffers[name]
+        if view.strides != contiguous_strides(logical) or product(source.type.shape) != product(logical) or source.strides is not None:
+            return None
+        w = writers.get(name, [])
+        if len(w) != 1 or readers.get(name) != [index] or source.kind is not BufferKind.temp or w[0] > index:
+            return None
+        producer = program.launches[w[0]]
+        if producer.offsets:
+            return None
+        stores = [a for n, a in zip(producer.buffers, producer.task.args) if n == name]
+        has_store = any(op.kind == "store" for op in _ops(producer.task.body))
+        has_atomic = any(op.kind.startswith("atomic") for op in _ops(producer.task.body))
+        if len(stores) != 1 or not stores[0].writes or stores[0].view != full_view(source.type.shape) or not has_store or has_atomic:
+            return None
+        plan.append((w[0], View(source.type.shape, contiguous_strides(source.type.shape), lo * product(shape[axis + 1 :]))))
+    return plan or None
+
+
+def _ops(body):
+    for op in body.ops:
+        yield op
+        for r in op.regions:
+            yield from _ops(r)
