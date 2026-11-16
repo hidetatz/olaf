@@ -12,6 +12,7 @@ from olaf.tile.from_graph import to_tile
 from olaf.tile.fuse import fuse
 from olaf.tile.ir import Program
 from olaf.tile.normalize import align_rows, hoist_offsets
+from olaf.tile.online_softmax import fuse_online_softmax
 
 
 def lower_graph(graph: Graph) -> Graph:
@@ -23,5 +24,5 @@ def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True
     """graph must be the output of lower_graph."""
     program = to_tile(graph, capability)
     if fused:
-        program = fuse(program)
+        program = fuse_online_softmax(fuse(program))
     return hoist_offsets(align_rows(program))

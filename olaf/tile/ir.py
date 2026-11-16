@@ -144,6 +144,10 @@ class Task:
     args: tuple[Arg, ...]
     body: Body
     warps: int = 4
+    # The Graph IR op this task implements, e.g. ("contract", "abxz,abyz->abxy") or
+    # ("reduce", "max", (3,)), for passes that match task patterns (tile.online_softmax).
+    # Analysis metadata only: it is not part of the template text and never changes code.
+    origin: tuple = ()
 
     def text(self) -> str:
         """Template text: the cache key. The name is a debugging label and is left out."""

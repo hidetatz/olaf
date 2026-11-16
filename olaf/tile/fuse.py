@@ -237,7 +237,7 @@ class _Rewriter:
         remap = {old: new for new, old in enumerate(used)}
         body = _renumber(body, remap)
         args = tuple(self.args[i][1] for i in used)
-        task = Task(self.launch.task.name, self.launch.task.grid, args, body, self.launch.task.warps)
+        task = Task(self.launch.task.name, self.launch.task.grid, args, body, self.launch.task.warps, self.launch.task.origin)
         if self.launch.offsets:
             raise ValueError("fuse runs before tile.normalize.hoist_offsets")
         return Launch(task, tuple(self.args[i][0] for i in used))

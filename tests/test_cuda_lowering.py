@@ -241,3 +241,17 @@ def test_register_operand_dot_uses_matrix_instructions(spec, a, b):
     program = to_program(graph)
     assert any("nvvm.mma.sync" in lower_task(launch.task).text for launch in program.launches)
     assert rel(CudaProgram(program).run([x, y])[0][0], interpret(graph, [x, y])[0][0]) < 1e-5
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_online_softmax_fusion_on_device(backward):
+    from test_tile import _attention_case
+
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    graph, args = _attention_case(backward)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert "attention" in {launch.task.name for launch in program.launches}
+    for a, e in zip(CudaProgram(program).run(args)[0], interpret(graph, args)[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)

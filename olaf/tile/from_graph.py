@@ -111,9 +111,10 @@ class _Converter:
         self.buffers[name] = Buffer(name, TensorType(type.shape, type.dtype), kind, **fields)
         return Ref(name, full_view(type.shape), type.dtype)
 
-    def launch(self, name: str, grid: Sequence[Dim], refs: Sequence[tuple[Ref, bool]], body, warps: int = 4) -> None:
+    def launch(self, name: str, grid: Sequence[Dim], refs: Sequence[tuple[Ref, bool]], body, warps: int = 4, origin: tuple = ()) -> None:
         args = tuple(Arg(r.view, r.dtype, writes) for r, writes in refs)
-        self.launches.append(Launch(Task(name, tuple(grid), args, body, warps), tuple(r.buffer for r, _ in refs)))
+        task = Task(name, tuple(grid), args, body, warps, origin or (name,))
+        self.launches.append(Launch(task, tuple(r.buffer for r, _ in refs)))
 
     def elementwise(self, name: str, out_type: TensorType, inputs: Sequence[Ref], compute: Callable, out: Ref | None = None, kind: BufferKind = BufferKind.temp) -> Ref:
         """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile."""
@@ -346,7 +347,7 @@ class _Converter:
         if acc_dtype is not ref.dtype:
             result = b.op("cast", result, dtype=ref.dtype)
         b.emit("store", (result, *out_starts), {"arg": 1})
-        self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids))
+        self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids), origin=("reduce", fn, tuple(axes)))
         return out
 
     def _op_contract(self, op: Op, inputs: list[Ref]) -> Ref:
@@ -417,7 +418,7 @@ class _Converter:
             result = b.op("permute", result, perm=(1, 0))
         result = b.op("reshape", result, shape=tuple(extent[c] for c in out_labels))
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
-        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps)
+        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=("contract", op.attr("spec")))
         return out
 
     def _matrix_dtype(self, value: Value) -> DType:

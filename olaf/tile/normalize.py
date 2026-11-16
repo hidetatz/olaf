@@ -24,7 +24,7 @@ def hoist_offsets(program: Program) -> Program:
         task = launch.task
         offsets = tuple(launch.offset(i) + a.view.offset for i, a in enumerate(task.args))
         args = tuple(replace(a, view=replace(a.view, offset=0)) for a in task.args)
-        hoisted = Task(task.name, task.grid, args, task.body, task.warps)
+        hoisted = Task(task.name, task.grid, args, task.body, task.warps, task.origin)
         launches.append(Launch(hoisted, launch.buffers, offsets if any(o != 0 for o in offsets) else ()))
     return replace(program, launches=tuple(launches))
 
@@ -64,7 +64,7 @@ def align_rows(program: Program, multiple: int = 8) -> Program:
         for name, arg in zip(launch.buffers, launch.task.args):
             args.append(replace(arg, view=_restrided(arg.view, strides[name])) if name in strides else arg)
         task = launch.task
-        launches.append(replace(launch, task=Task(task.name, task.grid, tuple(args), task.body, task.warps)))
+        launches.append(replace(launch, task=Task(task.name, task.grid, tuple(args), task.body, task.warps, task.origin)))
     buffers = tuple(replace(b, strides=strides[b.name]) if b.name in strides else b for b in program.buffers)
     return replace(program, buffers=buffers, launches=tuple(launches))
 

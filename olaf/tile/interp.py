@@ -48,8 +48,12 @@ _BINARY = {
 }
 
 
-def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarray] | None = None) -> tuple[list[np.ndarray], dict[str, np.ndarray]]:
-    """Run the program and return (outputs, updated resident state), like graph.interp.interpret."""
+def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarray] | None = None, *, after_launch=None) -> tuple[list[np.ndarray], dict[str, np.ndarray]]:
+    """Run the program and return (outputs, updated resident state), like graph.interp.interpret.
+
+    after_launch(index, launch, storage) is called after every launch with the flat buffers, to
+    find the first task that goes wrong when a pass breaks a program.
+    """
     if len(inputs) != len(program.inputs):
         raise ValueError(f"wrong number of inputs: {len(inputs)} / {len(program.inputs)}")
     state = dict(state or {})
@@ -82,9 +86,11 @@ def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarr
             # NaN (or an extreme integer) instead of zeros, so a task that reads an unwritten element shows up in the result.
             fill = np.nan if b.type.dtype.is_float else 0
             storage[b.name] = np.full(evaluate(b.elements(), env), fill, b.type.dtype.numpy)
-    for launch in program.launches:
+    for index, launch in enumerate(program.launches):
         arrays = [storage[n][evaluate(launch.offset(i), env) :] for i, n in enumerate(launch.buffers)]
         _run_task(launch.task, arrays, env)
+        if after_launch is not None:
+            after_launch(index, launch, storage)
 
     def shaped(name: str) -> np.ndarray:
         b = program.buffer(name)

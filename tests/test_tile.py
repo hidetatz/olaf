@@ -305,3 +305,42 @@ def test_split_reductions_preserve_values(shape, axes):
     program = to_tile(graph, AMPERE_RTX3060)
     assert len(program.launches) == 2
     assert rel(run_program(program, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-5
+
+
+def _attention_case(backward: bool, s: int = 100, d: int = 64):
+    from olaf.graph.ir import bf16_round
+
+    rng = np.random.default_rng(3)
+    q, k, v = (bf16_round(rng.normal(size=(1, 2, s, d))) for _ in range(3))
+
+    def attn(q, k, v):
+        mask = olaf.iota((s, s), axis=0) >= olaf.iota((s, s), axis=1)
+        return olaf.attention(q, k, v, olaf.broadcast_to(mask, (1, 2, s, s)))
+
+    def fn(q, k, v):
+        if not backward:
+            return attn(q, k, v)
+        return olaf.value_and_grad(lambda q, k, v: olaf.sum(olaf.cast(attn(q, k, v), F32) * olaf.cast(v, F32)), (0, 1, 2))(q, k, v)
+
+    graph = lower(olaf.trace(fn, *[tt(1, 2, s, d, dtype=olaf.bf16)] * 3).graph)
+    return graph, [q, k, v]
+
+
+@pytest.mark.parametrize("backward", [False, True])
+def test_online_softmax_fusion(backward):
+    """Attention (forward, and its backward) becomes FlashAttention-style tasks with equal results.
+
+    The forward rounds the probabilities to bf16 before normalizing them (FlashAttention's order),
+    so it differs from eager at bf16 rounding level; the bf16 tolerance applies.
+    """
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.tile.online_softmax import fuse_online_softmax
+
+    graph, args = _attention_case(backward)
+    before = fuse(to_tile(graph, AMPERE_RTX3060))
+    after = fuse_online_softmax(before)
+    names = {launch.task.name for launch in after.launches}
+    assert "attention" in names and (not backward or {"attention_dkv", "attention_dq"} <= names)
+    assert len(after.launches) < len(before.launches)
+    for a, e in zip(run_program(after, args)[0], interpret(graph, args)[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
