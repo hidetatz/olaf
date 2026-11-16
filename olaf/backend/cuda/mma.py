@@ -314,7 +314,7 @@ class _MatrixLoop:
         e = self.e
         base = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
         offset_in_stage = 0 if operand is self.a else self.a.bytes
-        starts = [k if s is iv else e.values[s].regs[0] for s in operand.starts]
+        starts = [k if iv is not None and s is iv else e.values[s].regs[0] for s in operand.starts]
         contiguous = operand.cols_axis if operand.contiguous_cols else operand.rows_axis
         strided = operand.rows_axis if operand.contiguous_cols else operand.cols_axis
         for row, chunk, smem_offset in plan:
@@ -349,13 +349,17 @@ class _MatrixLoop:
         )
         return [e.emit(f"llvm.extractvalue {result}[{i}] : {_STRUCT4_I32}") for i in range(4)]
 
-    def compute(self, stage_base: str, acc: list[str], a_offsets, b_offsets) -> list[str]:
+    def compute(self, stage_base: str, acc: list[str], a_offsets, b_offsets, a_registers=None, b_base: str | None = None) -> list[str]:
+        """mma over one stage. a_registers[i][kk], when given, are A fragments already in registers."""
         e = self.e
         acc = list(acc)
-        b_base = e.emit(f"llvm.add {stage_base}, {e.i32(self.a.bytes)} : i32")
+        b_base = b_base or e.emit(f"llvm.add {stage_base}, {e.i32(self.a.bytes)} : i32")
         ptx = _PTX_TYPE[self.dtype]
         for kk in range(self.ek // 16):
-            a_frags = [self.ldmatrix(e.emit(f"llvm.add {stage_base}, {a_offsets[i][kk]} : i32"), not self.a.contiguous_cols) for i in range(self.mi)]
+            if a_registers is not None:
+                a_frags = [a_registers[i][kk] for i in range(self.mi)]
+            else:
+                a_frags = [self.ldmatrix(e.emit(f"llvm.add {stage_base}, {a_offsets[i][kk]} : i32"), not self.a.contiguous_cols) for i in range(self.mi)]
             b_frags = [self.ldmatrix(e.emit(f"llvm.add {b_base}, {b_offsets[p][kk]} : i32"), self.b.contiguous_cols) for p in range(self.nj // 2)]
             for i in range(self.mi):
                 for j in range(self.nj):
@@ -371,7 +375,7 @@ class _MatrixLoop:
         return acc
 
     def emit(self, lo, hi, step, carry, region):
-        from olaf.backend.cuda.lower import _Value
+        from olaf.backend.cuda.lower import MmaAcc, _Value
 
         e = self.e
         lane, wm_idx, wn_idx = self.lane_values()
@@ -424,7 +428,7 @@ class _MatrixLoop:
         e.lines.append(f"  {done}:")
         e.raw("nvvm.cp.async.wait.group 0")
         e.barrier()
-        return [_Value(acc_params, False, carry.type, layout, None)]
+        return [_Value(acc_params, False, carry.type, layout, None, MmaAcc(self.em, self.en, self.wm, self.wn, 0, 1, 2))]
 
 
 def exactly_b16(e, value: TValue) -> bool:
@@ -441,43 +445,123 @@ def exactly_b16(e, value: TValue) -> bool:
 
 
 def lower_register_dot(e, dot: TOp, a, b, acc):
-    """dot(a, b, acc) on tiles held in registers (any layout), with mma.sync.
+    """dot(a, b, acc) inside a task body (not a pipelined loop), with mma.sync.
 
-    The operands are staged in shared memory as row-major [M][K] and [K][N] b16 tiles (the
-    swizzle of the pipelined loop), then the loop's ldmatrix + mma code runs on that single stage.
-    Used where operands are computed in the task (attention probabilities) rather than loaded.
-    Returns None when the shapes or dtypes do not fit, for the general path.
+    Each operand reaches the fragments the cheapest way it can:
+    - a plain b16 load from global memory (through widening casts, permutes, reshapes) is copied
+      straight into shared memory with 16-byte async copies, as in the pipelined loop;
+    - an A operand that is itself an accumulator of the same warp rows (warps stacked along M,
+      one warp per 16 rows) becomes A fragments in registers: the m16n8 accumulator of columns
+      16k..16k+15 holds exactly the m16k16 A fragment of that k block (FlashAttention's P);
+    - anything else is staged from registers into shared memory element by element.
+    Returns None when shapes or dtypes do not fit, for the general path.
     """
-    from olaf.backend.cuda.lower import _Value
+    from olaf.backend.cuda.lower import MmaAcc, _Value
 
     a_t, b_t = dot.inputs[0], dot.inputs[1]
     if acc.type.dtype is not DType.f32 or not (exactly_b16(e, a_t) and exactly_b16(e, b_t)):
         return None
     m, k = a.type.shape
     n = b.type.shape[1]
-    grid = _warp_grid(e.task.warps, m, n)
-    if grid is None or k % 16 or n % 16 or m % 16:
+    if k % 16 or n % 16 or m % 16:
         return None
-    dtype = DType.bf16
-    a_op = _Operand(-1, None, [], 0, 1, True, m, k)
-    b_op = _Operand(-1, None, [], 0, 1, True, k, n)
-    loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 1, dtype)
+    # Warps along M first: every warp then owns whole rows, which row reductions and the
+    # register A path need.
+    warps = e.task.warps
+    grid = (warps, 1) if m % (16 * warps) == 0 else _warp_grid(warps, m, n)
+    if grid is None:
+        return None
+    a_global = _global_operand(e, a_t)
+    b_global = _global_operand(e, b_t)
+    # An accumulator operand is staged in its own (row, col) orientation with paired stores; a
+    # transposed one is then read with the transposing ldmatrix (contiguous_cols=False).
+    a_op = a_global or _Operand(-1, None, [], 0, 1, _natural(a) != "transposed", m, k)
+    b_op = b_global or _Operand(-1, None, [], 0, 1, _natural(b) != "transposed", k, n)
+    loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 1, DType.bf16)
     lane, wm_idx, wn_idx = loop.lane_values()
     layout = loop.accumulator_layout(lane, wm_idx, wn_idx)
+    structure = MmaAcc(m, n, grid[0], grid[1], 0, 1, 2)
     if acc.coords is layout:
         acc_regs = list(acc.regs)
     elif len(set(acc.regs)) == 1:
         acc_regs = [acc.regs[0]] * len(layout)
     else:
-        acc_regs = e.relayout(acc, _Value([], False, acc.type, layout, None)).regs
+        acc_regs = e.relayout(acc, _Value([], False, acc.type, layout, None, structure)).regs
+    a_registers = _register_a(e, a, grid, m, k) if a_global is None else None
     e.barrier()
-    _stage(e, loop, a_op, a, 0)
-    _stage(e, loop, b_op, b, a_op.bytes)
+    for operand, value, base, is_global in ((a_op, a, 0, a_global is not None), (b_op, b, a_op.bytes, b_global is not None)):
+        if operand is a_op and a_registers is not None:
+            continue
+        if is_global:
+            plan = loop.copy_plan(operand)
+            loop.issue(operand, plan, e.i32(0), None, None)  # issue() places B after A itself
+        elif _natural(value) is not None:
+            _stage_accumulator(e, operand, value, base)
+        else:
+            _stage(e, loop, operand, value, base)
+    e.raw("nvvm.cp.async.commit.group")
+    e.raw("nvvm.cp.async.wait.group 0")
     e.barrier()
     a_offsets, b_offsets = loop.fragment_offsets(lane, wm_idx, wn_idx)
-    out = loop.compute(e.i32(0), acc_regs, a_offsets, b_offsets)
+    out = loop.compute(e.i32(0), acc_regs, a_offsets, b_offsets, a_registers, e.i32(a_op.bytes))
     e.barrier()
-    return _Value(out, False, acc.type, layout, None)
+    return _Value(out, False, acc.type, layout, None, structure)
+
+
+def _global_operand(e, value: TValue) -> _Operand | None:
+    """The dot operand as an _Operand copied from global memory, if it is a plain b16 load."""
+    producers = e.producers
+    traced = _trace_operand(e, None, value, producers)
+    if traced is None:
+        return None
+    load, axes = traced
+    view = e.task.args[load.attr("arg")].view
+    if load.attr("dtype") not in _PTX_TYPE or view.pad is not None or e.task.args[load.attr("arg")].writes:
+        return None
+    rows_axis, cols_axis = axes
+    contiguous_cols = view.strides[cols_axis] == 1
+    if not contiguous_cols and view.strides[rows_axis] != 1:
+        return None
+    contiguous = cols_axis if contiguous_cols else rows_axis
+    for d in [view.offset, *(st for i, st in enumerate(view.strides) if i != contiguous)]:
+        if not isinstance(d, int) or d % 8:
+            return None  # the launch-time alignment check covers only the pipelined loop's arguments
+    if e.task.args[load.attr("arg")] is not None:
+        e.aligned_args.add(load.attr("arg"))
+    shape = load.attr("shape")
+    operand = _Operand(load.attr("arg"), view, list(load.inputs), rows_axis, cols_axis, contiguous_cols, shape[rows_axis], shape[cols_axis])
+    chunks = operand.stored_rows * operand.row_elems // 8
+    return operand if chunks % e.threads == 0 and operand.row_elems % 8 == 0 else None
+
+
+def _register_a(e, a, grid, m: int, k: int):
+    """A fragments from an accumulator in registers (see lower_register_dot), or None."""
+    from olaf.backend.cuda.lower import MmaAcc
+
+    s = a.structure
+    if not isinstance(s, MmaAcc) or a.type.rank != 2 or (s.row_axis, s.col_axis) != (0, 1):
+        return None
+    if (s.em, s.en, s.wm, s.wn) != (m, k, grid[0], 1) or grid[1] != 1:
+        return None
+    nj = s.nj
+
+    def pack(x: str, y: str) -> str:
+        x, y = (r if a.type.dtype is DType.bf16 else e.emit(f"llvm.fptrunc {r} : f32 to bf16") for r in (x, y))
+        vec = e.emit("llvm.mlir.undef : vector<2xbf16>")
+        vec = e.emit(f"llvm.insertelement {x}, {vec}[{e.i32(0)} : i32] : vector<2xbf16>")
+        vec = e.emit(f"llvm.insertelement {y}, {vec}[{e.i32(1)} : i32] : vector<2xbf16>")
+        return e.emit(f"llvm.bitcast {vec} : vector<2xbf16> to i32")
+
+    frags = []
+    for i in range(s.mi):
+        per_k = []
+        for kk in range(k // 16):
+            lo = (i * nj + 2 * kk) * 4
+            hi = (i * nj + 2 * kk + 1) * 4
+            r = a.regs
+            per_k.append([pack(r[lo], r[lo + 1]), pack(r[lo + 2], r[lo + 3]), pack(r[hi], r[hi + 1]), pack(r[hi + 2], r[hi + 3])])
+        frags.append(per_k)
+    return frags
 
 
 def _stage(e, loop: _MatrixLoop, operand: _Operand, value, base: int) -> None:
@@ -502,3 +586,46 @@ def _stage(e, loop: _MatrixLoop, operand: _Operand, value, base: int) -> None:
         ptr = e.emit(f"llvm.getelementptr {smem}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
         guard = e.valid_of(value, slot)
         e.guarded(guard, lambda reg=reg, ptr=ptr: e.raw(f"llvm.store {reg}, {ptr} : bf16, !llvm.ptr<3>"))
+
+
+def _natural(value) -> str | None:
+    """"direct" or "transposed" for a 2-D accumulator value (as a dot operand), else None."""
+    from olaf.backend.cuda.lower import MmaAcc
+
+    st = value.structure
+    if not isinstance(st, MmaAcc) or value.type.rank != 2:
+        return None
+    return "direct" if (st.row_axis, st.col_axis) == (0, 1) else "transposed"
+
+
+def _stage_accumulator(e, operand: _Operand, value, base: int) -> None:
+    """Store an accumulator tile in its natural [row][col] orientation, two columns per store.
+
+    Slots q and q+1 of a fragment are adjacent columns of one row, so they pack into one 4-byte
+    bf16x2 store; for a transposed operand this layout is [K][M] (or [N][K]), which the
+    transposing ldmatrix reads as the operand.
+    """
+    st = value.structure
+    row_elems = operand.row_elems
+    per_row = row_elems // 8
+    rep = max(1, 8 // per_row)
+    span = min(per_row, 8)
+    smem = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+    for slot in range(0, len(value.regs), 2):
+        coords = value.coords[slot]
+        row, col = coords[st.row_axis], coords[st.col_axis]
+        x, y = value.regs[slot], value.regs[slot + 1]
+        if value.type.dtype is DType.f32:
+            x, y = (e.emit(f"llvm.fptrunc {r} : f32 to bf16") for r in (x, y))
+        vec = e.emit("llvm.mlir.undef : vector<2xbf16>")
+        vec = e.emit(f"llvm.insertelement {x}, {vec}[{e.i32(0)} : i32] : vector<2xbf16>")
+        vec = e.emit(f"llvm.insertelement {y}, {vec}[{e.i32(1)} : i32] : vector<2xbf16>")
+        word = e.emit(f"llvm.bitcast {vec} : vector<2xbf16> to i32")
+        chunk = e.emit(f"llvm.udiv {col}, {e.i32(8)} : i32")
+        within = e.emit(f"llvm.urem {col}, {e.i32(8)} : i32")
+        r = e.emit(f"llvm.udiv {row}, {e.i32(rep)} : i32") if rep > 1 else row
+        swz = e.emit(f"llvm.xor {chunk}, {e.emit(f'llvm.urem {r}, {e.i32(span)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {e.emit(f'llvm.mul {row}, {e.i32(row_elems * 2)} : i32')}, {e.emit(f'llvm.mul {swz}, {e.i32(16)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {e.i32(base)} : i32')} : i32")
+        ptr = e.emit(f"llvm.getelementptr {smem}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
+        e.raw(f"llvm.store {word}, {ptr} : i32, !llvm.ptr<3>")

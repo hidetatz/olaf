@@ -139,12 +139,14 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         def widen(v):
             # Zero outside the tensor: past the last row the loaded statistics are 0, so P is
             # 0 / 0 there, and a NaN would spread through the sums over rows into every column.
-            v = v if v.type.dtype is DType.f32 else b.op("cast", v, dtype=DType.f32)
-            zero = b.full(tile, 0.0, DType.f32)
+            # The zeros go in before the widening cast, so the dots still see widened b16 values
+            # (which is what lets them use b16 matrix instructions).
+            zero = b.full(tile, 0.0, v.type.dtype)
             for axis, size in ((rank - 2, g.shape[row]), (rank - 1, g.shape[col])):
                 coord = b.op("iota", coords[axis], shape=tile, axis=axis)
                 inside = b.op("cmp", coord, b.op("broadcast", b.dim(size), shape=tile, dims=()), fn="lt")
                 v = b.op("where", inside, v, zero)
+            v = v if v.type.dtype is DType.f32 else b.op("cast", v, dtype=DType.f32)
             return b.op("reshape", v, shape=(BLOCK, BLOCK))
 
         return widen(prob), widen(ds), d_o, q2d

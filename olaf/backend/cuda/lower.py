@@ -33,6 +33,7 @@ DEFAULT_WARPS = 4
 _LLVM = {DType.f32: "f32", DType.f64: "f64", DType.bf16: "bf16", DType.i32: "i32", DType.i64: "i64", DType.u32: "i32", DType.bool: "i1"}
 _MEMORY_TYPE = {**_LLVM, DType.bool: "i8"}
 _BYTES = {DType.f32: 4, DType.f64: 8, DType.bf16: 2, DType.i32: 4, DType.i64: 8, DType.u32: 4, DType.bool: 1}
+_ELEMENTWISE = frozenset({"neg", "abs", "exp", "log", "sqrt", "rsqrt", "recip", "tanh", "erf", "sin", "cos", "add", "sub", "mul", "div", "max", "min", "pow", "floordiv", "mod"})
 _LIBDEVICE = {"exp": "exp", "log": "log", "tanh": "tanh", "erf": "erf", "sin": "sin", "cos": "cos", "pow": "pow"}
 
 
@@ -74,6 +75,48 @@ class _Value:
     type: TileType
     coords: list[list[str]] | None = None
     valid: list[str | None] | None = None
+    # MmaAcc / MmaRows when the explicit layout is a matrix instruction's (see those classes).
+    structure: object = None
+    # rebuild(like) -> registers of this value in like's layout, re-emitting its computation:
+    # set for values computed only from constants, iota and read-only loads. Changing such a
+    # value's layout then costs its recomputation instead of a round trip through shared memory.
+    rebuild: object = None
+
+
+@dataclass(frozen=True)
+class MmaAcc:
+    """Accumulator fragments of m16n8 matrix instructions over a wm x wn warp grid.
+
+    Slot (i, j, q) holds row warp_m * em/wm + 16 i + lane/4 + 8 (q // 2) and column
+    warp_n * en/wn + 8 j + 2 (lane % 4) + q % 2 of an em x en tile; row_axis and col_axis say
+    which tile axes those are (unit axes may surround them).
+    """
+
+    em: int
+    en: int
+    wm: int
+    wn: int
+    row_axis: int
+    col_axis: int
+    rank: int
+
+    @property
+    def mi(self) -> int:
+        return self.em // (16 * self.wm)
+
+    @property
+    def nj(self) -> int:
+        return self.en // (8 * self.wn)
+
+
+@dataclass(frozen=True)
+class MmaRows:
+    """One value per accumulator row of an MmaAcc: slot (i, h) is row 16 i + lane/4 + 8 h of the
+    warp's rows, held by the 4 lanes of a quad (and by every warp along n)."""
+
+    acc: MmaAcc
+    row_axis: int
+    rank: int
 
 
 @dataclass
@@ -92,6 +135,8 @@ class _Emitter:
     entry_constants: list[str] = field(default_factory=list)
     aligned: list[Dim] = field(default_factory=list)
     aligned_args: set[int] = field(default_factory=set)
+    memo: dict = field(default_factory=dict)
+    keep: list = field(default_factory=list)
 
     @property
     def threads(self) -> int:
@@ -216,8 +261,24 @@ class _Emitter:
     def make(self, t: TileType, regs: list[str], like: _Value | None = None) -> _Value:
         """A value in the cyclic layout of t, or in the explicit layout of `like`."""
         if like is not None and like.coords is not None:
-            return _Value(regs, False, t, like.coords, like.valid)
+            return _Value(regs, False, t, like.coords, like.valid, like.structure)
         return _Value(regs, self.count(t.shape) == 1, t)
+
+    def template(self, t: TileType, like: _Value) -> _Value:
+        """An empty value with like's layout and t's type, for rebuild()."""
+        return _Value([], like.coords is None and self.count(t.shape) == 1, t, like.coords, like.valid, like.structure)
+
+    def n_slots(self, like: _Value) -> int:
+        return len(like.coords) if like.coords is not None else self.slots(like.type.shape)
+
+    def rebuilt(self, v: _Value, like: _Value) -> _Value:
+        """v recomputed in like's layout (v.rebuild must be set). Memoized per layout."""
+        key = ("rebuilt", id(v), id(like.coords) if like.coords is not None else ("cyclic", like.type.shape))
+        if key not in self.memo:
+            regs = v.rebuild(self.template(v.type, like))
+            self.memo[key] = _Value(regs, like.coords is None and self.count(v.type.shape) == 1, v.type, like.coords, like.valid, like.structure, v.rebuild)
+            self.keep.append(v)  # id(v) must stay unique while the memo refers to it
+        return self.memo[key]
 
     def layout_of(self, v: _Value) -> list[list[str]]:
         return v.coords if v.coords is not None else self.coords(v.type.shape)
@@ -228,11 +289,13 @@ class _Emitter:
         return self.valid(v.type.shape, slot)
 
     def relayout(self, v: _Value, like: _Value) -> _Value:
-        """v's elements in the layout of `like` (same shape), through shared memory."""
+        """v's elements in the layout of `like` (same shape): recomputed if v can be, else through shared memory."""
         if v.coords is like.coords or (v.replicated and like.coords is None):
             return v
         if v.replicated:
-            return _Value([v.regs[0]] * len(like.regs), False, v.type, like.coords, like.valid)
+            return _Value([v.regs[0]] * self.n_slots(like), False, v.type, like.coords, like.valid, like.structure)
+        if v.rebuild is not None:
+            return self.rebuilt(v, like)
         self.to_shared(v)
         regs = []
         for slot, coords in enumerate(self.layout_of(like)):
@@ -243,7 +306,7 @@ class _Emitter:
             regs.append(self.load_shared(index, v.type.dtype))
         if like.coords is None:
             return self.make(v.type, regs)
-        return _Value(regs, False, v.type, like.coords, like.valid)
+        return _Value(regs, False, v.type, like.coords, like.valid, like.structure)
 
     def cyclic(self, v: _Value) -> _Value:
         if v.coords is None:
@@ -480,14 +543,21 @@ class _Emitter:
         attrs = dict(op.attrs)
         if kind == "full":
             reg = self.typed_const(attrs["value"], out_t.dtype)
-            return [self.make(out_t, [reg] * self.slots(out_t.shape))]
+            value = self.make(out_t, [reg] * self.slots(out_t.shape))
+            value.rebuild = lambda like, reg=reg: [reg] * self.n_slots(like)
+            return [value]
         if kind == "dim":
             return [self.make(out_t, [self.dim(attrs["value"])])]
         if kind == "iota":
             start = args[0].regs[0]
-            coords = self.coords(out_t.shape)
             axis = attrs["axis"]
-            return [self.make(out_t, [self.emit(f"llvm.add {start}, {c[axis]} : i32") for c in coords])]
+
+            def iota_at(like, start=start, axis=axis):
+                return [self.emit(f"llvm.add {start}, {c[axis]} : i32") for c in self.layout_of(like)]
+
+            value = self.make(out_t, iota_at(_Value([], False, out_t)))
+            value.rebuild = iota_at
+            return [value]
         if kind == "reshape":
             src = args[0]
             if src.coords is None:
@@ -495,30 +565,27 @@ class _Emitter:
             if [d for d in src.type.shape if d != 1] != [d for d in out_t.shape if d != 1]:
                 return [self.make(out_t, list(self.cyclic(src).regs))]
             # Only unit axes appear or disappear: relabel the coordinates.
-            zero = self.i32(0)
-            coords = []
-            for c in src.coords:
-                big = [x for x, d in zip(c, src.type.shape) if d != 1]
-                coords.append([big.pop(0) if d != 1 else zero for d in out_t.shape])
-            return [_Value(list(src.regs), False, out_t, coords, src.valid)]
+            return [self.relabel(src, out_t, self.unit_map(src.type.shape, out_t.shape))]
         if kind == "permute" and args[0].coords is not None:
             perm = attrs["perm"]
-            src = args[0]
-            return [_Value(list(src.regs), False, out_t, [[c[p] for p in perm] for c in src.coords], src.valid)]
+            return [self.relabel(args[0], out_t, list(perm))]
+        if kind == "broadcast" and (args[0].rebuild is not None or isinstance(args[0].structure, MmaRows)) and not args[0].replicated:
+            return [self.lazy_broadcast(args[0], out_t, attrs["dims"])]
         if kind in ("broadcast", "permute"):
             return [self.exchange(op, self.cyclic(args[0]), out_t)]
         if kind in ("cmp", "where") or (kind not in ("full", "dim", "iota", "cast", "reduce", "dot", "load", "load_indexed", "store", "atomic_add_indexed", "for")):
             args = self.unify(args)
-        if kind == "cmp":
-            a, b = args
-            return [self.make(out_t, [self.compare(attrs["fn"], x, y, a.type.dtype) for x, y in zip(a.regs, b.regs)], a)]
-        if kind == "where":
-            c, a, b = args
-            t = _LLVM[a.type.dtype]
-            return [self.make(out_t, [self.emit(f"llvm.select {p}, {x}, {y} : i1, {t}") for p, x, y in zip(c.regs, a.regs, b.regs)], a)]
-        if kind == "cast":
-            return [self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs], args[0])]
+        if kind in ("cmp", "where", "cast") or kind in _ELEMENTWISE:
+            value = self.pointwise(op, args, out_t)
+            sources = [a for a in args if not a.replicated]
+            if sources and all(a.rebuild is not None for a in sources):
+                value.rebuild = lambda like, op=op, args=args, out_t=out_t: self.pointwise(op, [a if a.replicated else self.rebuilt(a, self.template(a.type, like)) for a in args], out_t).regs
+            return [value]
         if kind == "reduce":
+            if isinstance(args[0].structure, MmaAcc):
+                rows = self.mma_row_reduce(op, args[0], out_t)
+                if rows is not None:
+                    return [rows]
             return [self.reduce(op, self.cyclic(args[0]), out_t)]
         if kind == "dot":
             a, b, acc = args
@@ -547,11 +614,165 @@ class _Emitter:
                 if lowered is not None:
                     return lowered
             return self.loop(op, args)
-        # Elementwise.
+        raise NotImplementedError(f"CUDA lowering of tile op {kind}")
+
+    def pointwise(self, op: TOp, args: list[_Value], out_t: TileType) -> _Value:
+        """cmp, where, cast and the elementwise ops, slot by slot (args already in one layout)."""
+        kind, attrs = op.kind, dict(op.attrs)
+        like = next((a for a in args if a.coords is not None), None)
+        if kind == "cmp":
+            a, b = args
+            return self.make(out_t, [self.compare(attrs["fn"], x, y, a.type.dtype) for x, y in zip(a.regs, b.regs)], a)
+        if kind == "where":
+            c, a, b = args
+            t = _LLVM[a.type.dtype]
+            n = max(len(c.regs), len(a.regs), len(b.regs))
+            pick = lambda v, i: v.regs[i] if len(v.regs) > 1 else v.regs[0]  # noqa: E731
+            return self.make(out_t, [self.emit(f"llvm.select {pick(c, i)}, {pick(a, i)}, {pick(b, i)} : i1, {t}") for i in range(n)], like)
+        if kind == "cast":
+            return self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs], args[0])
         dtype = args[0].type.dtype
         n = max(len(a.regs) for a in args)
         regs = [self.scalar_op(kind, [a.regs[i] if len(a.regs) > 1 else a.regs[0] for a in args], dtype, attrs) for i in range(n)]
-        return [self.make(out_t, regs, next((a for a in args if a.coords is not None), None))]
+        return self.make(out_t, regs, like)
+
+    @staticmethod
+    def unit_map(src_shape, out_shape) -> list[int | None]:
+        """For each output axis of a unit-only reshape: the source axis it is, or None (a new unit axis)."""
+        big = [i for i, d in enumerate(src_shape) if d != 1]
+        out = []
+        for d in out_shape:
+            out.append(big.pop(0) if d != 1 else None)
+        return out
+
+    def relabel(self, src: _Value, out_t: TileType, mapping: list[int | None]) -> _Value:
+        """src with output axis k taken from source axis mapping[k] (None: a unit axis). No data moves."""
+        zero = self.i32(0)
+        coords = [[c[m] if m is not None else zero for m in mapping] for c in src.coords]
+        structure = src.structure
+        if structure is not None:
+            inverse = {m: k for k, m in enumerate(mapping) if m is not None}
+            if isinstance(structure, MmaAcc):
+                structure = MmaAcc(structure.em, structure.en, structure.wm, structure.wn, inverse[structure.row_axis], inverse[structure.col_axis], out_t.rank)
+            else:
+                structure = MmaRows(structure.acc, inverse[structure.row_axis], out_t.rank)
+        # Relabeled coordinates are entry-block names; caching them persistently keeps one list
+        # object per layout, which is how layouts are compared (by identity).
+        key = ("relabel", id(src.coords), tuple(mapping))
+        if key not in self.coords_cache:
+            self.coords_cache[key] = coords
+            self.keep.append(src.coords)
+        value = _Value(list(src.regs), False, out_t, self.coords_cache[key], src.valid, structure)
+        if src.rebuild is not None:
+            # like's coordinates in the output -> the source's axes.
+            def back(like, src=src, mapping=mapping):
+                source_coords = []
+                for c in self.layout_of(like):
+                    sc = [self.i32(0)] * src.type.rank
+                    for k, m in enumerate(mapping):
+                        if m is not None:
+                            sc[m] = c[k]
+                    source_coords.append(sc)
+                pseudo = _Value([], False, src.type, source_coords, like.valid, None)
+                return src.rebuild(pseudo)
+
+            value.rebuild = back
+        return value
+
+    def lazy_broadcast(self, src: _Value, out_t: TileType, dims) -> _Value:
+        """A broadcast emitted in its consumer's layout (see relayout); cyclic by default."""
+
+        def at(like, src=src, dims=dims):
+            if isinstance(src.structure, MmaRows) and isinstance(like.structure, MmaAcc) and like.structure == _acc_like(src.structure, like.structure):
+                acc = like.structure
+                return [src.regs[i * 2 + q // 2] for i in range(acc.mi) for j in range(acc.nj) for q in range(4)]
+            if src.rebuild is None:
+                return self.exchange_into(src, out_t, dims, like)
+            source_coords = [[c[d] if src.type.shape[i] != 1 else self.i32(0) for i, d in enumerate(dims)] for c in self.layout_of(like)]
+            return src.rebuild(_Value([], False, src.type, source_coords, like.valid, None))
+
+        regs = at(_Value([], self.count(out_t.shape) == 1, out_t))
+        return _Value(regs, self.count(out_t.shape) == 1, out_t, rebuild=at)
+
+    def exchange_into(self, src: _Value, out_t: TileType, dims, like: _Value) -> list[str]:
+        """A broadcast through shared memory, read in like's layout."""
+        self.to_shared(src)
+        regs = []
+        for slot, coords in enumerate(self.layout_of(like)):
+            source = [self.i32(0) if src.type.shape[i] == 1 else coords[d] for i, d in enumerate(dims)]
+            index = self.linear(source, src.type.shape)
+            guard = self.valid_of(like, slot)
+            if guard is not None:
+                index = self.emit(f"llvm.select {guard}, {index}, {self.i32(0)} : i1, i32")
+            regs.append(self.load_shared(index, src.type.dtype))
+        return regs
+
+    def mma_row_reduce(self, op: TOp, src: _Value, out_t: TileType) -> _Value | None:
+        """Reduce an accumulator tile over its columns without leaving registers when possible.
+
+        Each thread combines its own columns of a row, the 4 lanes of a quad (which hold one row)
+        combine with shuffles, and warps along n (if any) through shared memory.
+        """
+        acc = src.structure
+        axes = op.attr("axes")
+        fn = op.attr("fn")
+        dtype = src.type.dtype
+        others = [i for i in range(src.type.rank) if i not in (acc.row_axis, acc.col_axis)]
+        if tuple(axes) != (acc.col_axis,) or any(src.type.shape[i] != 1 for i in others) or _BYTES[dtype] != 4:
+            return None
+        combine = "add" if fn == "sum" else "max"
+        rows = []
+        for i in range(acc.mi):
+            for h in range(2):
+                parts = [src.regs[(i * acc.nj + j) * 4 + 2 * h + c] for j in range(acc.nj) for c in range(2)]
+                value = parts[0]
+                for x in parts[1:]:
+                    value = self.scalar_op(combine, [value, x], dtype, {})
+                rows.append(self.butterfly(value, 4, dtype, combine))
+        if acc.wn > 1:
+            lane = self.entry(f"llvm.urem %tid, {self.i32(32)} : i32")
+            warp = self.entry(f"llvm.udiv %tid, {self.i32(32)} : i32")
+            warp_n = self.entry(f"llvm.udiv {warp}, {self.i32(acc.wm)} : i32")
+            row_coords = self.rows_layout(acc, out_t, op)
+            self.shared_bytes = max(self.shared_bytes, acc.wn * acc.em * 4)
+            self.barrier()
+            first = self.emit(f"llvm.icmp \"eq\" {self.emit(f'llvm.urem {lane}, {self.i32(4)} : i32')}, {self.i32(0)} : i32")
+            for slot, value in enumerate(rows):
+                row = row_coords[slot][-1] if False else row_coords[slot][self.row_position(acc, out_t)]
+                index = self.emit(f"llvm.add {self.emit(f'llvm.mul {warp_n}, {self.i32(acc.em)} : i32')}, {row} : i32")
+                self.guarded(first, lambda index=index, value=value: self.store_shared(index, value, dtype))
+            self.barrier()
+            combined = []
+            for slot in range(len(rows)):
+                row = row_coords[slot][self.row_position(acc, out_t)]
+                parts = [self.load_shared(row if w == 0 else self.emit(f"llvm.add {row}, {self.i32(w * acc.em)} : i32"), dtype) for w in range(acc.wn)]
+                value = parts[0]
+                for x in parts[1:]:
+                    value = self.scalar_op(combine, [value, x], dtype, {})
+                combined.append(value)
+            rows = combined
+        position = self.row_position(acc, out_t)
+        return _Value(rows, False, out_t, self.rows_layout(acc, out_t, op), None, MmaRows(acc, position, out_t.rank))
+
+    @staticmethod
+    def row_position(acc: MmaAcc, out_t: TileType) -> int:
+        return acc.row_axis - (1 if acc.col_axis < acc.row_axis else 0)
+
+    def rows_layout(self, acc: MmaAcc, out_t: TileType, op: TOp) -> list[list[str]]:
+        """Coordinates of MmaRows slots in out_t (cached per accumulator geometry and rank)."""
+        key = ("mma-rows", acc.em, acc.en, acc.wm, acc.wn, out_t.rank, self.row_position(acc, out_t))
+        if key in self.coords_cache:
+            return self.coords_cache[key]
+        base = self.coords_cache[("mma-acc", acc.em, acc.en, acc.wm, acc.wn, self.threads)]
+        position = self.row_position(acc, out_t)
+        zero = self.i32(0)
+        coords = []
+        for i in range(acc.mi):
+            for h in range(2):
+                row = base[(i * acc.nj) * 4 + 2 * h][0]
+                coords.append([row if k == position else zero for k in range(out_t.rank)])
+        self.coords_cache[key] = coords
+        return coords
 
     def exchange(self, op: TOp, src: _Value, out_t: TileType) -> _Value:
         attrs = dict(op.attrs)
@@ -776,15 +997,23 @@ class _Emitter:
         arg = op.attr("arg")
         view = self.task.args[arg].view
         dtype = op.attr("dtype")
-        regs = []
-        for slot, coords in enumerate(self.coords(out_t.shape)):
-            tile = self.tile_coords(starts, out_t.shape, coords)
-            if index is not None:
-                idx = index.regs[slot] if not index.replicated else index.regs[0]
-                idx = self.cast(idx, index.type.dtype, INDEX)
-                tile = [idx if m == -1 else tile[m] for m in op.attr("axis_map")]
-            regs.append(self.masked_load(arg, view, tile, dtype, op.attr("other"), view.fill, self.valid(out_t.shape, slot)))
-        return self.make(out_t, regs)
+
+        def at(like):
+            regs = []
+            for slot, coords in enumerate(self.layout_of(like)):
+                tile = self.tile_coords(starts, out_t.shape, coords)
+                if index is not None:
+                    idx = index.regs[slot] if not index.replicated else index.regs[0]
+                    idx = self.cast(idx, index.type.dtype, INDEX)
+                    tile = [idx if m == -1 else tile[m] for m in op.attr("axis_map")]
+                regs.append(self.masked_load(arg, view, tile, dtype, op.attr("other"), view.fill, self.valid_of(like, slot)))
+            return regs
+
+        value = self.make(out_t, at(_Value([], self.count(out_t.shape) == 1, out_t)))
+        # Re-reading in another layout is safe when this task never writes the argument.
+        if index is None and not self.task.args[arg].writes:
+            value.rebuild = at
+        return value
 
     def store(self, op: TOp, args: list[_Value]) -> None:
         value, *starts = args
@@ -832,6 +1061,28 @@ class _Emitter:
 
     def loop(self, op: TOp, args: list[_Value]) -> list[_Value]:
         lo, hi, step, *carries = args
+        if any(c.rebuild is not None for c in carries):
+            # Trial emission: find the layouts the body produces, then start the carries in them
+            # (constant initial values cost nothing to lay out), so no iteration converts layouts.
+            saved = self.snapshot()
+            probe = self.emit_loop(op, lo, hi, step, carries)[1]
+            self.restore(saved)
+            carries = [
+                self.rebuilt(c, r) if c.rebuild is not None and r.coords is not None and r.coords is not c.coords else c
+                for c, r in zip(carries, probe)
+            ]
+        return self.emit_loop(op, lo, hi, step, carries)[0]
+
+    def snapshot(self):
+        # Entry-block code (constants, coordinates) is pure and stays: probed layouts refer to it.
+        return (len(self.lines), dict(self.values), dict(self.memo))
+
+    def restore(self, saved) -> None:
+        lines, values, memo = saved
+        del self.lines[lines:]
+        self.values, self.memo = values, memo
+
+    def emit_loop(self, op: TOp, lo, hi, step, carries) -> tuple[list[_Value], list[_Value]]:
         region = op.regions[0]
         header, body, done = self.label(), self.label(), self.label()
         flat = [r for c in carries for r in c.regs]
@@ -848,16 +1099,20 @@ class _Emitter:
         position = 0
         carried = []
         for p, c in zip(region.params[1:], carries):
-            v = _Value(params[position : position + len(c.regs)], c.replicated, c.type, c.coords, c.valid)
+            v = _Value(params[position : position + len(c.regs)], c.replicated, c.type, c.coords, c.valid, c.structure)
             position += len(c.regs)
             self.values[p] = v
             carried.append(v)
-        results = [self.relayout(r, c) for r, c in zip(self.body(region), carries)]
+        memo = dict(self.memo)
+        raw = self.body(region)
+        results = [self.relayout(r, c) for r, c in zip(raw, carries)]
+        # Values rebuilt inside the body do not dominate the code after the loop.
+        self.memo = memo
         nxt = self.emit(f"llvm.add {iv}, {step.regs[0]} : i32")
         out = [r for v in results for r in v.regs]
         self.raw(f"llvm.br {header}({', '.join([nxt, *out])} : {', '.join(['i32', *types])})")
         self.lines.append(f"  {done}:")
-        return carried
+        return carried, raw
 
     # -- driver ---------------------------------------------------------------------------------
 
@@ -908,3 +1163,9 @@ class _Emitter:
 
 def lower_task(task: Task) -> Lowered:
     return _Emitter(task).run()
+
+
+def _acc_like(rows: MmaRows, target: MmaAcc) -> MmaAcc:
+    """The MmaAcc a broadcast of `rows` along the columns must have to be register-local."""
+    acc = rows.acc
+    return MmaAcc(acc.em, acc.en, acc.wm, acc.wn, target.row_axis, target.col_axis, target.rank)
