@@ -33,7 +33,12 @@ from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, TileType, TOp, TValue, View, full_view
 
 CHEAP_OPS = 3
+# A producer whose output is wider than its inputs (bf16 in, f32 out) is recomputed in every
+# reader up to this cost: reading its inputs again moves fewer bytes than writing and reading
+# its output (GPT-2's gelu tanh, shared by forward and backward after CSE: 50 MB of f32 per layer).
+RECOMPUTE_OPS = 8
 
+_BYTES = {DType.f32: 4, DType.f64: 8, DType.bf16: 2, DType.i32: 4, DType.i64: 8, DType.u32: 4, DType.bool: 1}
 _MEMORY = frozenset({"load", "load_indexed", "store", "atomic_add", "atomic_add_indexed"})
 _FREE = frozenset({"cast", "full", "dim", "broadcast", "iota"})
 _POINTWISE = UNARY | BINARY | {"cmp", "where"} | _FREE
@@ -48,6 +53,7 @@ class _Pointwise:
     coordinate: frozenset[TValue]
     store: TOp
     cost: int
+    widens: bool = False  # bytes per output element exceed the bytes it reads per element
 
 
 def fuse(program: Program) -> Program:
@@ -94,7 +100,8 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer]) -> _Pointwise | None:
         if op.kind == "broadcast" and op.attr("dims") != ():
             return None
         cost += op.kind not in _FREE
-    return _Pointwise(launch, starts, coordinate, store, cost)
+    read = sum(_BYTES[a.dtype] for a in launch.task.args if not a.writes and any(st != 0 for st in a.view.strides))
+    return _Pointwise(launch, starts, coordinate, store, cost, _BYTES[store.inputs[0].type.dtype] > read)
 
 
 def _coordinate_values(body: Body) -> frozenset[TValue]:
@@ -147,7 +154,7 @@ class _Rewriter:
             return None
         if any(a.view.pad is not None for a in recipe.launch.task.args if not a.writes):
             return None
-        cheap = recipe.cost <= CHEAP_OPS
+        cheap = recipe.cost <= CHEAP_OPS or (recipe.widens and recipe.cost <= RECOMPUTE_OPS)
         if self.readers[name] > 1 and not cheap:
             return None
         if self.into_dot and not _widening_cast(recipe):
