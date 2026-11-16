@@ -634,14 +634,14 @@ class _Builder:
         first = b.op("sub", col_start, b.index(self.causal))
         return b.op("mul", b.op("floordiv", first, b.index(self.rows)), b.index(self.rows))
 
-    def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None) -> tuple[TValue, TValue, list[TValue]]:
+    def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None, k_tile: TValue | None = None) -> tuple[TValue, TValue, list[TValue]]:
         """X tile (rank-d, 1..1 x rows x cols) for the query and key tiles at these starts."""
         b, f, lab = t.b, self.f, self.labels
         row, col, s = lab["row"], lab["col"], lab["sum"]
         ext = {x: 1 for x in self.batch} | {row: self.rows, col: self.cols, s: self.head}
         starts = {**q_starts, **k_starts, s: b.index(0)}
         a = q_tile if q_tile is not None else _operand(t, f.c1, 0, starts, ext, row, s)
-        k = _operand(t, f.c1, 1, starts, ext, s, col)
+        k = k_tile if k_tile is not None else _operand(t, f.c1, 1, starts, ext, s, col)
         dot = b.op("dot", a, k, b.full((self.rows, self.cols), 0, DType.f32))
         tile = tuple([1] * len(self.batch) + [self.rows, self.cols])
         s4 = b.op("reshape", dot, shape=tile)

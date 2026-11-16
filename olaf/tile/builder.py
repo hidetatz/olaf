@@ -146,7 +146,9 @@ class TileBuilder:
     def for_range(self, lo: TValue, hi: TValue, step: int, carries: Sequence[TValue], fn, **attrs) -> list[TValue]:
         """fn(builder, iv, carries) -> next carries. Builds the region in a fresh builder.
 
-        attrs: `stages`, the software pipeline depth for the loads in the body (1 = none).
+        attrs: `stages`, the software pipeline depth for the loads in the body (1 = none);
+        `stream`, double-buffer the dot operands the body loads at the loop variable (copy
+        iteration i+1's while computing iteration i), at the cost of twice their shared memory.
         """
         inner = TileBuilder()
         iv = TValue(TileType((), INDEX))

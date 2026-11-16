@@ -192,7 +192,7 @@ class _MatrixLoop:
         self.stages = stages
         self.dtype = dtype
         self.stage_bytes = a.bytes + b.bytes
-        e.shared_bytes = max(e.shared_bytes, stages * self.stage_bytes)
+        e.reserve(stages * self.stage_bytes)
         self.warp_m = em // self.wm
         self.warp_n = en // self.wn
         self.mi = self.warp_m // 16
@@ -310,11 +310,13 @@ class _MatrixLoop:
 
     # -- loop body pieces -----------------------------------------------------------------------
 
-    def issue(self, operand: _Operand, plan, stage_base: str, k: str, iv: TValue) -> None:
+    def issue(self, operand: _Operand, plan, stage_base: str, k: str, iv: TValue, offset_in_stage: int | None = None) -> None:
+        """cp.async copies of operand's tile into shared memory at stage_base (+ its offset in a stage)."""
         e = self.e
-        base = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
-        offset_in_stage = 0 if operand is self.a else self.a.bytes
-        starts = [k if iv is not None and s is iv else e.values[s].regs[0] for s in operand.starts]
+        base = e.smem_base()
+        if offset_in_stage is None:
+            offset_in_stage = 0 if operand is self.a else self.a.bytes
+        starts = [_start(e, s, iv, k) for s in operand.starts]
         contiguous = operand.cols_axis if operand.contiguous_cols else operand.rows_axis
         strided = operand.rows_axis if operand.contiguous_cols else operand.cols_axis
         for row, chunk, smem_offset in plan:
@@ -340,7 +342,7 @@ class _MatrixLoop:
 
     def ldmatrix(self, byte: str, trans: bool) -> list[str]:
         e = self.e
-        base = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+        base = e.smem_base()
         ptr = e.emit(f"llvm.getelementptr {base}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
         layout = "col" if trans else "row"
         result = e.emit(
@@ -448,12 +450,13 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
     """dot(a, b, acc) inside a task body (not a pipelined loop), with mma.sync.
 
     Each operand reaches the fragments the cheapest way it can:
+    - resident: a load that an enclosing loop copied to shared memory once (make_resident);
     - a plain b16 load from global memory (through widening casts, permutes, reshapes) is copied
       straight into shared memory with 16-byte async copies, as in the pipelined loop;
     - an A operand that is itself an accumulator of the same warp rows (warps stacked along M,
       one warp per 16 rows) becomes A fragments in registers: the m16n8 accumulator of columns
       16k..16k+15 holds exactly the m16k16 A fragment of that k block (FlashAttention's P);
-    - anything else is staged from registers into shared memory element by element.
+    - anything else is staged from registers into shared memory.
     Returns None when shapes or dtypes do not fit, for the general path.
     """
     from olaf.backend.cuda.lower import MmaAcc, _Value
@@ -471,12 +474,9 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
     grid = (warps, 1) if m % (16 * warps) == 0 else _warp_grid(warps, m, n)
     if grid is None:
         return None
-    a_global = _global_operand(e, a_t)
-    b_global = _global_operand(e, b_t)
-    # An accumulator operand is staged in its own (row, col) orientation with paired stores; a
-    # transposed one is then read with the transposing ldmatrix (contiguous_cols=False).
-    a_op = a_global or _Operand(-1, None, [], 0, 1, _natural(a) != "transposed", m, k)
-    b_op = b_global or _Operand(-1, None, [], 0, 1, _natural(b) != "transposed", k, n)
+    a_found, b_found = _global_operand(e, a_t), _global_operand(e, b_t)
+    a_op = a_found[0] if a_found else _Operand(-1, None, [], 0, 1, _natural(a) != "transposed", m, k)
+    b_op = b_found[0] if b_found else _Operand(-1, None, [], 0, 1, _natural(b) != "transposed", k, n)
     loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 1, DType.bf16)
     lane, wm_idx, wn_idx = loop.lane_values()
     layout = loop.accumulator_layout(lane, wm_idx, wn_idx)
@@ -487,29 +487,109 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
         acc_regs = [acc.regs[0]] * len(layout)
     else:
         acc_regs = e.relayout(acc, _Value([], False, acc.type, layout, None, structure)).regs
-    a_registers = _register_a(e, a, grid, m, k) if a_global is None else None
-    e.barrier()
-    for operand, value, base, is_global in ((a_op, a, 0, a_global is not None), (b_op, b, a_op.bytes, b_global is not None)):
-        if operand is a_op and a_registers is not None:
-            continue
-        if is_global:
-            plan = loop.copy_plan(operand)
-            loop.issue(operand, plan, e.i32(0), None, None)  # issue() places B after A itself
-        elif _natural(value) is not None:
-            _stage_accumulator(e, operand, value, base)
+    a_registers = _register_a(e, a, grid, m, k) if a_found is None else None
+    # Byte offsets relative to scratch (resident copies sit before it: negative offsets).
+    offsets = {}
+    cursor = 0
+    ready = set()  # operands already in shared memory (resident or streamed by the loop)
+    for name, found, operand in (("a", a_found, a_op), ("b", b_found, b_op)):
+        if found is not None and found[1] in e.resident:
+            offsets[name] = e.i32(e.resident[found[1]] - e.scratch_base)
+            ready.add(name)
+        elif found is not None and found[1] in e.streamed:
+            offsets[name] = e.streamed[found[1]]
+            ready.add(name)
+        elif name == "a" and a_registers is not None:
+            offsets[name] = e.i32(0)
+            ready.add(name)
         else:
-            _stage(e, loop, operand, value, base)
-    e.raw("nvvm.cp.async.commit.group")
-    e.raw("nvvm.cp.async.wait.group 0")
-    e.barrier()
+            offsets[name] = e.i32(cursor)
+            cursor += operand.bytes
+    e.reserve(cursor)
+    if len(ready) < 2:
+        e.barrier()
+    copied = False
+    for name, found, operand, value in (("a", a_found, a_op, a), ("b", b_found, b_op, b)):
+        if name in ready:
+            continue
+        if found is not None:
+            loop.issue(operand, loop.copy_plan(operand), offsets[name], None, None, offset_in_stage=0)
+            copied = True
+        elif _natural(value) is not None:
+            _stage_accumulator(e, operand, value, offsets[name])
+        else:
+            _stage(e, loop, operand, value, offsets[name])
+    if copied:
+        # (Waits for every group, including a loop's prefetch: copying here defeats streaming,
+        # which is why loops stream or keep resident every operand they can.)
+        e.raw("nvvm.cp.async.commit.group")
+        e.raw("nvvm.cp.async.wait.group 0")
+    if len(ready) < 2:
+        e.barrier()
     a_offsets, b_offsets = loop.fragment_offsets(lane, wm_idx, wn_idx)
-    out = loop.compute(e.i32(0), acc_regs, a_offsets, b_offsets, a_registers, e.i32(a_op.bytes))
+    out = loop.compute(offsets["a"], acc_regs, a_offsets, b_offsets, a_registers, offsets["b"])
     e.barrier()
     return _Value(out, False, acc.type, layout, None, structure)
 
 
-def _global_operand(e, value: TValue) -> _Operand | None:
-    """The dot operand as an _Operand copied from global memory, if it is a plain b16 load."""
+def make_resident(e, region) -> None:
+    """Copy the dot operands a loop body loads from outside the loop into shared memory, once.
+
+    The fused attention loops multiply the same q (forward) or k and v (backward) tile in every
+    iteration; staging them anew each time costs a copy, a wait and a barrier per dot. Resident
+    copies sit at the start of shared memory and scratch moves past them while the body is
+    emitted (Emitter.scratch_base).
+    """
+    inside = set()
+
+    def walk(body):
+        for op in body.ops:
+            inside.add(id(op))
+            for r in op.regions:
+                walk(r)
+
+    walk(region)
+    wanted = []
+    seen = set()
+
+    def scan(body):
+        for op in body.ops:
+            if op.kind == "dot":
+                for value in op.inputs[:2]:
+                    found = _global_operand(e, value)
+                    if found is None:
+                        continue
+                    operand, load = found
+                    if id(load) in inside or id(load) in seen or load in e.resident or any(s not in e.values for s in load.inputs):
+                        continue
+                    seen.add(id(load))
+                    wanted.append((operand, load))
+            for r in op.regions:
+                scan(r)
+
+    scan(region)
+    if not wanted:
+        return
+    total = 0
+    placed = []
+    for operand, load in wanted:
+        placed.append((operand, load, total))
+        total += -(-operand.bytes // 16) * 16
+    e.reserve(total)
+    e.barrier()
+    # Only the copy helpers are used: no pipeline stages, so nothing is reserved for them.
+    helper = _MatrixLoop(e, placed[0][0], placed[0][0], placed[0][0].rows, placed[0][0].cols, 16, (1, 1), 0, DType.bf16)
+    for operand, load, offset in placed:
+        helper.issue(operand, helper.copy_plan(operand), e.i32(offset), None, None, offset_in_stage=0)
+        e.resident[load] = e.scratch_base + offset
+    e.raw("nvvm.cp.async.commit.group")
+    e.raw("nvvm.cp.async.wait.group 0")
+    e.barrier()
+    e.scratch_base += total
+
+
+def _global_operand(e, value: TValue):
+    """(the dot operand as an _Operand copied from global memory, its load op) for a plain b16 load, else None."""
     producers = e.producers
     traced = _trace_operand(e, None, value, producers)
     if traced is None:
@@ -531,7 +611,7 @@ def _global_operand(e, value: TValue) -> _Operand | None:
     shape = load.attr("shape")
     operand = _Operand(load.attr("arg"), view, list(load.inputs), rows_axis, cols_axis, contiguous_cols, shape[rows_axis], shape[cols_axis])
     chunks = operand.stored_rows * operand.row_elems // 8
-    return operand if chunks % e.threads == 0 and operand.row_elems % 8 == 0 else None
+    return (operand, load) if chunks % e.threads == 0 and operand.row_elems % 8 == 0 else None
 
 
 def _register_a(e, a, grid, m: int, k: int):
@@ -571,7 +651,7 @@ def _stage(e, loop: _MatrixLoop, operand: _Operand, value, base: int) -> None:
     per_row = cols // 8
     rep = max(1, 8 // per_row)
     span = min(per_row, 8)
-    smem = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+    smem = e.smem_base()
     for slot, coords in enumerate(e.layout_of(value)):
         row, col = coords if len(coords) == 2 else (e.i32(0), coords[0])
         reg = value.regs[slot] if not value.replicated else value.regs[0]
@@ -582,7 +662,7 @@ def _stage(e, loop: _MatrixLoop, operand: _Operand, value, base: int) -> None:
         r = e.emit(f"llvm.udiv {row}, {e.i32(rep)} : i32") if rep > 1 else row
         swz = e.emit(f"llvm.xor {chunk}, {e.emit(f'llvm.urem {r}, {e.i32(span)} : i32')} : i32")
         byte = e.emit(f"llvm.add {e.emit(f'llvm.mul {row}, {e.i32(cols * 2)} : i32')}, {e.emit(f'llvm.mul {swz}, {e.i32(16)} : i32')} : i32")
-        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {e.i32(base)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {base} : i32')} : i32")
         ptr = e.emit(f"llvm.getelementptr {smem}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
         guard = e.valid_of(value, slot)
         e.guarded(guard, lambda reg=reg, ptr=ptr: e.raw(f"llvm.store {reg}, {ptr} : bf16, !llvm.ptr<3>"))
@@ -610,7 +690,7 @@ def _stage_accumulator(e, operand: _Operand, value, base: int) -> None:
     per_row = row_elems // 8
     rep = max(1, 8 // per_row)
     span = min(per_row, 8)
-    smem = e.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+    smem = e.smem_base()
     for slot in range(0, len(value.regs), 2):
         coords = value.coords[slot]
         row, col = coords[st.row_axis], coords[st.col_axis]
@@ -626,6 +706,79 @@ def _stage_accumulator(e, operand: _Operand, value, base: int) -> None:
         r = e.emit(f"llvm.udiv {row}, {e.i32(rep)} : i32") if rep > 1 else row
         swz = e.emit(f"llvm.xor {chunk}, {e.emit(f'llvm.urem {r}, {e.i32(span)} : i32')} : i32")
         byte = e.emit(f"llvm.add {e.emit(f'llvm.mul {row}, {e.i32(row_elems * 2)} : i32')}, {e.emit(f'llvm.mul {swz}, {e.i32(16)} : i32')} : i32")
-        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {e.i32(base)} : i32')} : i32")
+        byte = e.emit(f"llvm.add {byte}, {e.emit(f'llvm.add {e.emit(f'llvm.mul {within}, {e.i32(2)} : i32')}, {base} : i32')} : i32")
         ptr = e.emit(f"llvm.getelementptr {smem}[{byte}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
         e.raw(f"llvm.store {word}, {ptr} : i32, !llvm.ptr<3>")
+
+
+def make_streamed(e, region, lo) -> list:
+    """Double-buffer the dot operands a loop body loads at the loop variable, one iteration ahead.
+
+    The fused attention loops load a new k and v tile (forward) or q and dO tile (backward)
+    every iteration. Copying it right before its dot leaves the copy latency exposed; instead the
+    copy of iteration i+1 is issued at the top of iteration i (prefetch_streamed) into the other
+    of two buffers, and only iteration i's copy is waited for. Before the loop, iteration 0's
+    copies are issued. Returns the plan for prefetch_streamed.
+    """
+    iv = region.params[0]
+    inside = {id(op) for op in region.ops}
+    plan, seen = [], set()
+    for op in region.ops:
+        if op.kind != "dot":
+            continue
+        for value in op.inputs[:2]:
+            found = _global_operand(e, value)
+            if found is None:
+                continue
+            operand, load = found
+            if id(load) not in inside or id(load) in seen:
+                continue
+            if any(_start(e, s, iv, "") is None for s in load.inputs):
+                continue  # a start computed inside the body: not known an iteration ahead
+            seen.add(id(load))
+            plan.append([operand, load, 0])
+    if not plan:
+        return []
+    total = 0
+    for item in plan:
+        item[2] = total
+        total += 2 * (-(-item[0].bytes // 16) * 16)
+    e.reserve(total)
+    e.barrier()
+    helper = _MatrixLoop(e, plan[0][0], plan[0][0], plan[0][0].rows, plan[0][0].cols, 16, (1, 1), 0, DType.bf16)
+    for operand, load, offset in plan:
+        helper.issue(operand, helper.copy_plan(operand), e.i32(offset), lo.regs[0], iv, offset_in_stage=0)
+    e.raw("nvvm.cp.async.commit.group")
+    for item in plan:
+        item[2] += e.scratch_base  # absolute
+    e.scratch_base += total
+    return [(operand, load, offset, helper) for operand, load, offset in plan]
+
+
+def prefetch_streamed(e, plan, iv_reg: str, lo, step, iv: TValue) -> None:
+    """At the top of an iteration: start the next iteration's copies, wait for this one's."""
+    count = e.emit(f"llvm.sdiv {e.emit(f'llvm.sub {iv_reg}, {lo.regs[0]} : i32')}, {step.regs[0]} : i32")
+    slot = e.emit(f"llvm.urem {count}, {e.i32(2)} : i32")
+    other = e.emit(f"llvm.sub {e.i32(1)}, {slot} : i32")
+    nxt = e.emit(f"llvm.add {iv_reg}, {step.regs[0]} : i32")
+    for operand, load, offset, helper in plan:
+        size = -(-operand.bytes // 16) * 16
+        base = e.emit(f"llvm.add {e.i32(offset - e.scratch_base)}, {e.emit(f'llvm.mul {other}, {e.i32(size)} : i32')} : i32")
+        helper.issue(operand, helper.copy_plan(operand), base, nxt, iv, offset_in_stage=0)
+        e.streamed[load] = e.emit(f"llvm.add {e.i32(offset - e.scratch_base)}, {e.emit(f'llvm.mul {slot}, {e.i32(size)} : i32')} : i32")
+    e.raw("nvvm.cp.async.commit.group")
+    e.raw("nvvm.cp.async.wait.group 1")
+    e.barrier()
+
+
+def _start(e, value: TValue, iv: TValue | None, k: str) -> str | None:
+    """The register holding a copy's start: k for the loop variable, an emitted value, or a
+    scalar constant (which a loop body may create before it is emitted)."""
+    if iv is not None and value is iv:
+        return k
+    if value in e.values:
+        return e.values[value].regs[0]
+    op = e.producers.get(value)
+    if op is not None and op.kind == "full" and op.outputs[0].type.shape == ():
+        return e.i32(op.attr("value"))
+    return None

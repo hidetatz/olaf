@@ -137,6 +137,12 @@ class _Emitter:
     aligned_args: set[int] = field(default_factory=set)
     memo: dict = field(default_factory=dict)
     keep: list = field(default_factory=list)
+    # Shared memory: [resident operands of the enclosing loops | scratch]. Scratch users (operand
+    # staging, layout exchanges, reductions) address from scratch_base, which moves past the
+    # operands a loop keeps resident while its body is emitted.
+    scratch_base: int = 0
+    resident: dict = field(default_factory=dict)  # load op -> byte offset of its resident copy
+    streamed: dict = field(default_factory=dict)  # load op -> this iteration's buffer (scratch-relative SSA)
 
     @property
     def threads(self) -> int:
@@ -208,6 +214,17 @@ class _Emitter:
         if key not in self.dims:
             self.dims[key] = (len(self.dims), d)
         return f"%dim{self.dims[key][0]}"
+
+    def reserve(self, nbytes: int) -> None:
+        """Record that scratch needs nbytes from scratch_base."""
+        self.shared_bytes = max(self.shared_bytes, self.scratch_base + nbytes)
+
+    def smem_base(self) -> str:
+        """Pointer to the start of scratch shared memory."""
+        base = self.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+        if self.scratch_base:
+            base = self.emit(f"llvm.getelementptr {base}[{self.i32(self.scratch_base)}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
+        return base
 
     def barrier(self) -> None:
         self.raw("nvvm.barrier")
@@ -326,12 +343,12 @@ class _Emitter:
     # -- shared memory exchange -------------------------------------------------------------------
 
     def smem_ptr(self, index: str, dtype: DType) -> str:
-        base = self.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+        base = self.smem_base()
         return self.emit(f"llvm.getelementptr {base}[{index}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, {_MEMORY_TYPE[dtype]}")
 
     def to_shared(self, v: _Value) -> None:
         """Write every element of v to shared memory at its row-major index."""
-        self.shared_bytes = max(self.shared_bytes, self.count(v.type.shape) * element_bytes(v.type.dtype))
+        self.reserve(self.count(v.type.shape) * element_bytes(v.type.dtype))
         self.barrier()
         if v.replicated:
             self.store_shared(self.i32(0), v.regs[0], v.type.dtype)
@@ -737,7 +754,7 @@ class _Emitter:
             warp = self.entry(f"llvm.udiv %tid, {self.i32(32)} : i32")
             warp_n = self.entry(f"llvm.udiv {warp}, {self.i32(acc.wm)} : i32")
             row_coords = self.rows_layout(acc, out_t, op)
-            self.shared_bytes = max(self.shared_bytes, acc.wn * acc.em * 4)
+            self.reserve(acc.wn * acc.em * 4)
             self.barrier()
             first = self.emit(f"llvm.icmp \"eq\" {self.emit(f'llvm.urem {lane}, {self.i32(4)} : i32')}, {self.i32(0)} : i32")
             for slot, value in enumerate(rows):
@@ -849,7 +866,7 @@ class _Emitter:
         if trailing and r % t == 0:
             per = r // t
             warps = t // 32
-            self.shared_bytes = max(self.shared_bytes, n_out * warps * _BYTES[dtype])
+            self.reserve(n_out * warps * _BYTES[dtype])
             lane = self.entry(f"llvm.urem %tid, {self.i32(32)} : i32")
             warp = self.entry(f"llvm.udiv %tid, {self.i32(32)} : i32")
             totals = [self.butterfly(fold([src.regs[o * per + k] for k in range(per)]), 32, dtype, combine) for o in range(n_out)]
@@ -872,7 +889,7 @@ class _Emitter:
                 regs.append(value)
             return self.make(out_t, regs)
         if trailing and r <= 32 and t % r == 0 and r & (r - 1) == 0:
-            self.shared_bytes = max(self.shared_bytes, n_out * _BYTES[dtype])
+            self.reserve(n_out * _BYTES[dtype])
             self.barrier()
             leader = self.emit(f"llvm.icmp \"eq\" {self.emit(f'llvm.urem %tid, {self.i32(r)} : i32')}, {self.i32(0)} : i32")
             for slot in range(len(src.regs)):
@@ -895,7 +912,7 @@ class _Emitter:
             if n_out == t:
                 return self.make(out_t, [partial])
             contributors = min(n, t) // n_out if n >= t else -(-n // n_out)
-            self.shared_bytes = max(self.shared_bytes, t * _BYTES[dtype])
+            self.reserve(t * _BYTES[dtype])
             self.barrier()
             self.store_shared("%tid", partial, dtype) if n >= t else self.guarded(self.emit(f"llvm.icmp \"ult\" %tid, {self.i32(n)} : i32"), lambda: self.store_shared("%tid", partial, dtype))
             self.barrier()
@@ -953,7 +970,7 @@ class _Emitter:
         n = b.type.shape[1]
         acc_t = _LLVM[acc.type.dtype]
         a_bytes = m * k * element_bytes(a.type.dtype)
-        self.shared_bytes = max(self.shared_bytes, a_bytes + k * n * element_bytes(b.type.dtype))
+        self.reserve(a_bytes + k * n * element_bytes(b.type.dtype))
         self.barrier()
         self.write_tile(a, 0)
         self.write_tile(b, a_bytes)
@@ -985,7 +1002,7 @@ class _Emitter:
             self.guarded(guard, lambda index=index, reg=reg: self.raw(f"llvm.store {reg}, {self.smem_at(index, v.type.dtype, byte_offset)} : {_MEMORY_TYPE[v.type.dtype]}, !llvm.ptr<3>"))
 
     def smem_at(self, index: str, dtype: DType, byte_offset: int) -> str:
-        base = self.emit("llvm.mlir.addressof @smem : !llvm.ptr<3>")
+        base = self.smem_base()
         if byte_offset:
             base = self.emit(f"llvm.getelementptr {base}[{self.i32(byte_offset)}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, i8")
         return self.emit(f"llvm.getelementptr {base}[{index}] : (!llvm.ptr<3>, i32) -> !llvm.ptr<3>, {_MEMORY_TYPE[dtype]}")
@@ -1167,6 +1184,14 @@ class _Emitter:
 
     def emit_loop(self, op: TOp, lo, hi, step, carries) -> tuple[list[_Value], list[_Value]]:
         region = op.regions[0]
+        saved_base, saved_resident, saved_streamed = self.scratch_base, dict(self.resident), dict(self.streamed)
+        stream_plan = []
+        if self.use_matrix:
+            from olaf.backend.cuda.mma import make_resident, make_streamed, prefetch_streamed
+
+            make_resident(self, region)
+            # Double buffering is a schedule choice made in Tile IR (the loop's `stream` attribute).
+            stream_plan = make_streamed(self, region, lo) if op.attr("stream", False) else []
         header, body, done = self.label(), self.label(), self.label()
         flat = [r for c in carries for r in c.regs]
         types = [_LLVM[c.type.dtype] for c in carries for _ in c.regs]
@@ -1179,6 +1204,8 @@ class _Emitter:
         self.raw(f"llvm.cond_br {cond}, {body}, {done}")
         self.lines.append(f"  {body}:")
         self.values[region.params[0]] = _Value([iv], True, region.params[0].type)
+        if stream_plan:
+            prefetch_streamed(self, stream_plan, iv, lo, step, region.params[0])
         position = 0
         carried = []
         for p, c in zip(region.params[1:], carries):
@@ -1191,10 +1218,16 @@ class _Emitter:
         results = [self.relayout(r, c) for r, c in zip(raw, carries)]
         # Values rebuilt inside the body do not dominate the code after the loop.
         self.memo = memo
+        self.scratch_base, self.resident, self.streamed = saved_base, saved_resident, saved_streamed
         nxt = self.emit(f"llvm.add {iv}, {step.regs[0]} : i32")
         out = [r for v in results for r in v.regs]
         self.raw(f"llvm.br {header}({', '.join([nxt, *out])} : {', '.join(['i32', *types])})")
         self.lines.append(f"  {done}:")
+        if stream_plan:
+            # The last prefetch (past the end) may still be in flight into memory that scratch
+            # is about to reuse.
+            self.raw("nvvm.cp.async.wait.group 0")
+            self.barrier()
         return carried, raw
 
     # -- driver ---------------------------------------------------------------------------------

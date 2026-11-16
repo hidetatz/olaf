@@ -125,16 +125,19 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     b.emit("store", (b.op("reshape", d, shape=rows_tile(g)), *(starts[x] for x in batch + [row])), {"arg": t.arg(d_name, full_view(d_buffer.type.shape), d_buffer.type.dtype, True)})
     d_task = t.finish("attention_d", grid, pids, ("attention_d",))
 
-    def inner_step(t: _Task, g, starts: dict):
-        """Shared by both tasks: X, P (exact), dO, dP and dS for one (row tile, col tile)."""
+    def inner_step(t: _Task, g, starts: dict, k_tile=None, v_t=None):
+        """Shared by both tasks: X, P (exact), dO, dP and dS for one (row tile, col tile).
+
+        k_tile and v_t, when given, were loaded outside the loop (the column tile is fixed)."""
         b = t.b
-        x, q2d, coords = g.scores(t, {k: starts[k] for k in batch + [row]}, {col: starts[col]})
+        x, q2d, coords = g.scores(t, {k: starts[k] for k in batch + [row]}, {col: starts[col]}, k_tile=k_tile)
         m_rows, l_rows = stat(t, g, m_name, starts), stat(t, g, l_name, starts)
         prob = g.p_exact(t, x, coords, m_rows, l_rows)
         local3 = _local(m3, {**starts, VALUE: b.index(0), s: b.index(0)})
         e3 = _local(m3, extents(g))
         d_o = _operand(t, c3, back.do_operand_c3, local3, e3, _letter(m3, row), _letter(m3, VALUE))
-        v_t = _operand(t, c3, 1 - back.do_operand_c3, local3, e3, _letter(m3, VALUE), _letter(m3, col))
+        if v_t is None:
+            v_t = _operand(t, c3, 1 - back.do_operand_c3, local3, e3, _letter(m3, VALUE), _letter(m3, col))
         dp = b.op("reshape", b.op("dot", d_o, v_t, b.full((g.rows, g.cols), 0, DType.f32)), shape=x.type.shape)
         d_rows = stat(t, g, d_name, starts)
         tile = x.type.shape
@@ -170,6 +173,12 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     starts.update({s: b.index(0), VALUE: b.index(0)})
     zeros_k = b.full((g.cols, g.head), 0.0, DType.f32)
     zeros_v = b.full((g.cols, g.value_size), 0.0, DType.f32)
+    # The column tile is fixed for the whole loop: k (both orientations) and v load once, outside
+    # it, so the lowering keeps them resident in shared memory.
+    fixed = {**{x: starts[x] for x in batch}, col: starts[col], s: b.index(0)}
+    k_tile = _operand(t, f.c1, 1, fixed, extents(g), s, col)
+    k_rows = _operand(t, f.c1, 1, fixed, extents(g), col, s)
+    v_t = _operand(t, c3, 1 - back.do_operand_c3, _local(m3, {**fixed, VALUE: b.index(0)}), _local(m3, extents(g)), _letter(m3, VALUE), _letter(m3, col))
 
     dq_arg = back.dq.launch.task.args[back.dq.out_arg]
     dq_atomic = dq_arg.dtype is DType.f32
@@ -177,15 +186,14 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     def kv_body(inner: TileBuilder, r0, carries):
         t.b = inner
         dk, dv = carries
-        prob, ds, d_o, q2d = inner_step(t, g, {**starts, row: r0})
+        prob, ds, d_o, q2d = inner_step(t, g, {**starts, row: r0}, k_tile, v_t)
         dv = inner.op("dot", inner.op("permute", prob, perm=(1, 0)), d_o, dv)
         dk = inner.op("dot", inner.op("permute", ds, perm=(1, 0)), q2d, dk)
         if dq_atomic:
             # This tile's share of dQ = dS K, added atomically: every column tile contributes to
             # the same rows (FlashAttention-2), which saves recomputing S, P, dP and dS in a
             # separate task per row tile.
-            k2d = _operand(t, f.c1, 1, {**{x: starts[x] for x in batch}, col: starts[col], s: inner.index(0)}, extents(g), col, s)
-            part = inner.op("dot", ds, k2d, inner.full((g.rows, g.head), 0.0, DType.f32))
+            part = inner.op("dot", ds, k_rows, inner.full((g.rows, g.head), 0.0, DType.f32))
             local = _local(maps["dq"], {**starts, row: r0, s: inner.index(0)})
             accumulate(t, back.dq, maps["dq"], part, row, s, local, extents(g))
         return [dk, dv]
@@ -204,7 +212,9 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
             shaped = t.b.op("permute", shaped, perm=perm)
         t.b.emit("atomic_add", (shaped, *(local[x] for x in term)), {"arg": t.arg(contract.output, arg.view, arg.dtype, True)})
 
-    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body)
+    # Streamed q and dO: measured 2.34 -> 2.11 ms per layer for GPT-2 small on the RTX 3060.
+    # (The forward is not streamed: with its larger shared memory it ran 0.61 -> 0.96 ms.)
+    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body, stream=True)
     t.b = b
     store(t, g, back.dk, maps["dk"], dk, col, s, starts)
     store(t, g, back.dv, maps["dv"], dv, col, VALUE, starts)
