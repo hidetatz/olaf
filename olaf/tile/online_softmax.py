@@ -650,8 +650,31 @@ class _Builder:
         limits = [(self.rank - 2, self.shape[row]), (self.rank - 1, self.shape[col])]
         return _masked(t, x, coords, limits), a, coords
 
+    def row_tile(self) -> tuple[int, ...]:
+        return tuple([1] * len(self.batch) + [self.rows, 1])
+
+    def shift(self, t: _Task, m_rows: TValue, coords) -> TValue:
+        """F(m) of the exp task (exp(X - F(m))), once per row: (1, ..., rows, 1)."""
+        f, b = self.f, t.b
+        rt = self.row_tile()
+        m = b.op("reshape", m_rows, shape=rt)
+        subs = {f.x_arg_t3: b.full(rt, 0.0, DType.f32), **{a: m for a in f.m_arg_t3}}
+        return _replay(t, self.p, f.t3, subs, rt, coords, target=_t3_shift(self.p, f))
+
+    def exp_tile(self, t: _Task, x: TValue, shift_rows: TValue) -> TValue:
+        """E = exp(X - F(m)) with F computed per row (the exp task's own form, checked by the
+        match): F depends only on the row, and per element it costs a compare and a select for
+        every element (forward 0.46 -> 0.39 ms per layer for GPT-2 small)."""
+        b = t.b
+        spread = b.op("broadcast", shift_rows, shape=x.type.shape, dims=tuple(range(x.type.rank)))
+        return b.op("exp", b.op("sub", x, spread))
+
     def p_exact(self, t: _Task, x: TValue, coords, m_rows: TValue, l_rows: TValue) -> TValue:
-        """P as the unfused chain computes it, from the final row statistics."""
+        """P as the unfused chain computes it, from the final row statistics.
+
+        Per element, by replaying the exp and normalization tasks. (Evaluating F and G once per
+        row, as the forward does with exp_tile, measured slower here: 1.53 -> 1.80 ms per layer
+        for the dK/dV task of GPT-2 small.)"""
         f, b = self.f, t.b
         tile = x.type.shape
         e = _replay(t, self.p, f.t3, {f.x_arg_t3: x, **{a: _spread(b, m_rows, tile) for a in f.m_arg_t3}}, tile, coords)
@@ -666,6 +689,12 @@ class _Builder:
         starts[tiled] = b.op("mul", pids[-1], b.index(block))
         grid = [self.shape[x] for x in self.batch] + [_ceil(self.shape[tiled], block)]
         return pids, starts, grid
+
+
+def _t3_shift(p: _Program, f: _Forward) -> TValue:
+    """F(m) in the exp task's body: exp(sub(load X, F(m)))."""
+    value, producers = _value_of(p.launch(f.t3).task, "store")
+    return producers[producers[value].inputs[0]].inputs[1]
 
 
 def _ceil(d: Dim, t: int) -> Dim:
@@ -700,8 +729,7 @@ def _forward_task(p: _Program, f: _Forward, write_stats: bool) -> Launch:
         x, _, coords = g.scores(t, q_starts, {col: k0}, q_tile)
         tile = x.type.shape
         m_new = inner.op("max", m, inner.op("reduce", x, fn="max", axes=(rank - 1,)))
-        spread = {a: _spread(inner, m_new, tile) for a in f.m_arg_t3}
-        e = _replay(t, p, f.t3, {f.x_arg_t3: x, **spread}, tile, coords)
+        e = g.exp_tile(t, x, g.shift(t, m_new, coords))
         row_tile = rows_tile + (1,)
         old = inner.op("reshape", m, shape=row_tile)
         new = inner.op("reshape", m_new, shape=row_tile)

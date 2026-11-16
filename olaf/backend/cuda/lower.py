@@ -740,6 +740,26 @@ class _Emitter:
         template = _Value([], False, TileType((acc.em, acc.en), out_t.dtype), base, None, MmaAcc(acc.em, acc.en, acc.wm, acc.wn, 0, 1, 2))
         return self.relabel(template, out_t, mapping)
 
+    def rebuild_rows(self, src: _Value, dims, like: _Value) -> list[str] | None:
+        """A row-constant value (src varies only along the axis that becomes like's rows),
+        recomputed once per accumulator row a thread holds instead of once per element: four
+        loads per thread for a 64-row tile where per-element recomputation issues sixteen."""
+        acc = like.structure
+        mapped = [i for i, d in enumerate(dims) if d == acc.row_axis]
+        if len(mapped) != 1 or any(src.type.shape[i] != 1 for i in range(src.type.rank) if i != mapped[0]):
+            return None
+        row_axis = mapped[0]
+        base = self.coords_cache.get(("mma-acc", acc.em, acc.en, acc.wm, acc.wn, self.threads))
+        if base is None:
+            return None
+        zero = self.i32(0)
+        coords = []
+        for i in range(acc.mi):
+            for h in range(2):
+                row = base[(i * acc.nj) * 4 + 2 * h][0]
+                coords.append([row if k == row_axis else zero for k in range(src.type.rank)])
+        return src.rebuild(_Value([], False, src.type, coords, None, None))
+
     def lazy_broadcast(self, src: _Value, out_t: TileType, dims) -> _Value:
         """A broadcast emitted in its consumer's layout (see relayout); cyclic by default, except
         that rows of an accumulator land in the accumulator's layout (register-local)."""
@@ -748,6 +768,11 @@ class _Emitter:
             if isinstance(src.structure, MmaRows) and isinstance(like.structure, MmaAcc) and like.structure == _acc_like(src.structure, like.structure):
                 acc = like.structure
                 return [src.regs[i * 2 + q // 2] for i in range(acc.mi) for j in range(acc.nj) for q in range(4)]
+            if src.rebuild is not None and isinstance(like.structure, MmaAcc):
+                rows = self.rebuild_rows(src, dims, like)
+                if rows is not None:
+                    acc = like.structure
+                    return [rows[i * 2 + q // 2] for i in range(acc.mi) for j in range(acc.nj) for q in range(4)]
             if src.rebuild is None:
                 return self.exchange_into(src, out_t, dims, like)
             source_coords = [[c[d] if src.type.shape[i] != 1 else self.i32(0) for i, d in enumerate(dims)] for c in self.layout_of(like)]
