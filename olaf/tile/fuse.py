@@ -73,17 +73,20 @@ def fuse(program: Program) -> Program:
     return _without_dead(program, launches)
 
 
-def _pointwise(launch: Launch, buffers: dict[str, Buffer]) -> _Pointwise | None:
+def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = False) -> _Pointwise | None:
+    """A pointwise task (see the module docstring). multi: also accept several stores (of
+    sibling fusion's merged tasks), all at the same tile; info.store is then the first."""
     body = launch.task.body
     stores = [op for op in body.ops if op.kind == "store"]
-    if len(stores) != 1 or any(op.regions or op.kind not in _POINTWISE | {"load", "store"} for op in body.ops):
+    if (len(stores) != 1 and not (multi and stores)) or any(op.regions or op.kind not in _POINTWISE | {"load", "store"} for op in body.ops):
         return None
     store = stores[0]
     starts = store.inputs[1:]
-    arg = launch.task.args[store.attr("arg")]
-    target = buffers[launch.buffers[store.attr("arg")]]
-    if arg.view != full_view(target.type.shape):
-        return None
+    for other in stores:
+        arg = launch.task.args[other.attr("arg")]
+        target = buffers[launch.buffers[other.attr("arg")]]
+        if arg.view != full_view(target.type.shape) or other.inputs[1:] != starts or other.inputs[0].type.shape != store.inputs[0].type.shape:
+            return None
     coordinate = _coordinate_values(body)
     cost = 0
     for op in body.ops:
@@ -506,14 +509,16 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
     return Launch(new, tuple(args[k][0] for k in used))
 
 
-def fuse_siblings(program: Program, window: int = 8) -> Program:
+def fuse_siblings(program: Program, window: int = 32) -> Program:
     """Merge pointwise tasks over the same tile grid that read common inputs (horizontal fusion).
 
     AdamW updates a parameter's moments and the parameter itself in separate tasks, each
     reading the gradient (the parameter task recomputes the moments from their inputs): 11
     memory passes where one task needs 7. Merged, every distinct load happens once and every
     output is stored. A later task B moves to an earlier task A's place, so: B's inputs are all
-    written before A, nothing between them touches B's output, and B does not read A's output.
+    written before A, nothing between them touches B's output, and B reads A's outputs only
+    through the views A stores them with, so the merged body passes A's values on directly (the
+    parameter update reads the moments just written).
     """
     changed = True
     while changed:
@@ -521,22 +526,24 @@ def fuse_siblings(program: Program, window: int = 8) -> Program:
         buffers = {b.name: b for b in program.buffers}
         launches = list(program.launches)
         for i, a in enumerate(launches):
-            info_a = _pointwise(a, buffers) if not a.offsets else None
+            info_a = _pointwise(a, buffers, multi=True) if not a.offsets else None
             if info_a is None or len(launches) <= i + 1:
                 continue
             for j in range(i + 1, min(len(launches), i + 1 + window)):
                 b = launches[j]
-                info_b = _pointwise(b, buffers) if not b.offsets else None
+                info_b = _pointwise(b, buffers, multi=True) if not b.offsets else None
                 if info_b is None or b.task.grid != a.task.grid or info_b.store.inputs[0].type.shape != info_a.store.inputs[0].type.shape:
                     continue
                 reads_a = {n for n, x in zip(a.buffers, a.task.args) if not x.writes}
                 reads_b = {n for n, x in zip(b.buffers, b.task.args) if not x.writes}
-                if not reads_a & reads_b:
-                    continue
-                written_between = {n for k in range(i, j) for n, x in zip(launches[k].buffers, launches[k].task.args) if x.writes}
+                a_out = {n: x for n, x in zip(a.buffers, a.task.args) if x.writes}
+                written_between = {n for k in range(i + 1, j) for n, x in zip(launches[k].buffers, launches[k].task.args) if x.writes}
                 b_out = {n for n, x in zip(b.buffers, b.task.args) if x.writes}
                 touched_between = {n for k in range(i + 1, j) for n in launches[k].buffers}
-                if reads_b & written_between or b_out & touched_between:
+                forwarded = [x.view == a_out[n].view for n, x in zip(b.buffers, b.task.args) if not x.writes and n in a_out]
+                if reads_b & written_between or b_out & touched_between or not all(forwarded):
+                    continue
+                if not reads_a & reads_b and not forwarded:
                     continue
                 launches[i] = _merge(a, info_a, b, info_b)
                 del launches[j]
@@ -561,6 +568,7 @@ def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Laun
     builder = TileBuilder()
     params = a.task.body.params
     loads: dict[tuple, TValue] = {}
+    stored: dict[tuple, TValue] = {}  # (buffer, arg) -> the value a stores there (for b's loads)
     mapping_a: dict[TValue, TValue] = {}
     for launch, info, mapping in ((a, info_a, mapping_a), (b, info_b, dict(zip(b.task.body.params, params)))):
         # b's tile starts are a's (both tasks have the same grid and tile), as a's ops rebuilt here.
@@ -573,6 +581,9 @@ def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Laun
             if op.kind == "load":
                 arg = launch.task.args[op.attr("arg")]
                 name = launch.buffers[op.attr("arg")]
+                if launch is b and (name, replace(arg, writes=True)) in stored:
+                    mapping[op.outputs[0]] = stored[(name, replace(arg, writes=True))]
+                    continue
                 key = (name, arg, tuple(id(v) for v in ins), op.attr("shape"), op.attr("other"))
                 if key not in loads:
                     loads[key] = builder.op("load", *ins, arg=arg_index(name, arg), shape=op.attr("shape"), dtype=op.attr("dtype"), other=op.attr("other"))
@@ -581,6 +592,8 @@ def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Laun
             if op.kind == "store":
                 arg = launch.task.args[op.attr("arg")]
                 builder.emit("store", tuple(ins), {"arg": arg_index(launch.buffers[op.attr("arg")], arg)})
+                if launch is a:
+                    stored[(launch.buffers[op.attr("arg")], arg)] = ins[0]
                 continue
             outs = builder.emit(op.kind, ins, dict(op.attrs), op.regions)
             mapping.update(zip(op.outputs, outs))
