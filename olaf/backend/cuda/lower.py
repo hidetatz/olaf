@@ -1068,14 +1068,21 @@ class _Emitter:
         out = []
         for slot, coords in enumerate(self.coords(acc.type.shape)):
             row, col = coords
-            total = accs[slot]
+            # This k step's products go into a partial sum of their own, added to acc once: one
+            # chain of fma over all of K (784 for an MNIST layer) has a 3.5x larger error than
+            # cuBLAS (5.1e-7 against 1.4e-7 relative), and the partials give cuBLAS's. One add
+            # per k step of 32. The first product starts the partial, so no zero is needed.
+            total = None
             for kk in range(k):
                 ai = self.emit(f"llvm.add {self.emit(f'llvm.mul {row}, {self.i32(k)} : i32')}, {self.i32(kk)} : i32")
                 bi = self.emit(f"llvm.add {self.i32(kk * n)}, {col} : i32")
                 x = self.to_acc(self.load_shared_at(ai, a.type.dtype, 0), a.type.dtype, acc.type.dtype)
                 y = self.to_acc(self.load_shared_at(bi, b.type.dtype, a_bytes), b.type.dtype, acc.type.dtype)
-                total = self.emit(f"llvm.intr.fma({x}, {y}, {total}) : ({acc_t}, {acc_t}, {acc_t}) -> {acc_t}")
-            out.append(total)
+                if total is None:
+                    total = self.emit(f"llvm.fmul {x}, {y} : {acc_t}")
+                else:
+                    total = self.emit(f"llvm.intr.fma({x}, {y}, {total}) : ({acc_t}, {acc_t}, {acc_t}) -> {acc_t}")
+            out.append(accs[slot] if total is None else self.emit(f"llvm.fadd {accs[slot]}, {total} : {acc_t}"))
         return self.make(acc.type, out)
 
     def to_acc(self, reg: str, src: DType, acc: DType) -> str:
