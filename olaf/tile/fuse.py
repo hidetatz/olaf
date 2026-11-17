@@ -153,7 +153,11 @@ class _Rewriter:
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
         view = self.launch.task.args[op.attr("arg")].view
-        if recipe is None or view.source is None:
+        if recipe is None or (view.source is None and not _same_layout(recipe, name, self.buffers)):
+            return None
+        if view.source is None and self.readers[name] > 1 and _narrows(recipe):
+            # Its output stays for the other readers (a bf16 copy for a dot): reading the wider
+            # inputs again here would move more bytes than reading that output.
             return None
         if any(a.view.pad is not None for a in recipe.launch.task.args if not a.writes):
             return None
@@ -210,7 +214,7 @@ class _Rewriter:
             ins = [mapped.get(v, v) for v in op.inputs]
             if op.kind == "load":
                 arg = producer.task.args[op.attr("arg")]
-                view = _compose(arg.view, consumer_view)
+                view = _compose(arg.view, consumer_view) if consumer_view.source is not None else _same_layout_view(arg.view, consumer_view)
                 slot = self.arg_index(producer.buffers[op.attr("arg")], Arg(view, arg.dtype, False))
                 if index is not None:
                     out = b.op("load_indexed", index, *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), axis_map=load.attr("axis_map"), other=op.attr("other"))
@@ -301,6 +305,37 @@ def _compose(inner: View, outer: View) -> View:
     # Keeping the consumer's padding means padded positions never touch memory: their producer
     # coordinates lie outside the producer's range, where the address would be out of bounds.
     return View(outer.shape, tuple(strides), offset, outer.pad, outer.fill, source)
+
+
+def _same_layout(recipe: _Pointwise, name: str, buffers: dict[str, Buffer]) -> bool:
+    """The producer reads only buffers laid out like its output (same shape, contiguous, full
+    views) and scalars, and computes no coordinates: then a consumer view without a source map
+    (a reshape, as a split reduction reads [4, 1024, 768] as [16, 256, 768]) addresses each
+    input exactly as it addresses the output. GPT-2's layernorm weight gradient multiplies two
+    such buffers only to sum the product over rows."""
+    out = buffers[name]
+    if out.strides is not None or any(op.kind == "iota" for op in recipe.launch.task.body.ops):
+        return False
+    for buffer, arg in zip(recipe.launch.buffers, recipe.launch.task.args):
+        if arg.writes or all(st == 0 for st in arg.view.strides) and arg.view.pad is None:
+            continue
+        source = buffers[buffer]
+        if source.type.shape != out.type.shape or source.strides is not None or arg.view != full_view(out.type.shape):
+            return False
+    return True
+
+
+def _narrows(recipe: _Pointwise) -> bool:
+    task = recipe.launch.task
+    read = sum(_BYTES[a.dtype] for a in task.args if not a.writes and any(st != 0 for st in a.view.strides))
+    return read > _BYTES[recipe.store.inputs[0].type.dtype]
+
+
+def _same_layout_view(inner: View, outer: View) -> View:
+    """inner (see _same_layout) seen through outer, a view of the producer's output."""
+    if all(st == 0 for st in inner.strides):
+        return View(outer.shape, tuple(0 for _ in outer.shape), inner.offset, outer.pad, outer.fill, None)
+    return View(outer.shape, outer.strides, outer.offset, outer.pad, outer.fill, None)
 
 
 def _widening_cast(recipe: _Pointwise) -> bool:

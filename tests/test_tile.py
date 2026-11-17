@@ -512,3 +512,19 @@ def test_gradient_of_inner_axis_split_is_stored_in_slices():
     program = to_program(graph)
     assert not any(launch.task.origin == ("concat",) for launch in program.launches)
     assert rel(run_program(program, [x, w])[0][0], interpret(graph, [x, w])[0][0]) < 1e-6
+
+
+def test_product_is_inlined_into_a_split_column_sum():
+    # A split reduction reads its input through a reshape (no source map); a producer laid out
+    # like its output (layernorm's weight gradient, sum over rows of dy * xhat) is still inlined.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    shape = (4, 1024, 768)
+    a, b = R.normal(size=shape).astype(np.float32), R.normal(size=shape).astype(np.float32)
+    graph = lower(olaf.trace(lambda x, y: (olaf.sum(x * y, axis=(0, 1)), olaf.sum(x, axis=(0, 1))), tt(*shape), tt(*shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)  # a GPU's unit count makes the reduction split
+    assert sum(launch.task.name == "reduce_sum" for launch in program.launches) == 4  # two stages each
+    assert not any(launch.task.name == "mul" for launch in program.launches)
+    for got, want in zip(run_program(program, [a, b])[0], interpret(graph, [a, b])[0]):
+        assert rel(got, want) < 1e-5
