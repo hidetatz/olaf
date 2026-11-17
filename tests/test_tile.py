@@ -574,7 +574,7 @@ def test_split_bf16_sum_keeps_partials_in_f32():
 def test_row_fusion_keeps_statistics_that_kept_reductions_read():
     # top-2 by repeated max: the reduction that finds the max's position is read before the
     # pointwise task row fusion starts from, so it stays, and so must the max it reads.
-    from olaf.models.mixtral import top_k
+    from olaf.examples.mixtral import top_k
     from olaf.pipeline import to_program
 
     x = R.normal(size=(64, 4)).astype(np.float32)

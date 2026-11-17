@@ -6,7 +6,7 @@ import torch
 from transformers import MixtralConfig, MixtralForCausalLM
 
 import olaf
-from olaf.models import mixtral
+from olaf.examples import mixtral
 
 import test_llama
 from model_gate import MULTIPLIER, Case, curve, load, one_step, relative

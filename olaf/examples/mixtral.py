@@ -19,7 +19,7 @@ import numpy as np
 import olaf
 from olaf import nn
 from olaf.graph.types import DType
-from olaf.models import llama
+from olaf.examples import llama
 
 
 @dataclass(frozen=True)

@@ -12,7 +12,7 @@ from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 import olaf
 from olaf.graph.builder import verify
 from olaf.passes.canonicalize import canonicalize
-from olaf.models import gpt2
+from olaf.examples import gpt2
 from olaf.passes.decompose import decompose
 
 TOLERANCE = 1e-5

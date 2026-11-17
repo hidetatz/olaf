@@ -6,7 +6,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM
 
 import olaf
-from olaf.models import llama
+from olaf.examples import llama
 
 from model_gate import MULTIPLIER, Case, curve, load, one_step, relative
 
