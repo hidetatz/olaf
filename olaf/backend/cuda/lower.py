@@ -1068,6 +1068,12 @@ class _Emitter:
         out = []
         for slot, coords in enumerate(self.coords(acc.type.shape)):
             row, col = coords
+            guard = self.valid(acc.type.shape, slot)
+            if guard is not None:
+                # A thread past the tile's last element still runs the loop: its row would
+                # read past the operands in shared memory.
+                row = self.emit(f"llvm.select {guard}, {row}, {self.i32(0)} : i1, i32")
+                col = self.emit(f"llvm.select {guard}, {col}, {self.i32(0)} : i1, i32")
             # This k step's products go into a partial sum of their own, added to acc once: one
             # chain of fma over all of K (784 for an MNIST layer) has a 3.5x larger error than
             # cuBLAS (5.1e-7 against 1.4e-7 relative), and the partials give cuBLAS's. One add
@@ -1092,9 +1098,13 @@ class _Emitter:
         if v.replicated:
             self.raw(f"llvm.store {v.regs[0]}, {self.smem_at(self.i32(0), v.type.dtype, byte_offset)} : {_MEMORY_TYPE[v.type.dtype]}, !llvm.ptr<3>")
             return
+        # As to_shared: a value in an explicit layout (after a permute) is placed by its own
+        # coordinates and validity; the cyclic flat index would put its elements at the wrong
+        # addresses, and its invalid slots past the tile.
+        layout = self.layout_of(v)
         for slot, reg in enumerate(v.regs):
-            index = self.flat_index(slot)
-            guard = self.valid(v.type.shape, slot)
+            index = self.flat_index(slot) if v.coords is None else self.linear(layout[slot], v.type.shape)
+            guard = self.valid_of(v, slot)
             self.guarded(guard, lambda index=index, reg=reg: self.raw(f"llvm.store {reg}, {self.smem_at(index, v.type.dtype, byte_offset)} : {_MEMORY_TYPE[v.type.dtype]}, !llvm.ptr<3>"))
 
     def smem_at(self, index: str, dtype: DType, byte_offset: int) -> str:

@@ -612,11 +612,37 @@ class _Converter:
         ws = w.view.strides
         weights = Ref(w.buffer, View((g, O // g, *kernel, Cg), (O // g * ws[0], ws[0], *ws[2:], ws[1]), w.view.offset), w.dtype)
         out_letters, kernel_letters = "pqr"[:n], "uvz"[:n]
-        spec = f"n{out_letters}g{kernel_letters}c,go{kernel_letters}c->ngo{out_letters}"
-        grouped = TensorType((N, g, O // g, *out_spatial), out_type.dtype)
-        contract = Op("contract", (Value(TensorType(win_shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(grouped),), make_attrs({"spec": spec}))
+        win_labels = "n" + out_letters + "g" + kernel_letters + "c"
+        extent = dict(zip(win_labels, win_shape))
+        stride_of = dict(zip(win_labels, win_strides))
+        # The dot tiles only the last label of each role, so the role orders matter. Rows (M):
+        # the largest of batch and output positions, a whole tile of rows instead of, for a
+        # weight gradient (whose "batch" is the input channels and whose "output" is the 3x3
+        # kernel), a tile of 3. Reduction (K): the contiguous label when it is long enough for
+        # a k tile, so operand copies stay vectorizable; else the longest.
+        m_order = sorted("n" + out_letters, key=lambda c: extent[c])
+        k_candidates = kernel_letters + "c"
+        unit = [c for c in k_candidates if stride_of[c] == 1 and extent[c] >= 16]
+        k_inner = unit[0] if unit else max(k_candidates, key=lambda c: extent[c])
+        k_order = "".join(c for c in k_candidates if c != k_inner) + k_inner
+        a_term = "".join(m_order) + "g" + k_order
+        a_perm = [win_labels.index(c) for c in a_term]
+        windows = replace(windows, view=View(tuple(win_shape[i] for i in a_perm), tuple(win_strides[i] for i in a_perm), start))
+        w_labels = "go" + kernel_letters + "c"
+        b_term = "go" + k_order
+        b_perm = [w_labels.index(c) for c in b_term]
+        weights = replace(weights, view=View(tuple(weights.shape[i] for i in b_perm), tuple(weights.view.strides[i] for i in b_perm), weights.view.offset))
+        out_term = "go" + "".join(m_order)
+        size = {**extent, "o": O // g}
+        grouped = TensorType(tuple(size[c] for c in out_term), out_type.dtype)
+        spec = f"{a_term},{b_term}->{out_term}"
+        contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(grouped),), make_attrs({"spec": spec}))
         result = self._op_contract(contract, [windows, weights])
-        return replace(result, view=View(tuple(out_type.shape), contiguous_strides(out_type.shape), result.view.offset))
+        # The result is [g, O/g, *rows in m_order]; g and O/g are adjacent, so they read as O.
+        rs = contiguous_strides(grouped.shape)
+        at = {c: rs[i] for i, c in enumerate(out_term)}
+        strides = (at["n"], at["o"], *(at[c] for c in out_letters))
+        return replace(result, view=View(tuple(out_type.shape), strides, result.view.offset))
 
     def _matrix_dtype(self, value: Value) -> DType:
         producer = self.producers.get(value)
