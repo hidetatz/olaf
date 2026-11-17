@@ -6,8 +6,8 @@ and the structure a device kernel needs (program ids, for loops, dot).
 
 Scalars are rank-0 tiles. Index arithmetic uses i32: GPT-2 small's largest buffer (the 50257 x 768
 embedding gradient, 3.9e7 elements) is far below 2^31, and i64 index math halves integer
-throughput on GPUs. Lowering must widen to i64 before a product could overflow; the bound is
-checked there, where the concrete sizes are known.
+throughput on GPUs. A launch whose offsets would pass 2^31 is rejected once the sizes are known
+(backend/cuda/runtime.py, check_index_range); i64 lowering for such launches is not implemented.
 """
 
 from __future__ import annotations

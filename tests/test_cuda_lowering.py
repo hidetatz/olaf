@@ -319,3 +319,16 @@ def test_sibling_column_sums_share_one_loop():
     actual, _ = CudaProgram(program).run(arrays)
     for a, e in zip(actual, expected):
         assert rel(a, e) < 1e-5
+
+
+def test_offsets_past_i32_are_rejected():
+    # Kernels compute element offsets in i32; past 2^31 they would wrap silently. Only the IR is
+    # built here (nothing is allocated), so no device is needed.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import check_index_range
+
+    big = to_program(lower(olaf.trace(lambda x: x * 2.0, tt(2**16, 2**15 + 8)).graph), AMPERE_RTX3060)
+    with pytest.raises(OverflowError, match="i32"):
+        check_index_range(big, {})
+    small = to_program(lower(olaf.trace(lambda x: x * 2.0, tt(2**15, 2**16 - 1)).graph), AMPERE_RTX3060)
+    check_index_range(small, {})  # 2^31 - 2^15 elements: the last offset still fits

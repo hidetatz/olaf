@@ -120,6 +120,42 @@ def _fingerprint() -> str:
     return _FINGERPRINT[0]
 
 
+INDEX_LIMIT = 2**31  # kernels address in i32 (tile/builder.py); see check_index_range
+
+
+def check_index_range(program: Program, env: dict[str, int]) -> None:
+    """Fail when a kernel would compute an element offset or block index past i32.
+
+    Kernels add view offsets and coordinate * stride terms in i32 on top of the argument's base
+    pointer (the launch offset is added on the host, in 64 bits). Past 2^31 the arithmetic wraps
+    and the kernel reads and writes the wrong elements without any error, so the sizes are
+    checked once they are known. Masked lanes may compute wrapped offsets; they are replaced by
+    0 before the access, so only in-bounds coordinates count here. Lowering to i64 offsets for
+    such launches is not implemented: it costs integer throughput on every access.
+    """
+    for launch in program.launches:
+        blocks = 1
+        for d in launch.task.grid:
+            blocks *= evaluate(d, env)
+        if blocks >= INDEX_LIMIT:
+            raise OverflowError(f"{launch.task.name}: {blocks} blocks exceed the i32 block index")
+        for name, arg in zip(launch.buffers, launch.task.args):
+            view = arg.view
+            low = high = evaluate(view.offset, env)
+            for axis, (size, stride) in enumerate(zip(view.shape, view.strides)):
+                extent = evaluate(size, env)
+                if view.pad is not None:
+                    extent -= evaluate(view.pad[axis][0], env) + evaluate(view.pad[axis][1], env)
+                step = evaluate(stride, env)
+                if extent > 0:
+                    span = (extent - 1) * step
+                    low, high = low + min(span, 0), high + max(span, 0)
+            if high >= INDEX_LIMIT or low <= -INDEX_LIMIT:
+                raise OverflowError(
+                    f"{launch.task.name}: argument {name} ({program.buffer(name).type}) reaches element offset {high}, past the i32 offsets kernels compute"
+                )
+
+
 class CudaProgram:
     def __init__(self, program: Program) -> None:
         self.program = program
@@ -175,6 +211,7 @@ class CudaProgram:
         state = dict(state or {})
         inputs = [np.asarray(a) for a in inputs]
         env = self.bind(inputs, state)
+        check_index_range(self.program, env)
         buffers = self.allocate(env)
         for name, array in zip(self.program.inputs, inputs):
             buffers[name].upload(to_device_bytes(array, self.program.buffer(name).type.dtype), self.stream)
@@ -239,6 +276,7 @@ class Session:
         self.compiled = compiled
         program = compiled.program
         self.env = dict(dims)
+        check_index_range(program, self.env)
         offsets, arena_bytes = plan_arena(program, self.env)
         self.arena_bytes = arena_bytes
         self.arena = driver.DeviceBuffer(max(arena_bytes, 1))
