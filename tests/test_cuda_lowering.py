@@ -279,3 +279,17 @@ def test_kernel_cache_skips_lowering_on_the_second_compile(tmp_path, monkeypatch
     monkeypatch.setattr(runtime, "lower_task", fail)
     second = runtime._compiled(task, "sm_86")
     assert second[1] == first[1] and second[0].text == first[0].text
+
+
+@pytest.mark.gpu
+def test_gradient_of_inner_axis_split_stored_in_slices():
+    def fn(a, w):
+        def loss(a):
+            # Products keep the pieces' gradients in tasks of their own (else they fuse into one).
+            q, k, v = a[:, :, :4], a[:, :, 4:8], a[:, :, 8:]
+            mm = lambda t, spec="bsd,de->bse": olaf.tanh(olaf.einsum(spec, t, w))
+            return olaf.sum(mm(olaf.permute(q, (1, 0, 2)))) + olaf.sum(mm(k)) + olaf.sum(mm(v))
+
+        return olaf.grad(loss)(a)
+
+    run_both(fn, [R.normal(size=(2, 6, 12)).astype(np.float32), R.normal(size=(4, 4)).astype(np.float32)], fused=True)

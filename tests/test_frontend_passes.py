@@ -462,6 +462,21 @@ class TestCanonicalize:
         after = self._check(lambda a: a[1:, :], X)
         assert [op.kind for op in after.ops] == ["slice"]
 
+    def test_adjacent_pads_summed_become_a_concat(self):
+        x = R.normal(size=(3, 6)).astype(np.float32)
+
+        def fn(a):
+            pieces = [olaf.pad(a[:, :2] * 2.0, (0, 0), (0, 4)), olaf.pad(olaf.exp(a[:, 2:5]), (0, 2), (0, 1)), olaf.pad(a[:, 5:], (0, 5), (0, 0))]
+            return pieces[2] + (pieces[1] + pieces[0])
+
+        after = self._check(fn, x, removes=("add", "pad"))
+        assert [len(op.inputs) for op in after.ops if op.kind == "concat"] == [3]
+
+    def test_pads_with_a_gap_are_kept(self):
+        x = R.normal(size=(3, 6)).astype(np.float32)
+        after = self._check(lambda a: olaf.pad(a[:, :2], (0, 0), (0, 4)) + olaf.pad(a[:, 3:], (0, 3), (0, 0)), x)
+        assert "add" in [op.kind for op in after.ops]
+
     def test_inside_scan_region(self):
         def fn(a):
             return olaf.scan(lambda c, _: (c.reshape(12).reshape(3, 4), None), a, None, length=2)[0]

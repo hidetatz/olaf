@@ -147,10 +147,11 @@ def eliminate_concats(program: Program) -> Program:
     """Let the producers of a concat's inputs store into their slices of its output.
 
     Unrolled scans stack each layer's weight gradients with concat (passes.unroll): 12 tensors
-    per weight kind, written once by their producers and then copied into the stack. When input
-    j is a contiguous buffer that only the concat reads, and its slice of the output is one
-    contiguous block (the concat axis is outermost, or every axis before it has size 1), its
-    producer can store there directly, at an offset, and the concat disappears.
+    per weight kind, written once by their producers and then copied into the stack; the qkv
+    gradient joins dq, dk and dv along its last axis. When input j is a contiguous buffer that
+    only the concat reads, and its slice of the output can be shown in j's shape as a strided
+    view (an offset block, or rows of a block when the concat axis is inner), its producer
+    stores there directly and the concat disappears.
     """
     from olaf.tile.ir import full_view
 
@@ -177,9 +178,8 @@ def eliminate_concats(program: Program) -> Program:
         plan = _concat_plan(program, launch, target, buffers, readers, writers, i)
         if plan is None:
             continue
-        for j, view in plan:
+        for j, name, view in plan:
             producer = launches[j]
-            name = next(n for n, a in zip(producer.buffers, producer.task.args) if a.writes)
             args = tuple(replace(a, view=view) if n == name and a.writes else a for n, a in zip(producer.buffers, producer.task.args))
             task = producer.task
             launches[j] = Launch(Task(task.name, task.grid, args, task.body, task.warps, task.origin), tuple(out if n == name else n for n in producer.buffers))
@@ -200,7 +200,7 @@ def _pure_select(task: Task) -> bool:
 
 def _concat_plan(program: Program, launch: Launch, target, buffers, readers, writers, index: int):
     """[(producer launch index, its store view into the concat output)] for every input, or None."""
-    from olaf.graph.dim import product
+    from olaf.tile.from_graph import _reshaped_strides
     from olaf.tile.ir import full_view
 
     shape = target.type.shape
@@ -215,12 +215,20 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         if view.pad is None or len(padded) != 1 or view.offset != 0:
             return None
         axis = padded[0]
-        if any(shape[k] != 1 for k in range(axis)):
-            return None  # the slice would not be one contiguous block
         lo, hi = view.pad[axis]
         logical = tuple(shape[k] - lo - hi if k == axis else d for k, d in enumerate(shape))
         source = buffers[name]
-        if view.strides != contiguous_strides(logical) or product(source.type.shape) != product(logical) or source.strides is not None:
+        if source.strides is not None:
+            return None
+        out_strides = contiguous_strides(shape)
+        if not isinstance(lo, int) or not isinstance(out_strides[axis], int):
+            return None
+        block = View(logical, out_strides, lo * out_strides[axis])
+        if view.strides == contiguous_strides(logical):
+            strides = _reshaped_strides(block, source.type.shape)  # read as a reshape of the input
+        else:
+            strides = _permuted_strides(view, logical, source.type.shape, out_strides)  # read permuted
+        if strides is None:
             return None
         w = writers.get(name, [])
         if len(w) != 1 or readers.get(name) != [index] or source.kind is not BufferKind.temp or w[0] > index:
@@ -230,11 +238,62 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
             return None
         stores = [a for n, a in zip(producer.buffers, producer.task.args) if n == name]
         has_store = any(op.kind == "store" for op in _ops(producer.task.body))
-        has_atomic = any(op.kind.startswith("atomic") for op in _ops(producer.task.body))
-        if len(stores) != 1 or not stores[0].writes or stores[0].view != full_view(source.type.shape) or not has_store or has_atomic:
+        # Atomics into this input would have to see the other inputs' slices as zeros.
+        has_atomic = any(op.kind.startswith("atomic") and producer.buffers[op.attr("arg")] == name for op in _ops(producer.task.body))
+        if len(stores) != 1 or not stores[0].writes or not has_store or has_atomic:
             return None
-        plan.append((w[0], View(source.type.shape, contiguous_strides(source.type.shape), lo * product(shape[axis + 1 :]))))
+        composed = _compose(stores[0].view, source.type.shape, strides, block.offset)
+        if composed is None:
+            return None
+        plan.append((w[0], name, composed))
     return plan or None
+
+
+def _permuted_strides(read: View, logical, shape, out_strides) -> tuple | None:
+    """Strides placing a contiguous buffer of `shape` where `read` (a permutation of its axes,
+    `logical` its unpadded extent) shows it in the concat's coordinates; None when `read` is
+    not a permutation."""
+    contiguous = contiguous_strides(shape)
+    if read.offset != 0 or not all(isinstance(d, int) for d in (*read.strides, *logical, *contiguous, *out_strides)):
+        return None
+    strides = []
+    for k, (size, step) in enumerate(zip(shape, contiguous)):
+        if size == 1:
+            strides.append(0)
+            continue
+        axes = [i for i, (d, st) in enumerate(zip(logical, read.strides)) if st == step and d == size]
+        if len(axes) != 1:
+            return None
+        strides.append(out_strides[axes[0]])
+    if sorted(d for d in logical if d != 1) != sorted(d for d in shape if d != 1):
+        return None
+    return tuple(strides)
+
+
+def _compose(view: View, shape, strides, offset: int) -> View | None:
+    """`view` (into a contiguous buffer of `shape`) re-aimed at the same elements laid out with
+    `strides` from `offset`. Each axis of the view must step along one buffer axis (a permuted
+    or sliced store, as attention's dK and dV are written head-major into a [batch, seq, head,
+    dim] buffer); anything else is None."""
+    contiguous = contiguous_strides(shape)
+    if view.pad is not None or not all(isinstance(d, int) for d in (*view.shape, *view.strides, view.offset, *contiguous)):
+        return None
+    new = []
+    for size, step in zip(view.shape, view.strides):
+        if step == 0 or size == 1:
+            new.append(0)
+            continue
+        axes = [k for k, c in enumerate(contiguous) if c == step and shape[k] > 1]
+        if len(axes) != 1 or size > shape[axes[0]]:
+            return None
+        new.append(strides[axes[0]])
+    rest, start = view.offset, offset
+    for k, c in enumerate(contiguous):
+        index, rest = divmod(rest, c) if shape[k] > 1 else (0, rest)
+        start += index * strides[k]
+    if rest:
+        return None
+    return View(view.shape, tuple(new), start)
 
 
 def _ops(body):

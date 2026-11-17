@@ -11,8 +11,9 @@ from collections.abc import Callable
 from olaf.graph.builder import dead_code_elimination, make_attrs
 from olaf.graph.ir import Graph, Op, Value
 
-# A rule returns a replacement Value (identity), a new Op, or None (no match).
-Rule = Callable[[Op, dict[Value, Op]], Value | Op | None]
+# A rule returns a replacement Value (identity), a new Op, new Ops (the last one defines the
+# result), or None (no match).
+Rule = Callable[[Op, dict[Value, Op]], Value | Op | tuple[Op, ...] | None]
 
 
 def _reshape_identity(op, defs):
@@ -79,6 +80,51 @@ def _pad_identity(op, defs):
         return op.inputs[0]
 
 
+def _add_of_pads(op, defs):
+    """pad(a) + pad(b), zero-padded along one axis to adjacent ranges, is pad(concat(a, b)).
+
+    The gradient of a value sliced into pieces (GPT-2's fused qkv projection split into q, k
+    and v) is the sum of each piece's gradient zero-padded back to full size: as adds, two extra
+    passes over the whole gradient; as a concat, the pieces' producers store into its slices
+    (eliminate_concats). Not bit-identical in one case: -0.0 + 0.0 is +0.0, the concat keeps -0.0.
+    """
+    if op.kind != "add":
+        return None
+    pads = [defs.get(v) for v in op.inputs]
+    if any(p is None or p.kind != "pad" or p.attr("value") != 0.0 for p in pads):
+        return None
+    (a, b) = pads
+    differ = [i for i, w in enumerate(zip(a.attr("low"), a.attr("high"), b.attr("low"), b.attr("high"))) if any(x != 0 for x in w)]
+    if len(differ) != 1 or any(not isinstance(x, int) for x in (*a.attr("low"), *a.attr("high"), *b.attr("low"), *b.attr("high"))):
+        return None
+    axis = differ[0]
+    extent = op.outputs[0].type.shape[axis]
+    if a.attr("low")[axis] > b.attr("low")[axis]:
+        a, b = b, a
+    if extent - a.attr("high")[axis] != b.attr("low")[axis]:
+        return None  # not adjacent (overlapping, or a gap between)
+    x, y = a.inputs[0], b.inputs[0]
+    joined = Value(x.type.with_shape(d + y.type.shape[i] if i == axis else d for i, d in enumerate(x.type.shape)))
+    concat = Op("concat", (x, y), (joined,), make_attrs({"axis": axis}))
+    concat = _concat_of_concat(concat, defs) or concat  # (dq, concat(dk, dv)) is one concat
+    low = tuple(a.attr("low")[i] if i == axis else 0 for i in range(len(a.attr("low"))))
+    high = tuple(b.attr("high")[i] if i == axis else 0 for i in range(len(b.attr("high"))))
+    return concat, Op("pad", (joined,), op.outputs, make_attrs({"low": low, "high": high, "value": 0.0}))
+
+
+def _concat_of_concat(op, defs):
+    if op.kind != "concat":
+        return None
+    axis = op.attr("axis")
+    flat = []
+    for v in op.inputs:
+        inner = defs.get(v)
+        flat.extend(inner.inputs if inner is not None and inner.kind == "concat" and inner.attr("axis") == axis else (v,))
+    if len(flat) == len(op.inputs):
+        return None
+    return Op("concat", tuple(flat), op.outputs, op.attrs)
+
+
 RULES: tuple[Rule, ...] = (
     _reshape_identity,
     _reshape_of_reshape,
@@ -88,6 +134,8 @@ RULES: tuple[Rule, ...] = (
     _slice_identity,
     _slice_of_concat,
     _pad_identity,
+    _add_of_pads,
+    _concat_of_concat,
 )
 
 
@@ -106,6 +154,10 @@ def canonicalize(graph: Graph) -> Graph:
                     subst[current.outputs[0]] = result
                     current = None
                     break
+                if isinstance(result, tuple):
+                    *before, result = result
+                    ops.extend(before)
+                    defs.update((v, o) for o in before for v in o.outputs)
                 if result is not None:
                     current = result
                     changed = True

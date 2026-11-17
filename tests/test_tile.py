@@ -488,3 +488,27 @@ def test_scan_gradient_stacks_are_written_in_place():
     program = to_program(graph)
     assert not any(launch.task.origin == ("concat",) for launch in program.launches)
     assert rel(run_program(program, [X, w])[0][0], interpret(graph, [X, w])[0][0]) < 1e-5
+
+
+def test_gradient_of_inner_axis_split_is_stored_in_slices():
+    # The gradient of a value split along its last axis (GPT-2's qkv) is a concat of the pieces'
+    # gradients; their producers store into strided slices of it, one of them permuted.
+    from olaf.pipeline import to_program
+
+    x = R.normal(size=(2, 6, 12)).astype(np.float32)
+
+    def fn(a, w):
+        def loss(a):
+            # Products keep the pieces' gradients in tasks of their own (else they fuse into one).
+            q, k, v = a[:, :, :4], a[:, :, 4:8], a[:, :, 8:]
+            mm = lambda t, spec="bsd,de->bse": olaf.tanh(olaf.einsum(spec, t, w))
+            return olaf.sum(mm(olaf.permute(q, (1, 0, 2)))) + olaf.sum(mm(k)) + olaf.sum(mm(v))
+
+        return olaf.grad(loss)(a)
+
+    w = R.normal(size=(4, 4)).astype(np.float32)
+    graph = lower(olaf.trace(fn, tt(2, 6, 12), tt(4, 4)).graph)
+    assert not any(op.kind == "add" and op.outputs[0].type.shape == (2, 6, 12) for op in graph.ops)
+    program = to_program(graph)
+    assert not any(launch.task.origin == ("concat",) for launch in program.launches)
+    assert rel(run_program(program, [x, w])[0][0], interpret(graph, [x, w])[0][0]) < 1e-6
