@@ -58,6 +58,8 @@ from olaf.frontend.trace import (
     while_loop,
     zeros,
 )
+from olaf.frontend import nn
+from olaf.frontend.optim import SGD, AdamW, params_from_state, train_step
 from olaf.graph.dim import Dim, sym
 from olaf.graph.types import DType, Sharding, StateDecl, StateKind, TensorType
 
