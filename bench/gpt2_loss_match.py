@@ -183,15 +183,18 @@ def one_step() -> None:
     test_training.LR, test_training.BETAS, test_training.WD = LR, BETAS, WD
     model = model_init().eval()
     traced, _ = test_training.train_step(split_params(model), model.config, BATCH, SEQ)
-    compiled = CudaProgram(to_program(test_training.lower(traced.graph), AMPERE_RTX3060))
+    from olaf.search.tune import load
+
+    # The searched schedules when there are any: those are what training runs with.
+    compiled = CudaProgram(to_program(test_training.lower(traced.graph), AMPERE_RTX3060, schedules=load()))
     b1 = BETAS[0]
     rel = lambda a, b: float(np.linalg.norm((a - b).ravel()) / np.linalg.norm(b.ravel()))  # noqa: E731
     worst = []
+    session = Session(compiled, {})  # one session for every checkpoint: each holds the whole step's memory
     for k in CHECKPOINTS:
         data = np.load(OUT / f"checkpoint_{k}.npz")
         exact = np.load(OUT / f"truth_{k}.npz")
         state = {name[len("state/"):]: data[name] for name in data.files if name.startswith("state/")}
-        session = Session(compiled, {})
         session.load_state(state)
         session.step([data["ids"]])
         loss = float(session.outputs()[0])
