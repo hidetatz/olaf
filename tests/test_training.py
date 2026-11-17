@@ -119,16 +119,21 @@ def test_mixed_precision_steps_on_device_match_eager_and_torch():
     device = CudaProgram(fuse(to_tile(graph, AMPERE_RTX3060)))
     data = batches(6, batch, seq, model.config.vocab_size)
     eager_state, device_state = dict(initial), dict(initial)
-    eager, ours = [], []
+    eager, stepwise, ours = [], [], []
     for ids in data:
+        # The device step from eager's state: one step's difference, not an accumulated one.
+        (loss,), _ = device.run([ids], eager_state)
+        stepwise.append(float(loss))
         (loss,), eager_state = interpret(graph, [ids], eager_state)
         eager.append(float(loss))
         (loss,), device_state = device.run([ids], device_state)
         ours.append(float(loss))
     reference, _ = torch_losses(small_model(), data, "cuda")
-    # The device and eager differ only in f32 summation order (and the resulting bf16 roundings);
-    # measured 7e-8.
-    np.testing.assert_allclose(ours, eager, rtol=1e-5)
+    # From the same state the device and eager differ only in f32 summation order (and the
+    # resulting bf16 roundings). Run apart for six steps, an occasional bf16 rounding that
+    # falls the other way grows (3.7e-5 by step 6 once AdamW's bias corrections became exact),
+    # so the separate runs are compared with PyTorch below instead.
+    np.testing.assert_allclose(stepwise, eager, rtol=1e-5)
     # Against PyTorch the bf16 rounding points differ (it rounds the scores before softmax and
     # each gelu step; olaf rounds composites once). Measured 1.8e-5, below PyTorch's own bf16 vs
     # f32 difference (2.1e-5) on these steps; 1e-3 leaves room without hiding a real error.

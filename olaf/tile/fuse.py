@@ -102,7 +102,11 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
             return None
         if op.kind == "broadcast" and op.attr("dims") != ():
             return None
-        cost += op.kind not in _FREE
+        if op.kind not in _FREE:
+            # f64 arithmetic is never cheap: duplicated into a reader it runs once per thread,
+            # and consumer GPUs do f64 at 1/64 of the f32 rate (AdamW's f64 bias corrections,
+            # inlined into GPT-2's 38M-element embedding update, would be ~1e9 f64 operations).
+            cost += CHEAP_OPS + 1 if op.outputs and op.outputs[0].type.dtype is DType.f64 else 1
     read = sum(_BYTES[a.dtype] for a in launch.task.args if not a.writes and any(st != 0 for st in a.view.strides))
     return _Pointwise(launch, starts, coordinate, store, cost, _BYTES[store.inputs[0].type.dtype] > read)
 
