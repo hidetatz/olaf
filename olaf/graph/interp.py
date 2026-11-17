@@ -191,6 +191,40 @@ def _contract(run, op, args):
     return [np.einsum(op.attr("spec"), *args, optimize=True)]
 
 
+def conv_reference(x: np.ndarray, w: np.ndarray, stride, padding, dilation, lhs_dilation, groups) -> np.ndarray:
+    """conv in NumPy, in x's dtype: dilate the input, pad (or crop), then one product per kernel
+    offset over strided windows."""
+    n = x.ndim - 2
+    if any(d > 1 for d in lhs_dilation):
+        shape = (*x.shape[:2], *((s - 1) * d + 1 for s, d in zip(x.shape[2:], lhs_dilation)))
+        dilated = np.zeros(shape, x.dtype)
+        dilated[(slice(None), slice(None), *(slice(None, None, d) for d in lhs_dilation))] = x
+        x = dilated
+    crop = tuple(slice(max(-lo, 0), s - max(-hi, 0)) for s, (lo, hi) in zip(x.shape[2:], padding))
+    x = x[(slice(None), slice(None), *crop)]
+    x = np.pad(x, [(0, 0), (0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding)])
+    kernel = w.shape[2:]
+    out = [(s - ((k - 1) * d + 1)) // st + 1 for s, k, d, st in zip(x.shape[2:], kernel, dilation, stride)]
+    N, C, O = x.shape[0], x.shape[1], w.shape[0]
+    cg, og = C // groups, O // groups
+    y = np.zeros((N, O, *out), x.dtype)
+    for offset in np.ndindex(*kernel):
+        window = tuple(slice(o * d, o * d + (size - 1) * st + 1, st) for o, d, size, st in zip(offset, dilation, out, stride))
+        patch = x[(slice(None), slice(None), *window)]
+        for g in range(groups):
+            tap = w[(slice(g * og, (g + 1) * og), slice(None), *offset)]
+            y[:, g * og : (g + 1) * og] += np.einsum("nc...,oc->no...", patch[:, g * cg : (g + 1) * cg], tap)
+    return y
+
+
+@_handler("conv")
+def _conv(run, op, args):
+    attrs = [op.attr(k) for k in ("stride", "padding", "dilation", "lhs_dilation", "groups")]
+    # As contract: accumulate in f64, round once (bf16 by check).
+    wide = conv_reference(*(a.astype(np.float64) for a in args), *attrs)
+    return [wide if op.inputs[0].type.dtype in (DType.bf16, DType.f64) else wide.astype(args[0].dtype)]
+
+
 @_handler("reshape")
 def _reshape(run, op, args):
     return [args[0].reshape(run.shape(op.attr("shape")))]

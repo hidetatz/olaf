@@ -207,6 +207,34 @@ def _infer_concat(inputs, attrs, regions):
     return [first.with_shape(size if i == axis else d for i, d in enumerate(first.shape))]
 
 
+def conv_output_size(size, kernel, stride, low, high, dilation, lhs_dilation):
+    """One spatial dimension of conv's output: the input dilated by lhs_dilation (zeros between
+    elements) and padded by low/high (negative crops), windows of the kernel dilated by
+    dilation, every stride-th window."""
+    dilated_in = (size - 1) * lhs_dilation + 1 + low + high
+    dilated_kernel = (kernel - 1) * dilation + 1
+    return (dilated_in - dilated_kernel) // stride + 1
+
+
+@_register("conv")
+def _infer_conv(inputs, attrs, regions):
+    # x [N, C, *spatial], w [O, C // groups, *kernel] (PyTorch's layout) -> [N, O, *out].
+    _arity(inputs, 2, "conv")
+    x, w = inputs
+    n = x.rank - 2
+    _check(n >= 1 and w.rank == x.rank, f"conv needs x [N, C, *spatial] and w [O, C/groups, *kernel]: {x}, {w}")
+    _check(x.dtype == w.dtype and x.dtype.is_float, f"conv dtypes: {x}, {w}")
+    stride, padding, dilation, lhs_dilation, groups = (attrs[k] for k in ("stride", "padding", "dilation", "lhs_dilation", "groups"))
+    _check(len(stride) == len(padding) == len(dilation) == len(lhs_dilation) == n, f"conv attributes need {n} spatial entries: {attrs}")
+    _check(all(isinstance(v, int) and v >= 1 for v in (*stride, *dilation, *lhs_dilation, groups)), f"conv strides, dilations and groups are positive ints: {attrs}")
+    spatial = (*x.shape[2:], *w.shape[2:])
+    _check(all(isinstance(d, int) for d in (*spatial, x.shape[1], w.shape[0], w.shape[1])), "conv needs static channel and spatial sizes")
+    _check(x.shape[1] == w.shape[1] * groups and w.shape[0] % groups == 0, f"conv channels do not match groups={groups}: {x}, {w}")
+    out = [conv_output_size(s, k, st, lo, hi, d, ld) for s, k, st, (lo, hi), d, ld in zip(x.shape[2:], w.shape[2:], stride, padding, dilation, lhs_dilation)]
+    _check(all(o >= 1 for o in out), f"conv output would be empty: {x}, {w}, {attrs}")
+    return [x.with_shape((x.shape[0], w.shape[0], *out))]
+
+
 @_register("pad")
 def _infer_pad(inputs, attrs, regions):
     _arity(inputs, 1, "pad")

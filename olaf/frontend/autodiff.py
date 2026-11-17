@@ -460,6 +460,58 @@ def _contract(b, op, c):
     return cots
 
 
+def _flip(b, v, axes):
+    """v reversed along `axes` (no core op reverses; a gather with descending indices does)."""
+    for a in axes:
+        size = v.type.shape[a]
+        index = b.op("sub", b.full((size,), size - 1, DType.i32), b.op("iota", shape=(size,), axis=0, dtype=DType.i32))
+        v = b.op("gather", v, index, axis=a, batch_dims=0)
+    return v
+
+
+def _swap01(b, v):
+    return b.op("permute", v, perm=(1, 0, *range(2, v.type.rank)))
+
+
+@_rule("conv")
+def _conv(b, op, c):
+    # The transposes of conv_general_dilated as in JAX (lax._conv_general_dilated_transpose_lhs
+    # and _rhs): both cotangents are convolutions again, with the roles of strides and
+    # dilations exchanged, so conv's VJP is closed under conv (docs/design.md).
+    x, w = op.inputs
+    stride, padding, dilation, lhs_dilation, g = (op.attr(k) for k in ("stride", "padding", "dilation", "lhs_dilation", "groups"))
+    n = x.type.rank - 2
+    spatial = tuple(range(2, 2 + n))
+    sizes = list(zip(x.type.shape[2:], w.type.shape[2:], c.type.shape[2:], stride, padding, dilation, lhs_dilation))
+    O, Cg = w.type.shape[0], w.type.shape[1]
+    Og, kernel = O // g, w.type.shape[2:]
+
+    # dx: c convolved with the flipped kernel, in and out channels swapped within each group.
+    lhs_pads = []
+    for size, k, out, st, (lo, hi), d, ld in sizes:
+        lhs, rhs, outd = (size - 1) * ld + 1, (k - 1) * d + 1, (out - 1) * st + 1
+        before = rhs - lo - 1
+        lhs_pads.append((before, lhs + rhs - 1 - outd - before))
+    wt = b.op("reshape", w, shape=(g, Og, Cg, *kernel))
+    wt = b.op("permute", wt, perm=(0, 2, 1, *range(3, 3 + n)))
+    wt = _flip(b, b.op("reshape", wt, shape=(g * Cg, Og, *kernel)), spatial)
+    dx = b.op("conv", c, wt, stride=tuple(lhs_dilation), padding=tuple(lhs_pads), dilation=tuple(dilation), lhs_dilation=tuple(stride), groups=g)
+
+    # dw: x and c with batch and channels swapped, convolved; per group.
+    rhs_pads = []
+    for size, k, out, st, (lo, hi), d, ld in sizes:
+        lhs, rhs, outd = (size - 1) * ld + 1, (k - 1) * d + 1, (out - 1) * st + 1
+        rhs_pads.append((lo, (outd - lhs) + (rhs - lo - 1)))
+    parts = []
+    for i in range(g):
+        xg = b.op("slice", x, starts=(0, i * Cg, *(0,) * n), stops=(x.type.shape[0], (i + 1) * Cg, *x.type.shape[2:])) if g > 1 else x
+        cg = b.op("slice", c, starts=(0, i * Og, *(0,) * n), stops=(c.type.shape[0], (i + 1) * Og, *c.type.shape[2:])) if g > 1 else c
+        dwt = b.op("conv", _swap01(b, xg), _swap01(b, cg), stride=tuple(dilation), padding=tuple(rhs_pads), dilation=tuple(stride), lhs_dilation=tuple(lhs_dilation), groups=1)
+        parts.append(_swap01(b, dwt))
+    dw = parts[0] if g == 1 else b.op("concat", *parts, axis=0)
+    return [dx, dw]
+
+
 @_rule("reshape")
 def _reshape(b, op, c):
     return [b.op("reshape", c, shape=op.inputs[0].type.shape)]

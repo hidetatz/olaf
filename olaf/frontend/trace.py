@@ -307,6 +307,38 @@ def einsum(spec: str, *inputs: Tensor) -> Tensor:
     return _emit("contract", *inputs, spec=spec)
 
 
+def _per_dim(value, n: int) -> tuple:
+    return tuple(value) if isinstance(value, (tuple, list)) else (value,) * n
+
+
+def conv(x: Tensor, w: Tensor, stride=1, padding=0, dilation=1, groups: int = 1) -> Tensor:
+    """torch.nn.functional.conv{1,2,3}d: x [N, C, *spatial], w [O, C/groups, *kernel].
+    padding: an int or one per spatial dim (symmetric), or one (low, high) pair per dim."""
+    n = x.rank - 2
+    pads = _per_dim(padding, n)
+    pads = tuple(p if isinstance(p, (tuple, list)) else (p, p) for p in pads)
+    return _emit("conv", x, w, stride=_per_dim(stride, n), padding=tuple(tuple(p) for p in pads), dilation=_per_dim(dilation, n), lhs_dilation=(1,) * n, groups=groups)
+
+
+def conv_transpose(x: Tensor, w: Tensor, stride=1, padding=0, output_padding=0, dilation=1, groups: int = 1) -> Tensor:
+    """torch.nn.functional.conv_transpose{1,2,3}d: x [N, C, *spatial], w [C, O/groups, *kernel].
+
+    The gradient of conv with respect to its input: a conv over the input dilated by the
+    stride, with the kernel flipped and its in and out channels swapped (within each group).
+    """
+    n = x.rank - 2
+    stride, padding, output_padding, dilation = (_per_dim(v, n) for v in (stride, padding, output_padding, dilation))
+    C, Og, kernel = w.shape[0], w.shape[1], w.shape[2:]
+    Cg = C // groups
+    wt = w.reshape(groups, Cg, Og, *kernel)
+    wt = permute(wt, (0, 2, 1, *range(3, 3 + n))).reshape(groups * Og, Cg, *kernel)
+    for a in range(2, 2 + n):
+        size = kernel[a - 2]
+        wt = take(wt, (size - 1) - iota((size,)), axis=a)
+    pads = tuple((d * (k - 1) - p, d * (k - 1) - p + op) for k, p, op, d in zip(kernel, padding, output_padding, dilation))
+    return _emit("conv", x, wt, stride=(1,) * n, padding=pads, dilation=dilation, lhs_dilation=stride, groups=groups)
+
+
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     if a.rank < 2 or b.rank != a.rank:
         raise TypeError(f"matmul needs tensors of equal rank >= 2: {a.type}, {b.type}")

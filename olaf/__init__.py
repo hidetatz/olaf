@@ -12,6 +12,8 @@ from olaf.frontend.trace import (
     concat,
     cond,
     constant,
+    conv,
+    conv_transpose,
     cos,
     cross_entropy,
     einsum,
