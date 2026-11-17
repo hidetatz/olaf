@@ -29,9 +29,10 @@ ELEMENTWISE_ELEMENTS = 1024
 # thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
 # chunk x 128 values (32 per thread).
 ROW_REDUCE_BLOCK = 1024
-# A split reduction aims at up to this many blocks per compute unit. More (16) was measured no
-# faster for GPT-2's bias gradients: those column sums are limited by per-element address and
-# mask arithmetic in the lowering, not by parallelism.
+# A split reduction aims at up to this many blocks per compute unit. GPT-2's widest bias
+# gradients (4096 x 2304 and x 3072 bf16 column sums) get 72-96 blocks at 28% occupancy and run
+# at 120-195 GB/s, yet 16 per unit was no faster in the replayed training step: their limit is
+# elsewhere.
 SPLIT_BLOCKS_PER_UNIT = 4
 COLUMN_REDUCE_BLOCK = 32
 DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions

@@ -134,7 +134,7 @@ def _build(program: Program, buffers, readers, p_index: int, info, needed: dict,
     width = 1 << max(shape[-1] - 1, 0).bit_length()
     tile = tuple([1] * (rank - 1) + [width])
     row_tile = tuple([1] * (rank - 1))
-    b = TileBuilder()
+    b = TileBuilder(cse=True)  # the replayed reductions and P load the same row tiles
     args: list[tuple[str, Arg]] = []
 
     def arg_index(name: str, arg: Arg) -> int:

@@ -120,15 +120,41 @@ def infer(kind: str, inputs: Sequence[TileType], attrs: dict, regions: Sequence[
     raise ValueError(f"unknown tile op: {kind}")
 
 
+_FOLD = {"add": lambda a, b: a + b, "sub": lambda a, b: a - b, "mul": lambda a, b: a * b}
+
+
 class TileBuilder:
-    def __init__(self) -> None:
+    def __init__(self, *, cse: bool = False) -> None:
+        """cse: reuse an earlier equal scalar op (folding index arithmetic on constants) and an
+        earlier equal load with no store emitted since. A pass that replays several tasks into
+        one body (row fusion) otherwise loads the same tile once per replayed task, and each
+        load goes to DRAM when the data does not stay in L2. Tile-shaped ops other than loads
+        are not merged: two loop carries starting from one shared value would have to agree on
+        a register layout in lowering."""
         self.ops: list[TOp] = []
+        self.cse = cse
+        self._seen: dict[tuple, tuple[TValue, ...]] = {}
+        self._constants: dict[TValue, int] = {}
 
     def emit(self, kind: str, inputs: Sequence[TValue] = (), attrs: dict | None = None, regions: Sequence[Body] = ()) -> tuple[TValue, ...]:
         attrs = dict(attrs or {})
         types = infer(kind, [v.type for v in inputs], attrs, regions)
+        key = None
+        if self.cse and not regions:
+            if kind in ("store", "atomic_add", "atomic_add_indexed"):
+                self._seen = {k: v for k, v in self._seen.items() if k[0] not in ("load", "load_indexed")}
+            elif kind in ("load", "load_indexed") or (len(types) == 1 and types[0].shape == ()):
+                if kind in _FOLD and types[0] == TileType((), INDEX) and all(v in self._constants for v in inputs):
+                    return (self.index(_FOLD[kind](*(self._constants[v] for v in inputs))),)
+                key = (kind, tuple(inputs), make_attrs(attrs))
+                if key in self._seen:
+                    return self._seen[key]
         outputs = tuple(TValue(t) for t in types)
         self.ops.append(TOp(kind, tuple(inputs), outputs, make_attrs(attrs), tuple(regions)))
+        if key is not None:
+            self._seen[key] = outputs
+            if kind == "full" and types[0] == TileType((), INDEX) and isinstance(attrs["value"], int):
+                self._constants[outputs[0]] = attrs["value"]
         return outputs
 
     def op(self, kind: str, *inputs: TValue, **attrs) -> TValue:
