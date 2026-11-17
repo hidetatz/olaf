@@ -462,6 +462,11 @@ def _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only
         consumer_out = consumer.buffers[info.store.attr("arg")]
         if info.cost > CHEAP_OPS or len(readers.get(consumer_out, [])) < 2:
             return None
+        if _widening_cast(info):
+            # Each reader widens the b16 value exactly for free; absorbed, the dot would store
+            # the f32 copy instead, twice the bytes (Llama's SwiGLU gate, read by the forward
+            # and the backward of silu: 23 MB of f32 per layer at 1024 x 5632).
+            return None
     reads = [a for a, (n, arg) in enumerate(zip(consumer.buffers, consumer.task.args)) if n == out]
     if len(reads) != 1 or launch.task.args[store.attr("arg")].view != full_view(buffer.type.shape):
         return None
