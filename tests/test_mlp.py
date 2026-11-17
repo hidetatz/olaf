@@ -7,7 +7,7 @@ import torch
 import olaf
 from olaf import nn
 
-from model_gate import MULTIPLIER, Case, curve, load, one_step, relative
+from model_gate import MULTIPLIER, Case, curve, load, one_step_median, relative
 
 BATCH, STEPS = 64, 200
 
@@ -84,6 +84,5 @@ def test_training_gates(compute, optimizer):
     ratio, details = curve(lambda seed: case(compute, seed + 1), ours, theirs, lambda seed: data(STEPS, seed))
     assert all(d["last"] < 0.7 * d["first"] for d in details), details  # it learns
     assert ratio <= MULTIPLIER, (ratio, details)
-    c = case(compute)
-    worst, ratios = one_step(c, c.params, data(1, seed=7)[0])
+    worst, ratios = one_step_median(lambda seed: case(compute, seed + 1), lambda seed: data(1, seed=seed + 7)[0])
     assert worst <= MULTIPLIER, ratios

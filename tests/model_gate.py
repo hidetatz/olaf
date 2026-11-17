@@ -27,6 +27,11 @@ import olaf
 from olaf.pipeline import lower_graph
 
 MULTIPLIER = 2.0
+# PyTorch's precision run is the f32 it claims to be: cuDNN would run f32 convolutions in TF32
+# (10-bit mantissas) by default, which made its error 30x olaf's on a small CNN and the gate
+# meaninglessly lenient.
+torch.backends.cudnn.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
 # PyTorch's error is compared with at least this: a few f32 ulps (2^-23 each), where errors
 # reflect only the order of additions. There a tiny model's PyTorch error (6e-8 on the MLP's
 # loss curve) is as much luck as olaf's (1.3e-7), and a ratio of the two says nothing. f32 for
@@ -104,6 +109,15 @@ def one_step(case: Case, params, inputs) -> tuple[float, dict]:
     for name, g in truth.items():
         ratios[name] = relative(ours[name], g) / max(relative(theirs[name], g), FLOOR)
     return max(ratios.values()), ratios
+
+
+def one_step_median(make_case, make_inputs, seeds=range(5)) -> tuple[float, dict]:
+    """one_step over several seeds; per tensor (and the loss) the median ratio, then the worst.
+    One seed is luck for a scalar like the loss: a bf16 run's loss error can land near zero
+    (on a small CNN PyTorch's was 48x smaller than olaf's once, and about equal on other seeds)."""
+    runs = [one_step(make_case(seed), make_case(seed).params, make_inputs(seed))[1] for seed in seeds]
+    medians = {name: float(np.median([r[name] for r in runs])) for name in runs[0]}
+    return max(medians.values()), medians
 
 
 def olaf_curve(case: Case, make_optimizer, batches, compiled=None) -> list[float]:

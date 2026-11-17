@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from olaf.frontend.trace import Tensor, broadcast_to, cast, concat, constant, cos, einsum, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
+from olaf.frontend.trace import Tensor, broadcast_to, cast, concat, constant, conv, cos, einsum, pad, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
 from olaf.graph.types import DType
 
 _LETTERS = "abcdefghijklmn"
@@ -178,8 +178,102 @@ def rotate(x: Tensor, cos_t: Tensor, sin_t: Tensor) -> Tensor:
     return x * broadcast_to(_to(cos_t, x.dtype), x.shape) + rotated * broadcast_to(_to(sin_t, x.dtype), x.shape)
 
 
+@dataclass(frozen=True)
+class Conv(Module):
+    """torch.nn.Conv{1,2,3}d: weight [out, in/groups, *kernel] (the number of spatial dims is
+    len(kernel)), optional bias. compute: as Linear (autocast runs convolutions in bf16)."""
+
+    in_channels: int
+    out_channels: int
+    kernel: tuple[int, ...]
+    stride: int | tuple = 1
+    padding: int | tuple = 0
+    dilation: int | tuple = 1
+    groups: int = 1
+    bias: bool = True
+    compute: DType | None = None
+
+    def init(self, rng: np.random.Generator) -> dict:
+        # torch's reset_parameters: kaiming_uniform_(a=sqrt(5)) is U(-1/sqrt(fan_in), +), and
+        # the bias uses the same bound.
+        fan_in = self.in_channels // self.groups * int(np.prod(self.kernel))
+        bound = 1.0 / math.sqrt(fan_in)
+        params = {"weight": rng.uniform(-bound, bound, (self.out_channels, self.in_channels // self.groups, *self.kernel)).astype(np.float32)}
+        if self.bias:
+            params["bias"] = rng.uniform(-bound, bound, (self.out_channels,)).astype(np.float32)
+        return params
+
+    def __call__(self, params, x: Tensor) -> Tensor:
+        y = conv(_to(x, self.compute), _to(params["weight"], self.compute), self.stride, self.padding, self.dilation, self.groups)
+        if self.bias:
+            b = _to(params["bias"], self.compute)
+            y = y + broadcast_to(b.reshape(self.out_channels, *(1,) * len(self.kernel)), y.shape)
+        return y
+
+
+def _strided(x: Tensor, axis: int, start: int, count: int, step: int) -> Tensor:
+    """x[..., start : start + count * step : step, ...] along `axis` (no strided slice op: a
+    slice, a reshape splitting off the step, and a slice of its first column). x must reach
+    start + count * step along the axis."""
+    index = [slice(None)] * x.rank
+    index[axis] = slice(start, start + count * step)
+    piece = x[tuple(index)]
+    if step == 1:
+        return piece
+    shape = list(piece.shape)
+    split = shape[:axis] + [count, step] + shape[axis + 1 :]
+    first = [slice(None)] * (x.rank + 1)
+    first[axis + 1] = slice(0, 1)
+    return piece.reshape(*split)[tuple(first)].reshape(*shape[:axis], count, *shape[axis + 1 :])
+
+
+def _windows(x: Tensor, kernel, stride, padding, fill: float):
+    """The kernel's shifted, strided views of x (padded with `fill`), one per kernel offset."""
+    n = len(kernel)
+    stride = tuple(kernel) if stride is None else (stride,) * n if isinstance(stride, int) else tuple(stride)
+    padding = (padding,) * n if isinstance(padding, int) else tuple(padding)
+    sizes = x.shape[2:]
+    out = [(s + 2 * p - k) // st + 1 for s, p, k, st in zip(sizes, padding, kernel, stride)]
+    # Pad so every shifted window reaches start + out * stride (the strided slice needs it).
+    high = [max(p, (k - 1) + o * st - s - p) for s, p, k, st, o in zip(sizes, padding, kernel, stride, out)]
+    if any(padding) or any(high):
+        x = pad(x, (0, 0, *padding), (0, 0, *high), value=fill)
+    views = []
+    for offset in np.ndindex(*kernel):
+        v = x
+        for d, (o, size, st) in enumerate(zip(offset, out, stride)):
+            v = _strided(v, 2 + d, int(o), size, st)
+        views.append(v)
+    return views
+
+
+def max_pool(x: Tensor, kernel, stride=None, padding=0) -> Tensor:
+    """torch.nn.functional.max_pool{1,2,3}d (padding counts as -inf). Exact in any dtype.
+    Where several entries tie for the max the gradient goes to one of them; after a ReLU the
+    ties are zeros, whose gradient the ReLU stops anyway."""
+    views = _windows(x, tuple(kernel), stride, padding, -math.inf)
+    y = views[0]
+    for v in views[1:]:
+        y = maximum(y, v)
+    return y
+
+
+def avg_pool(x: Tensor, kernel, stride=None, padding=0) -> Tensor:
+    """torch.nn.functional.avg_pool{1,2,3}d with count_include_pad=True. Summed in f32 and
+    rounded once for bf16, as PyTorch does."""
+    views = _windows(_to(x, DType.f32) if x.dtype is DType.bf16 else x, tuple(kernel), stride, padding, 0.0)
+    total = views[0]
+    for v in views[1:]:
+        total = total + v
+    return _to(total * (1.0 / float(np.prod(kernel))), x.dtype)
+
+
+def flatten(x: Tensor, start: int = 1) -> Tensor:
+    return x.reshape(*x.shape[:start], int(np.prod(x.shape[start:])))
+
+
 def relu(x: Tensor) -> Tensor:
     return maximum(x, 0.0)
 
 
-__all__ = ["Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "relu", "rotary_tables", "rotate"]
+__all__ = ["Conv", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]

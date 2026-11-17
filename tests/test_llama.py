@@ -8,7 +8,7 @@ from transformers import LlamaConfig, LlamaForCausalLM
 import olaf
 from olaf.examples import llama
 
-from model_gate import MULTIPLIER, Case, curve, load, one_step, relative
+from model_gate import MULTIPLIER, Case, curve, load, one_step_median, relative
 
 BATCH, SEQ, STEPS = 4, 32, 200
 HF = dict(vocab_size=64, hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=SEQ, rms_norm_eps=1e-6, tie_word_embeddings=False)
@@ -97,8 +97,7 @@ def test_training_gates(compute):
     ratio, details = curve(lambda seed: case(compute, seed + 1), ours, theirs, lambda seed: data(STEPS, seed))
     assert all(d["last"] < 0.5 * d["first"] for d in details), details  # it learns
     assert ratio <= MULTIPLIER, (ratio, details)
-    c = case(compute)
-    worst, ratios = one_step(c, c.params, data(1, seed=7)[0])
+    worst, ratios = one_step_median(lambda seed: case(compute, seed + 1), lambda seed: data(1, seed=seed + 7)[0])
     assert worst <= MULTIPLIER, ratios
 
 
