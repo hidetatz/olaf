@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from olaf.frontend.trace import Tensor, cast, einsum, maximum
+from olaf.frontend.trace import Tensor, cast, einsum, layernorm, maximum, repeat, take, tree_flatten, tree_map, tree_unflatten
 from olaf.graph.types import DType
 
 _LETTERS = "abcdefghijklmn"
@@ -86,8 +86,61 @@ class Sequential(Module):
         return x
 
 
+@dataclass(frozen=True)
+class Embedding(Module):
+    """Rows of a [num, dim] table (torch.nn.Embedding; initialized N(0, std))."""
+
+    num: int
+    dim: int
+    std: float = 1.0
+
+    def init(self, rng: np.random.Generator) -> dict:
+        return {"weight": (rng.standard_normal((self.num, self.dim)) * self.std).astype(np.float32)}
+
+    def __call__(self, params, ids: Tensor) -> Tensor:
+        return take(params["weight"], ids)
+
+
+@dataclass(frozen=True)
+class LayerNorm(Module):
+    """Over the last axis, with weight and bias (torch.nn.LayerNorm). Computed in f32 inside
+    for b16 inputs, like every composite (docs/design.md, "数値一致の判定")."""
+
+    dim: int
+    eps: float = 1e-5
+
+    def init(self, rng: np.random.Generator) -> dict:
+        return {"weight": np.ones(self.dim, np.float32), "bias": np.zeros(self.dim, np.float32)}
+
+    def __call__(self, params, x: Tensor) -> Tensor:
+        return layernorm(x, params["weight"], params["bias"], eps=self.eps)
+
+
+@dataclass(frozen=True)
+class Repeat(Module):
+    """`block` applied n times, each with its own parameters, stacked on a leading axis of
+    every leaf. Traced as one scan (frontend/trace.repeat), so the step graph holds one copy of
+    the block and the backward differentiates through the scan; unrolled=True traces n copies
+    (for comparisons)."""
+
+    block: Module
+    n: int
+
+    def init(self, rng: np.random.Generator) -> dict:
+        layers = [tree_flatten(self.block.init(rng)) for _ in range(self.n)]
+        structure = layers[0][1]
+        return tree_unflatten(structure, [np.stack(leaves) for leaves in zip(*(flat for flat, _ in layers))])
+
+    def __call__(self, params, x: Tensor, *args, unrolled: bool = False) -> Tensor:
+        if unrolled:
+            for i in range(self.n):
+                x = self.block(tree_map(lambda leaf: leaf[i], params), x, *args)
+            return x
+        return repeat(lambda h, p: self.block(p, h, *args), self.n, x, params)
+
+
 def relu(x: Tensor) -> Tensor:
     return maximum(x, 0.0)
 
 
-__all__ = ["Linear", "Module", "Sequential", "relu"]
+__all__ = ["Embedding", "LayerNorm", "Linear", "Module", "Repeat", "Sequential", "relu"]

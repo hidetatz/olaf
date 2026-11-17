@@ -12,6 +12,7 @@ from transformers import AutoTokenizer, GPT2Config, GPT2LMHeadModel
 import olaf
 from olaf.graph.builder import verify
 from olaf.passes.canonicalize import canonicalize
+from olaf.models import gpt2
 from olaf.passes.decompose import decompose
 
 TOLERANCE = 1e-5
@@ -21,73 +22,35 @@ def relative_error(a, b):
     return float(np.linalg.norm(np.ravel(a) - np.ravel(b)) / np.linalg.norm(np.ravel(b)))
 
 
-def gelu_kind(config):
-    return {"gelu_new": "tanh", "gelu": "none"}[config.activation_function]
 
 
 def split_params(model):
-    """Turn an HF state_dict into a pytree with per-layer weights stacked on the first dimension.
-
-    Stacking lets us differentiate through scan without unrolling the blocks.
-    """
-    state = {k: v.detach().numpy() for k, v in model.state_dict().items() if not k.endswith(".attn.bias") and not k.endswith(".attn.masked_bias")}
-    n = model.config.n_layer
-    params = {k.removeprefix("transformer."): v for k, v in state.items() if ".h." not in k and k != "lm_head.weight"}
-    names = sorted({k.split(".", 3)[3] for k in state if ".h." in k})
-    params["h"] = {name: np.stack([state[f"transformer.h.{i}.{name}"] for i in range(n)]) for name in names}
-    return params
+    """Hugging Face's state_dict as olaf's GPT-2 parameters (blocks stacked on the first axis,
+    so the step differentiates through one scan instead of n copies)."""
+    return gpt2.from_huggingface(model)
 
 
 def param_specs(params, dtype=olaf.f32):
     return olaf.tree_map(lambda a: olaf.TensorType(a.shape, dtype), params)
 
 
-def _to(x, dtype):
-    return x if dtype is None or x.dtype is dtype else olaf.cast(x, dtype)
-
-
-def linear(x, w, b, compute=None):
-    """HF Conv1D (x @ w + b). With compute=bf16, as under torch.autocast: all three in bf16."""
-    return olaf.einsum("bsd,de->bse", _to(x, compute), _to(w, compute)) + _to(b, compute)
-
-
-def residual(x, y):
-    # f32 + bf16 promotes to f32 in PyTorch, so the residual stream stays in the parameters' dtype.
-    return x + _to(y, x.dtype)
-
-
-def block(x, p, mask, n_head, activation, compute=None):
-    B, S, D = x.shape
-    a = olaf.layernorm(x, p["ln_1.weight"], p["ln_1.bias"], eps=1e-5)
-    qkv = linear(a, p["attn.c_attn.weight"], p["attn.c_attn.bias"], compute)
-
-    def heads(t):
-        return olaf.transpose(t.reshape(B, S, n_head, D // n_head), 1, 2)
-
-    qq, k, v = (heads(qkv[..., i * D : (i + 1) * D]) for i in range(3))
-    attended = olaf.attention(qq, k, v, olaf.broadcast_to(mask, (B, n_head, S, S)))
-    merged = olaf.transpose(attended, 1, 2).reshape(B, S, D)
-    x = residual(x, linear(merged, p["attn.c_proj.weight"], p["attn.c_proj.bias"], compute))
-
-    m = olaf.layernorm(x, p["ln_2.weight"], p["ln_2.bias"], eps=1e-5)
-    hidden = olaf.gelu(linear(m, p["mlp.c_fc.weight"], p["mlp.c_fc.bias"], compute), activation)
-    return residual(x, linear(hidden, p["mlp.c_proj.weight"], p["mlp.c_proj.bias"], compute))
-
-
 def forward(params, ids, config, *, folded=True, compute=None):
     """Logits. compute=bf16 mirrors torch.autocast(bfloat16): bf16 linears and logits, f32 elsewhere."""
-    B, S = ids.shape
-    x = olaf.take(params["wte.weight"], ids) + olaf.take(params["wpe.weight"], olaf.iota((S,)))
-    mask = olaf.iota((S, S), axis=0) >= olaf.iota((S, S), axis=1)
-    activation = gelu_kind(config)
-    step_block = lambda h, p: block(h, p, mask, config.n_head, activation, compute)  # noqa: E731
-    if folded:
-        x = olaf.repeat(step_block, config.n_layer, x, params["h"])
-    else:
-        for i in range(config.n_layer):
-            x = step_block(x, {k: v[i] for k, v in params["h"].items()})
-    x = olaf.layernorm(x, params["ln_f.weight"], params["ln_f.bias"], eps=1e-5)
-    return olaf.einsum("bsd,vd->bsv", _to(x, compute), _to(params["wte.weight"], compute))
+    return gpt2.GPT2(gpt2.Config.from_huggingface(config), compute)(params, ids, unrolled=not folded)
+
+
+def flat_grads(grads, n_layer):
+    """{torch parameter name: gradient}, the stacked block gradients split per layer."""
+    from olaf.frontend.optim import _paths
+
+    out = {}
+    for path, value in zip(_paths(grads), olaf.tree_flatten(grads)[0]):
+        if path.startswith("h."):
+            for layer in range(n_layer):
+                out[f"h.{layer}.{path[2:]}"] = value[layer]
+        else:
+            out[path] = value
+    return out
 
 
 def trace_step(params, config, *, folded=True, dtype=olaf.f32):
@@ -109,23 +72,15 @@ def torch_step(model, ids):
     return out
 
 
-def torch_grad(model, params_key, layer=None):
-    named = dict(model.named_parameters())
-    name = f"transformer.{params_key}" if layer is None else f"transformer.h.{layer}.{params_key}"
-    return named[name].grad.numpy()
 
 
 def assert_matches(model, params, ids, result):
     (loss, logits), grads = result
     out = torch_step(model, ids)
     errors = {"loss": relative_error(loss, out.loss.item()), "logits": relative_error(logits, out.logits.detach().numpy())}
-    for key, value in grads.items():
-        if key == "h":
-            for name, stacked in value.items():
-                for layer in range(model.config.n_layer):
-                    errors[f"h.{layer}.{name}"] = relative_error(stacked[layer], torch_grad(model, name, layer))
-        else:
-            errors[key] = relative_error(value, torch_grad(model, key))
+    named = dict(model.named_parameters())
+    for name, value in flat_grads(grads, model.config.n_layer).items():
+        errors[name] = relative_error(value, named[f"transformer.{name}"].grad.numpy())
     worst = max(errors, key=errors.get)
     assert errors[worst] < TOLERANCE, f"{worst}: {errors[worst]:.3e}"
     return errors
@@ -244,13 +199,8 @@ def errors_against(model, reference, result):
     (loss, logits), grads = result
     ref_loss, ref_logits, ref_grads = reference
     errors = {"loss": relative_error(loss, ref_loss), "logits": relative_error(logits, ref_logits)}
-    for key, value in grads.items():
-        if key == "h":
-            for name, stacked in value.items():
-                for layer in range(model.config.n_layer):
-                    errors[f"h.{layer}.{name}"] = relative_error(stacked[layer], ref_grads[f"transformer.h.{layer}.{name}"])
-        else:
-            errors[key] = relative_error(value, ref_grads[f"transformer.{key}"])
+    for name, value in flat_grads(grads, model.config.n_layer).items():
+        errors[name] = relative_error(value, ref_grads[f"transformer.{name}"])
     return errors
 
 
