@@ -332,3 +332,20 @@ def test_offsets_past_i32_are_rejected():
         check_index_range(big, {})
     small = to_program(lower(olaf.trace(lambda x: x * 2.0, tt(2**15, 2**16 - 1)).graph), AMPERE_RTX3060)
     check_index_range(small, {})  # 2^31 - 2^15 elements: the last offset still fits
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("width", [2048, 4096, 8192])
+@pytest.mark.parametrize("norm", ["layernorm", "rmsnorm"])
+def test_long_rows_fuse_and_match(width, norm):
+    # Rows past 1024 (Llama's hidden sizes) fuse into one task over more warps.
+    from olaf import nn
+
+    def fn(x, w):
+        if norm == "layernorm":
+            return olaf.layernorm(x, w, w * 0.5)
+        return nn.RMSNorm(width)({"weight": w}, x)
+
+    arrays = [R.normal(size=(3, 5, width)).astype(np.float32), R.normal(size=(width,)).astype(np.float32)]
+    program = run_both(lambda x, w: olaf.grad(lambda x: olaf.sum(olaf.tanh(fn(x, w))))(x), arrays, fused=True)
+    assert any(launch.task.name == "rows" and launch.task.warps > 4 for launch in program.launches)

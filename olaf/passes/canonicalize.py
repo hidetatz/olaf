@@ -44,6 +44,33 @@ def _broadcast_identity(op, defs):
         return op.inputs[0]
 
 
+def _broadcast_of_unit_reshape(op, defs):
+    """broadcast(reshape(x)), the reshape only inserting size-1 axes, is broadcast(x).
+
+    A row statistic written keepdim-style (mean(...).reshape(..., 1) * x, as RMSNorm usually is)
+    otherwise reaches Tile IR through a reshape, whose view has no source map, and row fusion
+    cannot see that it is broadcast along the row.
+    """
+    inner = defs.get(op.inputs[0]) if op.inputs else None
+    if op.kind != "broadcast" or inner is None or inner.kind != "reshape":
+        return None
+    a, b = inner.inputs[0].type.shape, inner.outputs[0].type.shape
+    mapping, j = [], 0
+    for size in a:
+        while j < len(b) and b[j] != size:
+            if b[j] != 1:
+                return None
+            j += 1
+        if j == len(b):
+            return None
+        mapping.append(j)
+        j += 1
+    if any(b[k] != 1 for k in range(j, len(b))):
+        return None
+    dims = tuple(op.attr("dims")[k] for k in mapping)
+    return Op("broadcast", inner.inputs, op.outputs, make_attrs({"shape": op.attr("shape"), "dims": dims}))
+
+
 def _slice_identity(op, defs):
     if op.kind == "slice":
         x = op.inputs[0]
@@ -131,6 +158,7 @@ RULES: tuple[Rule, ...] = (
     _permute_identity,
     _permute_of_permute,
     _broadcast_identity,
+    _broadcast_of_unit_reshape,
     _slice_identity,
     _slice_of_concat,
     _pad_identity,

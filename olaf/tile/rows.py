@@ -23,7 +23,13 @@ from olaf.tile.builder import INDEX, TileBuilder
 from olaf.tile.fuse import _pointwise
 from olaf.tile.ir import Arg, Body, BufferKind, Launch, Program, Task, TileType, TOp, TValue, View, full_view
 
-ROW_LIMIT = 1024
+# Rows up to this long fuse (Llama's hidden sizes go to 8192). A row tile is spread over
+# `_warps(width)` warps so each thread holds at most 8 elements of each row value.
+ROW_LIMIT = 8192
+
+
+def _warps(width: int) -> int:
+    return max(4, min(32, width // 256))
 
 
 def fuse_rows(program: Program) -> Program:
@@ -60,7 +66,10 @@ def _fuse_one(program: Program) -> Program | None:
 
 def _row_view(view: View, rank: int) -> bool:
     """A rank-1 statistic read broadcast along the last axis of a rank-`rank` tile."""
-    return view.pad is None and view.source is not None and list(view.source) == [(j, 0) for j in range(rank - 1)]
+    if view.pad is None and view.source is not None and len(view.source) == rank - 1:
+        # A size-1 axis may map to no view axis: its coordinate is 0 either way.
+        return all(entry == (j, 0) or (entry == (None, 0) and view.shape[j] == 1) for j, entry in enumerate(view.source))
+    return False
 
 
 def _reduction(program: Program, index: int, shape) -> dict | None:
@@ -222,7 +231,7 @@ def _build(program: Program, buffers, readers, p_index: int, info, needed: dict,
             b.emit("store", (rows[name], *pids), {"arg": arg_index(name, Arg(full_view(buffer.type.shape), buffer.type.dtype, True))})
     grid = tuple(shape[:-1])
     body = b.finish(pids)
-    new = Launch(Task("rows", grid, tuple(a for _, a in args), body, 4, ("rows",)), tuple(n for n, _ in args))
+    new = Launch(Task("rows", grid, tuple(a for _, a in args), body, _warps(width), ("rows",)), tuple(n for n, _ in args))
     launches = []
     for i, launch in enumerate(program.launches):
         if i == p_index:

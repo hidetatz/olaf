@@ -29,6 +29,9 @@ ELEMENTWISE_ELEMENTS = 1024
 # thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
 # chunk x 128 values (32 per thread).
 ROW_REDUCE_BLOCK = 1024
+# Rows up to this long are reduced in one loop step (with more warps, at most 8 elements per
+# thread), as tile/rows.py fuses rows up to tile.rows.ROW_LIMIT only when one step covers them.
+WHOLE_ROW_LIMIT = 8192
 # A split reduction aims at up to this many blocks per compute unit, and a column reduction
 # reads this many rows per loop step. Measured on the RTX 3060 by graph replay, column sums of
 # 4096 x {768, 2304, 3072} bf16 and 4096 x 768 f32: 4 blocks and 32 rows gave 224 / 149 / 190
@@ -102,6 +105,31 @@ def _neutral(fn: str, dtype: DType) -> float | int:
     if dtype.is_float:
         return float("-inf")
     return int(np.iinfo(dtype.numpy).min)
+
+
+def _unit_reshape(view: View, shape) -> View | None:
+    """`view` reshaped by only inserting or removing size-1 axes, keeping its source map.
+
+    A general reshape view has no source map (axes mix), which hides it from fusion; this kind
+    maps axis to axis. RMSNorm written keepdim-style computes its statistic as [batch, seq, 1]
+    and broadcasts it along the row: row fusion needs to see that it is a row statistic."""
+    old = [i for i, d in enumerate(view.shape) if d != 1]
+    new = [j for j, d in enumerate(shape) if d != 1]
+    if len(old) != len(new) or any(view.shape[i] != shape[j] for i, j in zip(old, new)):
+        return None
+    if view.pad is not None and any(view.pad[i] != (0, 0) for i in range(len(view.shape)) if i not in old):
+        return None
+    to_new = dict(zip(old, new))
+    strides = [0] * len(shape)
+    pad = [(0, 0)] * len(shape) if view.pad is not None else None
+    for i, j in to_new.items():
+        strides[j] = view.strides[i]
+        if pad is not None:
+            pad[j] = view.pad[i]
+    source = None
+    if view.source is not None:
+        source = tuple((None, start) if axis is None or axis not in to_new else (to_new[axis], start) for axis, start in view.source)
+    return View(tuple(shape), tuple(strides), view.offset, tuple(pad) if pad is not None else None, view.fill, source)
 
 
 def _reshaped_strides(view: View, shape) -> tuple[int, ...] | None:
@@ -312,6 +340,9 @@ class _Converter:
         shape = op.attr("shape")
         if shape == ref.shape:
             return ref
+        unit = _unit_reshape(ref.view, tuple(shape))
+        if unit is not None:
+            return replace(ref, view=unit)
         if not ref.view.is_contiguous:
             strides = _reshaped_strides(ref.view, shape)
             if strides is not None:
@@ -411,7 +442,15 @@ class _Converter:
         extent = {a: 1 for a in range(rank)}
         if inner_kept is not None:
             extent[inner_kept] = _block(shape[inner_kept], ELEMENTWISE_BLOCK)
-        extent[inner_reduced] = _block(shape[inner_reduced], COLUMN_REDUCE_BLOCK if inner_kept is not None else ROW_REDUCE_BLOCK)
+        warps = 4
+        if inner_kept is not None:
+            extent[inner_reduced] = _block(shape[inner_reduced], COLUMN_REDUCE_BLOCK)
+        elif axes == (rank - 1,) and isinstance(shape[-1], int) and ROW_REDUCE_BLOCK < shape[-1] <= WHOLE_ROW_LIMIT:
+            # The whole row in one step, so row fusion (tile/rows.py) can replay it.
+            extent[inner_reduced] = _block(shape[-1], WHOLE_ROW_LIMIT)
+            warps = max(4, min(32, extent[inner_reduced] // 256))
+        else:
+            extent[inner_reduced] = _block(shape[inner_reduced], ROW_REDUCE_BLOCK)
         out_tile = tuple(extent[a] for a in kept)
         tile_shape = tuple(extent[a] for a in range(rank))
         grid = tuple(_ceil_div(shape[a], extent[a]) for a in kept)
@@ -447,7 +486,7 @@ class _Converter:
         if acc_dtype is not out_type.dtype:
             result = b.op("cast", result, dtype=out_type.dtype)
         b.emit("store", (result, *out_starts), {"arg": 1})
-        self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids), origin=("reduce", fn, tuple(axes)))
+        self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids), warps, origin=("reduce", fn, tuple(axes)))
         return out
 
     def _op_contract(self, op: Op, inputs: list[Ref]) -> Ref:
