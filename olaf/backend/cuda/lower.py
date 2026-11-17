@@ -495,14 +495,19 @@ class _Emitter:
 
     # -- global memory ----------------------------------------------------------------------------
 
-    def view_address(self, view: View, coords: list[str]) -> tuple[str, str | None, str | None]:
-        """Element offset, in-bounds condition and in-padding condition for logical coordinates."""
+    def view_address(self, view: View, coords: list[str], addressing: list | None = None) -> tuple[str, str | None, str | None]:
+        """Element offset, in-bounds condition and in-padding condition for logical coordinates.
+
+        addressing: if given, receives the bounds checks of the axes the address depends on
+        (a nonzero stride or padding); see masked_load."""
         inside: str | None = None
         padded: str | None = None
         offset = self.dim(view.offset)
         for axis, c in enumerate(coords):
             ok = self.emit(f"llvm.icmp \"ult\" {c}, {self.dim(view.shape[axis])} : i32")
             inside = self.conj(inside, ok)
+            if addressing is not None and (view.strides[axis] != 0 or (view.pad is not None and view.pad[axis] != (0, 0))):
+                addressing.append(ok)
             stored = c
             if view.pad is not None:
                 lo, hi = view.pad[axis]
@@ -523,14 +528,23 @@ class _Emitter:
         return self.emit(f"llvm.getelementptr %arg{arg}[{offset}] : (!llvm.ptr<1>, i32) -> !llvm.ptr<1>, {_MEMORY_TYPE[dtype]}")
 
     def masked_load(self, arg: int, view: View, coords: list[str], dtype: DType, other, fill, slot_valid: str | None) -> str:
-        offset, inside, padded = self.view_address(view, coords)
+        addressing: list[str] = []
+        offset, inside, padded = self.view_address(view, coords, addressing)
         ok = inside
         if padded is not None:
             ok = self.conj(ok, self.emit(f"llvm.xor {padded}, {self.const(True, 'i1')} : i1"))
         ok = self.conj(ok, slot_valid) or self.const(True, "i1")
         # Masked lanes read element 0 instead (buffers are never empty), then select `other`:
-        # branch-free, and the hardware cannot fault on a masked address.
-        safe = self.emit(f"llvm.select {ok}, {offset}, {self.i32(0)} : i1, i32")
+        # branch-free, and the hardware cannot fault on a masked address. Only the axes the
+        # address depends on decide whether it is safe: a row statistic broadcast along a tile's
+        # row then has the same address in every slot of the row, and LLVM loads it once (the
+        # bounds of the broadcast axis still select `other` below).
+        safe_ok = None
+        for c in addressing:
+            safe_ok = self.conj(safe_ok, c)
+        if padded is not None:
+            safe_ok = self.conj(safe_ok, self.emit(f"llvm.xor {padded}, {self.const(True, 'i1')} : i1"))
+        safe = offset if safe_ok is None else self.emit(f"llvm.select {safe_ok}, {offset}, {self.i32(0)} : i1, i32")
         value = self.emit(f"llvm.load {self.global_ptr(arg, safe, dtype)} : !llvm.ptr<1> -> {_MEMORY_TYPE[dtype]}")
         if dtype is DType.bool:
             value = self.emit(f"llvm.icmp \"ne\" {value}, {self.const(0, 'i8')} : i8")

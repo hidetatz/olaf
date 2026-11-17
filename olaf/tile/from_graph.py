@@ -73,6 +73,10 @@ def _elementwise_tile(shape) -> tuple[int, ...]:
     """
     if not shape:
         return ()
+    if isinstance(shape[-1], int) and shape[-1] >= ELEMENTWISE_ELEMENTS:
+        # A long row (the 50257-wide logits) is tiled along itself, so the elements a thread
+        # owns share their row: a broadcast row statistic is one load for all of them.
+        return tuple(1 for _ in shape[:-1]) + (ELEMENTWISE_ELEMENTS,)
     last = _block(shape[-1], ELEMENTWISE_BLOCK)
     rows = 1
     if len(shape) >= 2:
