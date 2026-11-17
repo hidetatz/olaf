@@ -218,13 +218,21 @@ def _build(program: Program, buffers, readers, p_index: int, info, needed: dict,
     target = p_launch.buffers[info.store.attr("arg")]
     b.emit("store", (mapped[info.store.inputs[0]], *starts), {"arg": arg_index(target, task.args[info.store.attr("arg")])})
 
-    # Statistics read elsewhere are stored too; their reductions go unless read before P.
-    merged = {parts["index"] for parts in needed.values()} | {p_index}
+    # Statistics read elsewhere are stored too; their reductions go unless read before P. A kept
+    # reduction is a reader before P of the statistics it reads, so keeping one can keep others
+    # (top-k: the reduction finding the max's position is read before P, and it reads the max).
+    kept: set[int] = set()
+    while True:
+        gone = {parts["index"] for parts in needed.values() if parts["index"] not in kept} | {p_index}
+        more = {parts["index"] for name, parts in needed.items() if parts["index"] not in kept and any(r < p_index and r not in gone for r in readers.get(name, []))}
+        if not more:
+            break
+        kept |= more
     removed = {p_index}
     for name, parts in needed.items():
-        outside = [r for r in readers.get(name, []) if r not in merged]
-        if any(r < p_index for r in outside):
+        if parts["index"] in kept:
             continue
+        outside = [r for r in readers.get(name, []) if r not in gone]
         removed.add(parts["index"])
         if outside:
             buffer = buffers[name]

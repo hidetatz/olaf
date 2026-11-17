@@ -349,3 +349,20 @@ def test_long_rows_fuse_and_match(width, norm):
     arrays = [R.normal(size=(3, 5, width)).astype(np.float32), R.normal(size=(width,)).astype(np.float32)]
     program = run_both(lambda x, w: olaf.grad(lambda x: olaf.sum(olaf.tanh(fn(x, w))))(x), arrays, fused=True)
     assert any(launch.task.name == "rows" and launch.task.warps > 4 for launch in program.launches)
+
+
+@pytest.mark.gpu
+def test_bf16_scatter_add_rounds_once():
+    # Many updates land on few rows: in bf16 each add would round; the sum must round once.
+    from olaf.backend.cuda.runtime import CudaProgram
+    from olaf.graph.ir import bf16_round
+
+    target = bf16_round(R.normal(size=(4, 8)).astype(np.float32))
+    updates = bf16_round(R.normal(size=(300, 8)).astype(np.float32) * 0.01)
+    index = (np.arange(300) % 4).astype(np.int32)
+    specs = [tt(4, 8, dtype=olaf.bf16), tt(300, dtype=olaf.i32), tt(300, 8, dtype=olaf.bf16)]
+    graph = lower(olaf.trace(lambda t, i, u: olaf.scatter_add(t, i, u), *specs).graph)
+    (got,), _ = CudaProgram(to_program(graph, fused=True)).run([target, index, updates])
+    exact = target.astype(np.float64)
+    np.add.at(exact, index, updates.astype(np.float64))
+    np.testing.assert_array_equal(got, bf16_round(exact.astype(np.float32)))

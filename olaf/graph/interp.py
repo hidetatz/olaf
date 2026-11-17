@@ -261,6 +261,11 @@ def _scatter_add(run, op, args):
     target, index, updates = args
     axis, batch_dims = op.attr("axis"), op.attr("batch_dims")
     _check_bounds(index, target.shape[axis])
+    if op.outputs[0].type.dtype in (DType.bf16, DType.f32):
+        # As reduce: the exact sum (approximated in f64), rounded once (bf16 by check).
+        out = target.astype(np.float64)
+        np.add.at(out, _gather_index(updates.shape, index, axis, batch_dims), updates.astype(np.float64))
+        return [out if op.outputs[0].type.dtype is DType.bf16 else out.astype(np.float32)]
     out = target.copy()
     np.add.at(out, _gather_index(updates.shape, index, axis, batch_dims), updates)
     return [out]

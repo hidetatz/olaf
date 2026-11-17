@@ -615,6 +615,15 @@ class _Converter:
     def _op_scatter_add(self, op: Op, inputs: list[Ref]) -> Ref:
         target, index, updates = inputs
         axis, batch_dims = op.attr("axis"), op.attr("batch_dims")
+        result_type = op.outputs[0].type
+        narrow = result_type.dtype is DType.bf16
+        if narrow:
+            # A b16 scatter_add accumulates in f32 and rounds once at the end: its meaning is
+            # the exact sum rounded to the result dtype (docs/design.md), which b16 atomics,
+            # rounding at every add, would not give (and Ampere has none for bf16 anyway).
+            wide = TensorType(result_type.shape, DType.f32)
+            target = self.elementwise("cast", wide, [target], lambda b, tiles, *_: b.op("cast", tiles[0], dtype=DType.f32))
+            updates = self.elementwise("cast", TensorType(updates.shape, DType.f32), [updates], lambda b, tiles, *_: b.op("cast", tiles[0], dtype=DType.f32))
         out = self.materialize(target)
         spread, n_index = self._index_over(index, updates.shape, axis, batch_dims)
         axis_map = self._axis_map(out.view.rank, axis, n_index)
@@ -629,6 +638,8 @@ class _Converter:
         b.emit("atomic_add_indexed", (idx, value, *starts), {"arg": 2, "axis_map": axis_map, "bounds": tuple(shape)})
         grid = tuple(_ceil_div(d, t) for d, t in zip(shape, tile))
         self.launch("scatter_add", grid, [(spread, False), (updates, False), (out, True)], b.finish(pids))
+        if narrow:
+            return self.elementwise("cast", result_type, [out], lambda b, tiles, *_: b.op("cast", tiles[0], dtype=result_type.dtype))
         return out
 
     # -- state ----------------------------------------------------------------------------------

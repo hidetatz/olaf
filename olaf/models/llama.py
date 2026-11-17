@@ -71,6 +71,16 @@ class Block(nn.Module):
         return olaf.tree_map(lambda layer: layer.init(rng), self._layers())
 
     def __call__(self, p, x, mask, cos, sin):
+        x = self.attend(p, x, mask, cos, sin)
+        h = self._layers()["post_attention_layernorm"](p["post_attention_layernorm"], x)
+        return x + _to(self.feed_forward(p["mlp"], h), x.dtype)
+
+    def feed_forward(self, pm, h):
+        m = self._layers()["mlp"]
+        return m["down_proj"](pm["down_proj"], olaf.silu(m["gate_proj"](pm["gate_proj"], h)) * m["up_proj"](pm["up_proj"], h))
+
+    def attend(self, p, x, mask, cos, sin):
+        """x plus the attention sublayer (input norm, rotary GQA attention, output projection)."""
         c, layers = self.config, self._layers()
         att, pa = layers["self_attn"], p["self_attn"]
         B, S, _ = x.shape
@@ -95,11 +105,7 @@ class Block(nn.Module):
         k5, v5 = (olaf.broadcast_to(_to(t, dtype).reshape(B, c.n_kv_head, 1, S, hd), groups) for t in (k, v))
         attended = olaf.attention(q5, k5, v5, olaf.broadcast_to(mask, (B, c.n_kv_head, rep, S, S))).reshape(B, c.n_head, S, hd)
         merged = olaf.transpose(attended, 1, 2).reshape(B, S, c.n_head * hd)
-        x = x + _to(att["o_proj"](pa["o_proj"], merged), x.dtype)
-        m, pm = layers["mlp"], p["mlp"]
-        h = layers["post_attention_layernorm"](p["post_attention_layernorm"], x)
-        gated = olaf.silu(m["gate_proj"](pm["gate_proj"], h)) * m["up_proj"](pm["up_proj"], h)
-        return x + _to(m["down_proj"](pm["down_proj"], gated), x.dtype)
+        return x + _to(att["o_proj"](pa["o_proj"], merged), x.dtype)
 
 
 @dataclass(frozen=True)
@@ -108,11 +114,12 @@ class Llama(nn.Module):
 
     config: Config
     compute: DType | None = None
+    block = Block  # the decoder layer (Mixtral replaces it)
 
     def _layers(self):
         c = self.config
         return {
-            "model": {"embed_tokens": nn.Embedding(c.vocab_size, c.hidden_size, 0.02), "layers": nn.Repeat(Block(c, self.compute), c.n_layer), "norm": nn.RMSNorm(c.hidden_size, c.eps)},
+            "model": {"embed_tokens": nn.Embedding(c.vocab_size, c.hidden_size, 0.02), "layers": nn.Repeat(self.block(c, self.compute), c.n_layer), "norm": nn.RMSNorm(c.hidden_size, c.eps)},
             "lm_head": nn.Linear(c.hidden_size, c.vocab_size, bias=False, compute=self.compute),
         }
 
