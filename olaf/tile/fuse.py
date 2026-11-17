@@ -496,7 +496,7 @@ def _permuted(view: View, perm: list[int]) -> View:
     return View(tuple(view.shape[a] for a in perm), tuple(view.strides[a] for a in perm), view.offset, pad, view.fill, source)
 
 
-def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int, perm: list[int]) -> Launch:
+def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int, perm: list[int], keep_store: bool = False) -> Launch:
     task = launch.task
     args: list[tuple[str, Arg]] = [(n, a) for n, a in zip(launch.buffers, task.args)]
 
@@ -507,7 +507,7 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
         return args.index(key)
 
     b = TileBuilder()
-    b.ops = [op for op in task.body.ops if op is not store]
+    b.ops = [op for op in task.body.ops if keep_store or op is not store]
     value, starts = store.inputs[0], list(store.inputs[1:])
     tile = value.type.shape
     p_tile = info.store.inputs[0].type.shape
@@ -542,6 +542,70 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
     body = _renumber(body, remap)
     new = Task(task.name, task.grid, tuple(args[k][1] for k in used), body, task.warps, task.origin)
     return Launch(new, tuple(args[k][0] for k in used))
+
+
+def fuse_row_epilogues(program: Program) -> Program:
+    """Absorb a pointwise consumer of a row-fused task's output into it (tile/rows.py).
+
+    A layer normalization's output is read twice in GPT-2's training step: in f32 by the next
+    residual step or the backward, and through a cast to bf16 (with the affine transform in the
+    forward) by the next matrix product. The cast is a pass of its own over 12.6 MB of f32 per
+    use; here the row task stores both. Unlike fuse_epilogues the output may have other
+    readers: the row task then keeps storing it.
+    """
+    changed = True
+    while changed:
+        changed = False
+        buffers = {b.name: b for b in program.buffers}
+        readers: dict[str, list[int]] = {}
+        writers: dict[str, list[int]] = {}
+        for i, launch in enumerate(program.launches):
+            for name, arg in zip(launch.buffers, launch.task.args):
+                (writers if arg.writes else readers).setdefault(name, []).append(i)
+        launches = list(program.launches)
+        for i, launch in enumerate(launches):
+            if launch.task.origin != ("rows",) or launch.offsets or any(op.regions for op in launch.task.body.ops):
+                continue
+            written = {n for n, a in zip(launch.buffers, launch.task.args) if a.writes}
+            for store in [op for op in launch.task.body.ops if op.kind == "store"]:
+                absorbed = _try_absorb_row(launches, i, store, buffers, readers, writers, written)
+                if absorbed is not None:
+                    launches[i], j = absorbed
+                    del launches[j]
+                    changed = True
+                    break
+            if changed:
+                break
+        program = replace(program, launches=tuple(launches))
+    used = {n for launch in program.launches for n in launch.buffers} | set(program.inputs) | set(program.outputs)
+    return replace(program, buffers=tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp))
+
+
+def _try_absorb_row(launches, i, store, buffers, readers, writers, written):
+    launch = launches[i]
+    out = launch.buffers[store.attr("arg")]
+    buffer = buffers[out]
+    if writers.get(out) != [i] or launch.task.args[store.attr("arg")].view != full_view(buffer.type.shape):
+        return None
+    for j in sorted(set(readers.get(out, []))):
+        consumer = launches[j]
+        if j < i or consumer.offsets:
+            continue
+        info = _pointwise(consumer, buffers)
+        if info is None:
+            continue
+        reads = [a for a, n in enumerate(consumer.buffers) if n == out]
+        if len(reads) != 1 or consumer.task.args[reads[0]].view != full_view(buffer.type.shape):
+            continue
+        target = consumer.buffers[info.store.attr("arg")]
+        if buffers[target].type.shape != buffer.type.shape or writers.get(target) != [j] or any(r < j for r in readers.get(target, [])):
+            continue
+        others = {n for n, a in zip(consumer.buffers, consumer.task.args) if not a.writes and n != out}
+        if others & written or any(w > i for n in others for w in writers.get(n, [])):
+            continue
+        keep = buffer.kind is not BufferKind.temp or any(r != j for r in readers.get(out, []))
+        return _absorb(launch, store, consumer, info, reads[0], list(range(len(buffer.type.shape))), keep_store=keep), j
+    return None
 
 
 def fuse_siblings(program: Program, window: int = 32) -> Program:

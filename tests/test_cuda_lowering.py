@@ -293,3 +293,13 @@ def test_gradient_of_inner_axis_split_stored_in_slices():
         return olaf.grad(loss)(a)
 
     run_both(fn, [R.normal(size=(2, 6, 12)).astype(np.float32), R.normal(size=(4, 4)).astype(np.float32)], fused=True)
+
+
+@pytest.mark.gpu
+def test_row_task_stores_its_bf16_copy():
+    def fn(a, w, c, m):
+        y = olaf.layernorm(a, w, c)
+        return y, olaf.einsum("bsd,de->bse", olaf.cast(y, olaf.bf16), olaf.cast(m, olaf.bf16))
+
+    arrays = [R.normal(size=s).astype(np.float32) for s in ((3, 6, 40), (40,), (40,), (40, 8))]
+    run_both(fn, arrays, fused=True, tol=1e-2)

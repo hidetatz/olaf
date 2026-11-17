@@ -528,3 +528,23 @@ def test_product_is_inlined_into_a_split_column_sum():
     assert not any(launch.task.name == "mul" for launch in program.launches)
     for got, want in zip(run_program(program, [a, b])[0], interpret(graph, [a, b])[0]):
         assert rel(got, want) < 1e-5
+
+
+def test_row_task_stores_its_bf16_copy():
+    # The f32 normalized rows are an output and are cast to bf16 for a product: the row task
+    # stores both, and no separate cast pass remains.
+    from olaf.pipeline import to_program
+
+    x = R.normal(size=(3, 6, 40)).astype(np.float32)
+    w, bias = R.normal(size=(40,)).astype(np.float32), R.normal(size=(40,)).astype(np.float32)
+    wm = R.normal(size=(40, 8)).astype(np.float32)
+
+    def fn(a, w, c, m):
+        y = olaf.layernorm(a, w, c)
+        return y, olaf.einsum("bsd,de->bse", olaf.cast(y, olaf.bf16), olaf.cast(m, olaf.bf16))
+
+    graph = lower(olaf.trace(fn, tt(3, 6, 40), tt(40), tt(40), tt(40, 8)).graph)
+    program = to_program(graph)
+    assert not any(launch.task.name == "cast" and launch.task.args[0].view.shape == (3, 6, 40) for launch in program.launches)
+    for got, want in zip(run_program(program, [x, w, bias, wm])[0], interpret(graph, [x, w, bias, wm])[0]):
+        assert rel(got.astype(np.float64), want.astype(np.float64)) < 1e-5
