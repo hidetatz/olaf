@@ -29,12 +29,13 @@ ELEMENTWISE_ELEMENTS = 1024
 # thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
 # chunk x 128 values (32 per thread).
 ROW_REDUCE_BLOCK = 1024
-# A split reduction aims at up to this many blocks per compute unit. GPT-2's widest bias
-# gradients (4096 x 2304 and x 3072 bf16 column sums) get 72-96 blocks at 28% occupancy and run
-# at 120-195 GB/s, yet 16 per unit was no faster in the replayed training step: their limit is
-# elsewhere.
-SPLIT_BLOCKS_PER_UNIT = 4
-COLUMN_REDUCE_BLOCK = 32
+# A split reduction aims at up to this many blocks per compute unit, and a column reduction
+# reads this many rows per loop step. Measured on the RTX 3060 by graph replay, column sums of
+# 4096 x {768, 2304, 3072} bf16 and 4096 x 768 f32: 4 blocks and 32 rows gave 224 / 149 / 190
+# and 303 GB/s; 8 blocks and 16 rows give 255 / 309 / 318 and 311 GB/s. 32 rows is the part
+# that hurt, though not monotonically in width (2304 columns was the slowest).
+SPLIT_BLOCKS_PER_UNIT = 8
+COLUMN_REDUCE_BLOCK = 16
 DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions
 # With a 16x8x16 matrix instruction: 128x128 output tiles over 8 warps (64x32 per warp) and a
 # 3-stage async copy pipeline over 32-wide K steps. 3 stages of bf16 A and B tiles take 48 KiB of
@@ -364,7 +365,10 @@ class _Converter:
             sliced = replace(ref, view=View(shape, strides, v.offset, pad, v.fill))
             inner_axes = tuple(a if a < axis else a + 1 for a in axes)
             kept_shape = tuple(d for i, d in enumerate(shape) if i not in inner_axes)
-            partial = self._reduce(sliced, fn, inner_axes, TensorType(kept_shape, ref.dtype))
+            # Partial sums stay in the accumulator dtype: rounding them to bf16 and again after
+            # combining them would round twice where the unsplit sum rounds once.
+            partial_dtype = accumulator_dtype(ref.dtype) if fn == "sum" else ref.dtype
+            partial = self._reduce(sliced, fn, inner_axes, TensorType(kept_shape, partial_dtype))
             position = sum(1 for a in range(axis) if a not in axes)
             return self._reduce(partial, fn, (position,), op.outputs[0].type)
         return self._reduce(ref, fn, axes, op.outputs[0].type)
@@ -436,8 +440,8 @@ class _Converter:
             return builder.for_range(builder.index(0), builder.dim(shape[axis]), extent[axis], [carry], body)[0]
 
         result = b.op("reduce", loop(b, 0, {}, acc), fn=fn, axes=tuple(reduced))
-        if acc_dtype is not ref.dtype:
-            result = b.op("cast", result, dtype=ref.dtype)
+        if acc_dtype is not out_type.dtype:
+            result = b.op("cast", result, dtype=out_type.dtype)
         b.emit("store", (result, *out_starts), {"arg": 1})
         self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids), origin=("reduce", fn, tuple(axes)))
         return out

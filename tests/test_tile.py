@@ -548,3 +548,23 @@ def test_row_task_stores_its_bf16_copy():
     assert not any(launch.task.name == "cast" and launch.task.args[0].view.shape == (3, 6, 40) for launch in program.launches)
     for got, want in zip(run_program(program, [x, w, bias, wm])[0], interpret(graph, [x, w, bias, wm])[0]):
         assert rel(got.astype(np.float64), want.astype(np.float64)) < 1e-5
+
+
+def test_split_bf16_sum_keeps_partials_in_f32():
+    # The unsplit sum accumulates in f32 and rounds once; the split one must not round its
+    # partial sums to bf16 in between.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    graph = lower(olaf.trace(lambda x: olaf.sum(x, axis=(0, 1)), tt(4, 1024, 768, dtype=olaf.bf16)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    buffers = {b.name: b for b in program.buffers}
+    stages = [launch for launch in program.launches if launch.task.name == "reduce_sum"]
+    assert len(stages) == 2
+    partial = next(n for n, a in zip(stages[0].buffers, stages[0].task.args) if a.writes)
+    assert buffers[partial].type.dtype is olaf.f32
+    x = R.normal(size=(4, 1024, 768)).astype(np.float32)
+    from olaf.graph.ir import bf16_round
+
+    x = bf16_round(x)
+    got, want = run_program(program, [x])[0][0], interpret(graph, [x])[0][0]
+    assert rel(got.astype(np.float64), want.astype(np.float64)) < 1e-2
