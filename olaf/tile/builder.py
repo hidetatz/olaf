@@ -176,7 +176,7 @@ class TileBuilder:
         `stream`, double-buffer the dot operands the body loads at the loop variable (copy
         iteration i+1's while computing iteration i), at the cost of twice their shared memory.
         """
-        inner = TileBuilder()
+        inner = TileBuilder(cse=self.cse)
         iv = TValue(TileType((), INDEX))
         params = [TValue(c.type) for c in carries]
         results = fn(inner, iv, params)

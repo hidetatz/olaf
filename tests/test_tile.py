@@ -524,7 +524,8 @@ def test_product_is_inlined_into_a_split_column_sum():
     a, b = R.normal(size=shape).astype(np.float32), R.normal(size=shape).astype(np.float32)
     graph = lower(olaf.trace(lambda x, y: (olaf.sum(x * y, axis=(0, 1)), olaf.sum(x, axis=(0, 1))), tt(*shape), tt(*shape)).graph)
     program = to_program(graph, AMPERE_RTX3060)  # a GPU's unit count makes the reduction split
-    assert sum(launch.task.name == "reduce_sum" for launch in program.launches) == 4  # two stages each
+    # Two stages each, the first stages merged into one task (fuse_sibling_reductions): x is read once.
+    assert sum(launch.task.name == "reduce_sum" for launch in program.launches) == 3
     assert not any(launch.task.name == "mul" for launch in program.launches)
     for got, want in zip(run_program(program, [a, b])[0], interpret(graph, [a, b])[0]):
         assert rel(got, want) < 1e-5

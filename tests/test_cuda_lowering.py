@@ -303,3 +303,19 @@ def test_row_task_stores_its_bf16_copy():
 
     arrays = [R.normal(size=s).astype(np.float32) for s in ((3, 6, 40), (40,), (40,), (40, 8))]
     run_both(fn, arrays, fused=True, tol=1e-2)
+
+
+@pytest.mark.gpu
+def test_sibling_column_sums_share_one_loop():
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    shape = (4, 1024, 768)
+    arrays = [R.normal(size=shape).astype(np.float32) for _ in range(2)]
+    graph = lower(olaf.trace(lambda x, y: (olaf.sum(x * y, axis=(0, 1)), olaf.sum(x, axis=(0, 1))), tt(*shape), tt(*shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert sum(launch.task.name == "reduce_sum" for launch in program.launches) == 3
+    expected, _ = interpret(graph, arrays)
+    actual, _ = CudaProgram(program).run(arrays)
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-5

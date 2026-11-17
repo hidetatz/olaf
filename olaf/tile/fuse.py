@@ -608,6 +608,134 @@ def _try_absorb_row(launches, i, store, buffers, readers, writers, written):
     return None
 
 
+def fuse_sibling_reductions(program: Program, window: int = 4) -> Program:
+    """Merge two reductions over the same input into one task: one loop, the input read once.
+
+    The weight and bias gradients of a layer normalization are column sums of dy * xhat and of
+    dy: two tasks, each reading dy (12.6 MB of f32 per GPT-2 layer norm). Here they become one
+    loop carrying both accumulators, whose loads of dy are shared by value numbering.
+
+    Matched: launches A and B (B within `window` after A), both reductions with one top-level
+    loop of the same bounds and attributes and no loop inside it, the same grid and warps,
+    sharing a read buffer through the same view. B moves to A's place, so B's inputs must be
+    written before A, nothing in between may touch B's output, and B must not read A's.
+    """
+    changed = True
+    while changed:
+        changed = False
+        launches = list(program.launches)
+        for i, a in enumerate(launches):
+            if not _single_loop_reduction(a):
+                continue
+            a_out = {n for n, x in zip(a.buffers, a.task.args) if x.writes}
+            a_reads = {(n, x) for n, x in zip(a.buffers, a.task.args) if not x.writes and any(st != 0 for st in x.view.strides)}
+            for j in range(i + 1, min(i + 1 + window, len(launches))):
+                b = launches[j]
+                if not _single_loop_reduction(b) or b.task.grid != a.task.grid or b.task.warps != a.task.warps:
+                    continue
+                b_reads = {(n, x) for n, x in zip(b.buffers, b.task.args) if not x.writes and any(st != 0 for st in x.view.strides)}
+                b_out = {n for n, x in zip(b.buffers, b.task.args) if x.writes}
+                if not a_reads & b_reads or {n for n, _ in b_reads} & a_out:
+                    continue
+                between = launches[i:j]
+                if any(n in {m for m, _ in b_reads} for k in between for n, x in zip(k.buffers, k.task.args) if x.writes):
+                    continue
+                if any(n in b_out for k in launches[i + 1 : j] for n in k.buffers):
+                    continue
+                merged = _merge_loops(a, b)
+                if merged is None:
+                    continue
+                launches[i] = merged
+                del launches[j]
+                changed = True
+                break
+            if changed:
+                break
+        program = replace(program, launches=tuple(launches))
+    return program
+
+
+def _single_loop_reduction(launch: Launch) -> bool:
+    """A reduction whose body is a nest of loops, one per level (one per reduced axis)."""
+
+    def nest(body: Body) -> bool:
+        loops = [op for op in body.ops if op.regions]
+        return len(loops) <= 1 and all(op.kind == "for" and nest(op.regions[0]) for op in loops)
+
+    body = launch.task.body
+    return (
+        not launch.offsets
+        and launch.task.origin[:1] == ("reduce",)
+        and any(op.kind == "for" for op in body.ops)
+        and nest(body)
+        and not any(op.kind.startswith("atomic") for op in _walk(body))
+    )
+
+
+def _merge_loops(a: Launch, b: Launch) -> Launch | None:
+    args: list[tuple[str, Arg]] = []
+
+    def arg_index(name: str, arg: Arg) -> int:
+        if (name, arg) not in args:
+            args.append((name, arg))
+        return args.index((name, arg))
+
+    def replay(target: TileBuilder, launch: Launch, ops, mapping: dict) -> None:
+        for op in ops:
+            ins = [mapping.get(v, v) for v in op.inputs]
+            attrs = dict(op.attrs)
+            if op.kind in _MEMORY:
+                attrs["arg"] = arg_index(launch.buffers[op.attr("arg")], launch.task.args[op.attr("arg")])
+            outs = target.emit(op.kind, ins, attrs)
+            mapping.update(zip(op.outputs, outs))
+
+    class Mismatch(Exception):
+        pass
+
+    def merge(target: TileBuilder, bodies, maps) -> None:
+        """Replay both bodies into target, the loops at this level as one loop."""
+        loops = [next((op for op in body.ops if op.kind == "for"), None) for body in bodies]
+        if (loops[0] is None) != (loops[1] is None):
+            raise Mismatch
+        if loops[0] is None:
+            for launch, body, mapping in zip((a, b), bodies, maps):
+                replay(target, launch, body.ops, mapping)
+            return
+        if loops[0].attrs != loops[1].attrs:
+            raise Mismatch
+        for launch, body, loop, mapping in zip((a, b), bodies, loops, maps):
+            replay(target, launch, body.ops[: body.ops.index(loop)], mapping)
+        bounds = [[maps[k].get(v, v) for v in loops[k].inputs[:3]] for k in range(2)]
+        if bounds[0] != bounds[1]:
+            raise Mismatch
+        n_a = len(loops[0].inputs) - 3
+        carries = [maps[k].get(v, v) for k in range(2) for v in loops[k].inputs[3:]]
+        iv = TValue(TileType((), INDEX))
+        params = [TValue(c.type) for c in carries]
+        inner = TileBuilder(cse=True)
+        inner_maps = [dict(maps[0]), dict(maps[1])]
+        inner_maps[0].update(zip(loops[0].regions[0].params, (iv, *params[:n_a])))
+        inner_maps[1].update(zip(loops[1].regions[0].params, (iv, *params[n_a:])))
+        merge(inner, [loops[0].regions[0], loops[1].regions[0]], inner_maps)
+        results = [inner_maps[k].get(v, v) for k in range(2) for v in loops[k].regions[0].results]
+        region = Body((iv, *params), tuple(inner.ops), tuple(results))
+        outs = target.emit("for", (*bounds[0], *carries), dict(loops[0].attrs), (region,))
+        maps[0].update(zip(loops[0].outputs, outs[:n_a]))
+        maps[1].update(zip(loops[1].outputs, outs[n_a:]))
+        for launch, body, loop, mapping in zip((a, b), bodies, loops, maps):
+            replay(target, launch, body.ops[body.ops.index(loop) + 1 :], mapping)
+
+    builder = TileBuilder(cse=True)
+    params = tuple(TValue(v.type) for v in a.task.body.params)
+    maps = [dict(zip(launch.task.body.params, params)) for launch in (a, b)]
+    try:
+        merge(builder, [a.task.body, b.task.body], maps)
+    except Mismatch:
+        return None
+    task = Task(a.task.name, a.task.grid, tuple(x for _, x in args), builder.finish(params), a.task.warps, a.task.origin)
+    return Launch(task, tuple(n for n, _ in args))
+
+
 def fuse_siblings(program: Program, window: int = 32) -> Program:
     """Merge pointwise tasks over the same tile grid that read common inputs (horizontal fusion).
 
