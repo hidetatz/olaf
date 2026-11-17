@@ -89,6 +89,7 @@ def test_eager_forward_and_backward_match_huggingface_f64():
         assert relative(ours[name], p.grad.numpy()) < 1e-6, name
 
 
+@pytest.mark.model
 @pytest.mark.gpu
 @pytest.mark.parametrize("compute", [None, olaf.bf16])
 def test_training_gates(compute):

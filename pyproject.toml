@@ -24,4 +24,5 @@ addopts = "--strict-markers"
 markers = [
     "gpu: tests that need a GPU",
     "slow: time-consuming tests such as full-size GPT-2",
+    "model: the per-model training gates (several seeds of short training runs; skip with -m 'not model')",
 ]

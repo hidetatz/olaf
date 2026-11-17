@@ -32,6 +32,10 @@ MULTIPLIER = 2.0
 # meaninglessly lenient.
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cuda.matmul.allow_tf32 = False
+# And reproducible: cuDNN's default backward convolutions add with atomics, so PyTorch's error
+# (and the gate's verdict) changed from run to run.
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 # PyTorch's error is compared with at least this: a few f32 ulps (2^-23 each), where errors
 # reflect only the order of additions. There a tiny model's PyTorch error (6e-8 on the MLP's
 # loss curve) is as much luck as olaf's (1.3e-7), and a ratio of the two says nothing. f32 for
@@ -60,6 +64,7 @@ class Case:
     input_specs: tuple
     autocast: bool = False
     named: object = None
+    buffers: object = None  # untrained state (batch norm): olaf_loss(params, buffers, *inputs) -> (loss, new buffers)
 
     def torch_named(self, tree) -> dict:
         if self.named is not None:
@@ -99,7 +104,13 @@ def one_step(case: Case, params, inputs) -> tuple[float, dict]:
     from olaf.frontend.optim import _paths
 
     specs = olaf.tree_map(lambda a: olaf.TensorType(np.shape(a), olaf.f32), params)
-    traced = olaf.trace(lambda p, *xs: olaf.value_and_grad(lambda p: case.olaf_loss(p, *xs))(p), specs, *case.input_specs)
+    if case.buffers is None:
+        loss_of = case.olaf_loss
+    else:
+        def loss_of(p, *xs):
+            buffers = olaf.tree_map(lambda a: olaf.constant(np.asarray(a, np.float32)), case.buffers)
+            return case.olaf_loss(p, buffers, *xs)[0]
+    traced = olaf.trace(lambda p, *xs: olaf.value_and_grad(lambda p: loss_of(p, *xs))(p), specs, *case.input_specs)
     outputs, _ = device_program(traced.graph).run([*olaf.tree_flatten(params)[0], *inputs])
     _, structure = olaf.tree_flatten(params)
     ours = case.torch_named(olaf.tree_unflatten(structure, list(outputs[1:])))
@@ -124,7 +135,7 @@ def olaf_curve(case: Case, make_optimizer, batches, compiled=None) -> list[float
     """compiled: a program from an earlier case of the same model (only the values differ)."""
     from olaf.backend.cuda.runtime import Session
 
-    traced, initial = olaf.train_step(case.olaf_loss, case.params, make_optimizer, *case.input_specs)
+    traced, initial = olaf.train_step(case.olaf_loss, case.params, make_optimizer, *case.input_specs, buffers=case.buffers)
     session = Session(compiled or device_program(traced.graph), {})
     session.load_state(initial)
     losses = []
@@ -157,7 +168,7 @@ def curve(make_case, olaf_optimizer, torch_optimizer, make_batches, seeds=range(
     for seed in seeds:
         case, batches = make_case(seed), make_batches(seed)
         if compiled is None:
-            compiled = device_program(olaf.train_step(case.olaf_loss, case.params, olaf_optimizer, *case.input_specs)[0].graph)
+            compiled = device_program(olaf.train_step(case.olaf_loss, case.params, olaf_optimizer, *case.input_specs, buffers=case.buffers)[0].graph)
         ours = olaf_curve(case, olaf_optimizer, batches, compiled)
         truth = torch_curve(case, torch_optimizer, batches, torch.float64, "cpu")
         theirs = torch_curve(case, torch_optimizer, batches, torch.float32, "cuda", case.autocast)

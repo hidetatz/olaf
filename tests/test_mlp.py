@@ -77,6 +77,7 @@ OPTIMIZERS = {
 }
 
 
+@pytest.mark.model
 @pytest.mark.gpu
 @pytest.mark.parametrize("compute,optimizer", [(None, "sgd"), (None, "adamw"), (olaf.bf16, "adamw")])
 def test_training_gates(compute, optimizer):

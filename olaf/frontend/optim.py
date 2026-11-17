@@ -121,7 +121,7 @@ class SGD:
         return tree_unflatten(self.structure, updated)
 
 
-def train_step(loss_fn: Callable, params, make_optimizer: Callable, *input_specs, dtype: DType = DType.f32, name: str = "params") -> tuple[Traced, dict]:
+def train_step(loss_fn: Callable, params, make_optimizer: Callable, *input_specs, dtype: DType = DType.f32, name: str = "params", buffers=None) -> tuple[Traced, dict]:
     """Trace one training step: read the parameters, differentiate loss_fn(params, *inputs),
     update with the optimizer, write the parameters back, return the loss.
 
@@ -129,20 +129,37 @@ def train_step(loss_fn: Callable, params, make_optimizer: Callable, *input_specs
     weights; compute dtypes are the modules' business). make_optimizer(param_types) builds the
     optimizer, e.g. lambda t: AdamW(t, lr=3e-4). Returns the traced step and the initial state
     (parameters and optimizer state, keyed by state name).
+
+    buffers: untrained model state (batch norm's running statistics), a pytree of f32 arrays.
+    With it, loss_fn(params, buffers, *inputs) returns (loss, new buffers), which the step
+    writes back; they are not differentiated.
     """
     np_dtype = {DType.f32: np.float32, DType.f64: np.float64}[dtype]
     types = tree_map(lambda a: TensorType(np.shape(a), dtype), params)
     states, paths = parameter_states(types, name)
     opt = make_optimizer(types)
 
+    if buffers is not None:
+        buffer_types = tree_map(lambda a: TensorType(np.shape(a), DType.f32), buffers)
+        buffer_paths = _paths(buffer_types)
+        b_leaves, b_structure = tree_flatten(buffer_types)
+        buffer_states = tree_unflatten(b_structure, [state(f"buffers.{p}", t, StateKind.buffer) for p, t in zip(buffer_paths, b_leaves)])
+
     def step(*inputs):
         current = read_all(states)
-        loss, grads = value_and_grad(lambda p: loss_fn(p, *inputs))(current)
+        if buffers is None:
+            loss, grads = value_and_grad(lambda p: loss_fn(p, *inputs))(current)
+        else:
+            held = read_all(buffer_states)
+            (loss, new_buffers), grads = value_and_grad(lambda p: loss_fn(p, held, *inputs), has_aux=True)(current)
+            write_all(buffer_states, new_buffers)
         write_all(states, opt.update(current, grads))
         return loss
 
     traced = trace(step, *input_specs)
     initial = {f"{name}.{path}": np.asarray(value, np_dtype) for path, value in zip(paths, tree_flatten(params)[0])}
+    if buffers is not None:
+        initial.update({f"buffers.{p}": np.asarray(v, np.float32) for p, v in zip(buffer_paths, tree_flatten(buffers)[0])})
     optim_state = opt.initial_state()
     if dtype is not DType.f32:
         optim_state = {k: v.astype(np_dtype) for k, v in optim_state.items()}

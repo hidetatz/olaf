@@ -39,6 +39,7 @@ class StateKind(Enum):
     optim = "optim"
     kv_cache = "kv_cache"
     rng = "rng"
+    buffer = "buffer"  # model state that is not trained (batch norm's running statistics)
 
 
 @dataclass(frozen=True)

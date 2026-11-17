@@ -211,6 +211,49 @@ class Conv(Module):
         return y
 
 
+@dataclass(frozen=True)
+class BatchNorm(Module):
+    """torch.nn.BatchNorm{1,2,3}d over axis 1, with running statistics as buffers.
+
+    Called as bn(params, x, buffers, training) -> (y, new buffers): olaf modules hold no state,
+    so the running mean and variance come in and go out like any value (the step writes them
+    back, frontend/optim.train_step). Training normalizes with the batch's biased variance and
+    updates the running variance with the unbiased one, as PyTorch. Computed in f32 and rounded
+    once to x's dtype, as cuDNN does for bf16 inputs.
+    """
+
+    channels: int
+    eps: float = 1e-5
+    momentum: float = 0.1
+
+    def init(self, rng: np.random.Generator) -> dict:
+        return {"weight": np.ones(self.channels, np.float32), "bias": np.zeros(self.channels, np.float32)}
+
+    def init_buffers(self) -> dict:
+        return {"running_mean": np.zeros(self.channels, np.float32), "running_var": np.ones(self.channels, np.float32)}
+
+    def __call__(self, params, x: Tensor, buffers, training: bool = True):
+        h = _to(x, DType.f32) if x.dtype is DType.bf16 else x
+        axes = (0, *range(2, h.rank))
+        shape = (1, self.channels, *(1,) * (h.rank - 2))
+        if training:
+            count = int(np.prod([h.shape[a] for a in axes]))
+            mu = mean(h, axis=axes)
+            centered = h - broadcast_to(mu.reshape(*shape), h.shape)
+            var = mean(centered * centered, axis=axes)
+            m = self.momentum
+            new = {
+                "running_mean": buffers["running_mean"] * (1.0 - m) + mu * m,
+                "running_var": buffers["running_var"] * (1.0 - m) + var * (m * count / max(count - 1, 1)),
+            }
+        else:
+            mu, var, new = buffers["running_mean"], buffers["running_var"], buffers
+            centered = h - broadcast_to(mu.reshape(*shape), h.shape)
+        scale = params["weight"] * rsqrt(var + self.eps)
+        y = centered * broadcast_to(scale.reshape(*shape), h.shape) + broadcast_to(params["bias"].reshape(*shape), h.shape)
+        return _to(y, x.dtype), new
+
+
 def _strided(x: Tensor, axis: int, start: int, count: int, step: int) -> Tensor:
     """x[..., start : start + count * step : step, ...] along `axis` (no strided slice op: a
     slice, a reshape splitting off the step, and a slice of its first column). x must reach
@@ -276,4 +319,4 @@ def relu(x: Tensor) -> Tensor:
     return maximum(x, 0.0)
 
 
-__all__ = ["Conv", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]
+__all__ = ["BatchNorm", "Conv", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]
