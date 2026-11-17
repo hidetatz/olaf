@@ -18,12 +18,15 @@ def hoist_offsets(program: Program) -> Program:
     stacked parameters, and with the offsets in the views each copy is its own template: 528
     unique tasks for GPT-2 small's training step instead of one set per block. The offset is just
     the start of the argument's memory, so it belongs with the buffer binding.
+
+    Source maps go too: they serve fusion, which is over by now, and their starts name the
+    block's place in the stack (the layer), which would split the templates again.
     """
     launches = []
     for launch in program.launches:
         task = launch.task
         offsets = tuple(launch.offset(i) + a.view.offset for i, a in enumerate(task.args))
-        args = tuple(replace(a, view=replace(a.view, offset=0)) for a in task.args)
+        args = tuple(replace(a, view=replace(a.view, offset=0, source=None)) for a in task.args)
         hoisted = Task(task.name, task.grid, args, task.body, task.warps, task.origin)
         launches.append(Launch(hoisted, launch.buffers, offsets if any(o != 0 for o in offsets) else ()))
     return replace(program, launches=tuple(launches))
