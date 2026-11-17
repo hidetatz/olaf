@@ -570,6 +570,54 @@ class _Converter:
         self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=origin)
         return out
 
+    def _op_conv(self, op: Op, inputs: list[Ref]) -> Ref:
+        """conv as a contract over a window view of the input (implicit GEMM: nothing is copied
+        per window).
+
+        Output position (n, p...) and kernel offset (u...) address the input at
+        p * stride + u * dilation, which is affine, so the windows are one strided view
+        [N, *out, groups, *kernel, C/groups] with overlapping strides, and the weight a view
+        [groups, O/groups, *kernel, C/groups]. Padding and input dilation are not affine masks
+        (a position is in the padding depending on p * stride + u * dilation together), so they
+        are made real first: the input is written, spread by its dilation, into a zeroed buffer
+        with the padding around it (negative padding crops, by moving the windows' start).
+        C/groups is the innermost reduced label, so the dot's k tile runs over channels rather
+        than over a kernel width of 3.
+        """
+        from olaf.graph.builder import make_attrs
+
+        x, w = inputs
+        stride, padding, dilation, lhs_dilation, g = (op.attr(k) for k in ("stride", "padding", "dilation", "lhs_dilation", "groups"))
+        n = len(stride)
+        N, C = x.shape[:2]
+        O, Cg = w.shape[:2]
+        kernel = tuple(w.shape[2:])
+        out_type = op.outputs[0].type
+        out_spatial = tuple(out_type.shape[2:])
+        if any(ld > 1 for ld in lhs_dilation) or any(lo > 0 or hi > 0 for lo, hi in padding):
+            spread = tuple((s - 1) * ld + 1 + max(lo, 0) + max(hi, 0) for s, ld, (lo, hi) in zip(x.shape[2:], lhs_dilation, padding))
+            padded_type = TensorType((N, C, *spread), x.dtype)
+            base = self.elementwise("fill", padded_type, [], lambda b, tiles, starts, tile: b.full(tile, 0, x.dtype))
+            ps = contiguous_strides(padded_type.shape)
+            into = View(tuple(x.shape), (ps[0], ps[1], *(st * ld for st, ld in zip(ps[2:], lhs_dilation))), sum(max(lo, 0) * st for (lo, _), st in zip(padding, ps[2:])))
+            self.elementwise("copy", TensorType(x.shape, x.dtype), [self.plain(x)], lambda b, t, s, ts: t[0], out=replace(base, view=into))
+        else:
+            base = x if x.view.is_contiguous else self.materialize(x)
+        bs = base.view.strides
+        start = base.view.offset + sum(max(-lo, 0) * st for (lo, _), st in zip(padding, bs[2:]))
+        win_shape = (N, *out_spatial, g, *kernel, Cg)
+        win_strides = (bs[0], *(st * s for st, s in zip(bs[2:], stride)), Cg * bs[1], *(st * d for st, d in zip(bs[2:], dilation)), bs[1])
+        windows = Ref(base.buffer, View(win_shape, win_strides, start), x.dtype)
+        w = w if w.view.is_contiguous else self.materialize(w)
+        ws = w.view.strides
+        weights = Ref(w.buffer, View((g, O // g, *kernel, Cg), (O // g * ws[0], ws[0], *ws[2:], ws[1]), w.view.offset), w.dtype)
+        out_letters, kernel_letters = "pqr"[:n], "uvz"[:n]
+        spec = f"n{out_letters}g{kernel_letters}c,go{kernel_letters}c->ngo{out_letters}"
+        grouped = TensorType((N, g, O // g, *out_spatial), out_type.dtype)
+        contract = Op("contract", (Value(TensorType(win_shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(grouped),), make_attrs({"spec": spec}))
+        result = self._op_contract(contract, [windows, weights])
+        return replace(result, view=View(tuple(out_type.shape), contiguous_strides(out_type.shape), result.view.offset))
+
     def _matrix_dtype(self, value: Value) -> DType:
         producer = self.producers.get(value)
         if value.type.dtype is DType.f32 and producer is not None and producer.kind == "cast" and producer.inputs[0].type.dtype is DType.bf16:

@@ -87,3 +87,76 @@ def test_conv_transpose_eager_matches_torch(xs, ws, stride, padding, output_padd
     for name, a, b in zip(("y", "dx", "dw"), got, want):
         assert a.shape == b.shape, (name, a.shape, b.shape)
         assert relative(a, b) < 1e-12, name
+
+
+def _tile_check(fn, x, w, r):
+    from olaf.pipeline import lower_graph, to_program
+    from olaf.tile.interp import run_program
+
+    spec = [olaf.TensorType(a.shape, olaf.f32) for a in (x, w, r)]
+    graph = lower_graph(olaf.trace(lambda x, w, r: (fn(x, w), olaf.grad(lambda x, w: olaf.sum(fn(x, w) * r), argnums=(0, 1))(x, w)), *spec).graph)
+    arrays = [a.astype(np.float32) for a in (x, w, r)]
+    from olaf.graph.interp import interpret
+
+    want, _ = interpret(graph, arrays)
+    return to_program(graph), arrays, want
+
+
+@pytest.mark.parametrize("xs,ws,stride,padding,dilation,groups", CONVS)
+def test_conv_tile_program_matches_eager(xs, ws, stride, padding, dilation, groups):
+    from olaf.tile.interp import run_program
+
+    x, w = R.normal(size=xs), R.normal(size=ws)
+    fn = lambda x, w: olaf.conv(x, w, stride, padding, dilation, groups)  # noqa: E731
+    r = R.normal(size=_out_shape(lambda x, w: _torch_conv(xs)(x, w, stride=stride, padding=padding, dilation=dilation, groups=groups), x, w))
+    program, arrays, want = _tile_check(fn, x, w, r)
+    got, _ = run_program(program, arrays)
+    for a, b in zip(got, want):
+        assert relative(a, b) < 1e-5
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("xs,ws,stride,padding,dilation,groups", CONVS)
+def test_conv_on_device_matches_eager(xs, ws, stride, padding, dilation, groups):
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    x, w = R.normal(size=xs), R.normal(size=ws)
+    fn = lambda x, w: olaf.conv(x, w, stride, padding, dilation, groups)  # noqa: E731
+    r = R.normal(size=_out_shape(lambda x, w: _torch_conv(xs)(x, w, stride=stride, padding=padding, dilation=dilation, groups=groups), x, w))
+    program, arrays, want = _tile_check(fn, x, w, r)
+    got, _ = CudaProgram(program).run(arrays)
+    for a, b in zip(got, want):
+        assert relative(a, b) < 1e-5
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("xs,ws,stride,padding,output_padding,groups", TRANSPOSED)
+def test_conv_transpose_on_device_matches_eager(xs, ws, stride, padding, output_padding, groups):
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    x, w = R.normal(size=xs), R.normal(size=ws)
+    fn = lambda x, w: olaf.conv_transpose(x, w, stride, padding, output_padding, groups=groups)  # noqa: E731
+    r = R.normal(size=_out_shape(lambda x, w: _torch_conv_transpose(xs)(x, w, stride=stride, padding=padding, output_padding=output_padding, groups=groups), x, w))
+    program, arrays, want = _tile_check(fn, x, w, r)
+    got, _ = CudaProgram(program).run(arrays)
+    for a, b in zip(got, want):
+        assert relative(a, b) < 1e-5
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("xs,ws,stride,padding,dilation,groups", [CONVS[1], CONVS[2], ((4, 32, 16, 16), (64, 32, 3, 3), 1, 1, 1, 1)])
+def test_bf16_conv_on_device_matches_eager(xs, ws, stride, padding, dilation, groups):
+    # bf16 operands go to the matrix instructions through strided window views.
+    from olaf.backend.cuda.runtime import CudaProgram
+    from olaf.graph.interp import interpret
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import lower_graph, to_program
+
+    x, w = (bf16_round(R.normal(size=s).astype(np.float32)) for s in (xs, ws))
+    spec = [olaf.TensorType(a.shape, olaf.bf16) for a in (x, w)]
+    fn = lambda x, w: olaf.conv(x, w, stride, padding, dilation, groups)  # noqa: E731
+    graph = lower_graph(olaf.trace(lambda x, w: (fn(x, w), olaf.grad(lambda x, w: olaf.sum(olaf.cast(fn(x, w), olaf.f32) ** 2.0), argnums=(0, 1))(x, w)), *spec).graph)
+    want, _ = interpret(graph, [x, w])
+    got, _ = CudaProgram(to_program(graph)).run([x, w])
+    for a, b in zip(got, want):
+        assert relative(a, b) < 1e-2
