@@ -139,6 +139,14 @@ def _add_of_pads(op, defs):
     return concat, Op("pad", (joined,), op.outputs, make_attrs({"low": low, "high": high, "value": 0.0}))
 
 
+def _concat_identity(op, defs):
+    """A concat of one operand is that operand. An unrolled scan of length 1 (a one-layer model)
+    stacks each saved activation with one; left in place, the backward reads the stack instead of
+    the forward's value, and attention's backward fusion no longer sees its pattern."""
+    if op.kind == "concat" and len(op.inputs) == 1:
+        return op.inputs[0]
+
+
 def _concat_of_concat(op, defs):
     if op.kind != "concat":
         return None
@@ -163,6 +171,7 @@ RULES: tuple[Rule, ...] = (
     _slice_of_concat,
     _pad_identity,
     _add_of_pads,
+    _concat_identity,
     _concat_of_concat,
 )
 

@@ -84,11 +84,16 @@ class Block(nn.Module):
         k = heads(att["k_proj"](pa["k_proj"], h), c.n_kv_head)
         v = heads(att["v_proj"](pa["v_proj"], h), c.n_kv_head)
         q, k = (nn.rotate(_to(t, DType.f32), cos, sin) for t in (q, k))
-        if rep > 1:
-            # Hugging Face's repeat_kv: each key and value head serves `rep` query heads.
-            k, v = (olaf.broadcast_to(t.reshape(B, c.n_kv_head, 1, S, hd), (B, c.n_kv_head, rep, S, hd)).reshape(B, c.n_head, S, hd) for t in (k, v))
         dtype = self.compute or x.dtype
-        attended = olaf.attention(_to(q, dtype), _to(k, dtype), _to(v, dtype), olaf.broadcast_to(mask, (B, c.n_head, S, S)))
+        # Grouped-query attention: query head h uses key/value head h // rep. Hugging Face
+        # repeats k and v to n_head heads (repeat_kv), which is the same math, but as a tensor
+        # it can only be a copy: [kv, rep] -> [kv * rep] with rep broadcast has no strides.
+        # With the group as its own batch axis, q is a plain reshape and k and v broadcast
+        # along rep, so nothing is copied.
+        groups = (B, c.n_kv_head, rep, S, hd)
+        q5 = _to(q, dtype).reshape(*groups)
+        k5, v5 = (olaf.broadcast_to(_to(t, dtype).reshape(B, c.n_kv_head, 1, S, hd), groups) for t in (k, v))
+        attended = olaf.attention(q5, k5, v5, olaf.broadcast_to(mask, (B, c.n_kv_head, rep, S, S))).reshape(B, c.n_head, S, hd)
         merged = olaf.transpose(attended, 1, 2).reshape(B, S, c.n_head * hd)
         x = x + _to(att["o_proj"](pa["o_proj"], merged), x.dtype)
         m, pm = layers["mlp"], p["mlp"]

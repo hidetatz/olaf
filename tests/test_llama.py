@@ -100,3 +100,25 @@ def test_training_gates(compute):
     c = case(compute)
     worst, ratios = one_step(c, c.params, data(1, seed=7)[0])
     assert worst <= MULTIPLIER, ratios
+
+
+def test_fusion_at_llama_shapes():
+    # The shapes the small gate model does not reach: a 2048-wide hidden state (rows past 1024),
+    # head dim 128, four query heads per key/value head. Built only, not run.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import lower_graph, to_program
+
+    S, I = 256, 5632
+    cfg = llama.Config(vocab_size=320, hidden_size=2048, intermediate_size=I, n_layer=1, n_head=16, n_kv_head=4)  # vocab != S: logits are not score-shaped
+    model = llama.Llama(cfg, olaf.bf16)
+    traced, _ = olaf.train_step(olaf_loss(model), model.init(np.random.default_rng(0)), lambda t: olaf.AdamW(t), olaf.TensorType((1, S), olaf.i32))
+    program = to_program(lower_graph(traced.graph), AMPERE_RTX3060)
+    shapes = {b.name: b.type for b in program.buffers}
+    names = [launch.task.name for launch in program.launches]
+    assert {"attention", "attention_dkv"} <= set(names)
+    assert not any(t.shape[-2:] == (S, S) for t in shapes.values()), "attention scores materialized"
+    assert names.count("rows") >= 4, "RMSNorm forward and backward fuse into row tasks"
+    forward = next(launch for launch in program.launches if launch.task.name == "attention")
+    assert any(shapes[n].shape == (1, 4, S, 128) for n in forward.buffers), "the forward reads unrepeated keys"
+    assert not any(launch.task.name == "copy" and any(shapes[n].rank == 5 and shapes[n].dtype is olaf.bf16 for n in launch.buffers) for launch in program.launches), "keys or values copied per query head"
+    assert not any(t.dtype is olaf.f32 and t.shape == (1, S, I) for t in shapes.values()), "f32 copy of an MLP activation"
