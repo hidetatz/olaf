@@ -123,3 +123,54 @@ def test_training_gates(compute):
     assert ratio <= MULTIPLIER, (ratio, details)
     worst, ratios = one_step_median(lambda seed: case(compute, seed + 1), lambda seed: data(1, seed=seed + 7)[0])
     assert worst <= MULTIPLIER, ratios
+
+
+def _eval_case(seed=3):
+    model = resnet.ResNet(CONFIG)
+    rng = np.random.default_rng(seed)
+    params = model.init(rng)
+    # Running statistics away from their initial values, so evaluation mode is exercised.
+    buffers = olaf.tree_map(lambda a: (rng.normal(size=a.shape) * 0.1 if np.all(a == 0) else rng.uniform(0.5, 1.5, a.shape)).astype(np.float32), model.init_buffers())
+    x = rng.normal(size=(4, 3, 32, 32)).astype(np.float32)
+    classes = rng.integers(0, 10, 4).astype(np.int32)
+    return model, params, buffers, x, classes
+
+
+def torch_grad_cam(params, buffers, x, classes):
+    twin = torch_model(torch.float64, "cpu").eval()
+    from olaf.frontend.optim import _paths
+
+    state = {**dict(zip(_paths(params), olaf.tree_flatten(params)[0])), **dict(zip(_paths(buffers), olaf.tree_flatten(buffers)[0]))}
+    twin.load_state_dict({k: torch.from_numpy(np.asarray(v, np.float64)) for k, v in state.items()}, strict=False)
+    h = torch.relu(twin.bn1(twin.conv1(torch.from_numpy(x).double())))
+    for i in range(len(CONFIG.blocks)):
+        h = getattr(twin, f"layer{i + 1}")(h)
+    logits = twin.fc(h.mean(dim=(2, 3)))
+    score = logits[torch.arange(len(classes)), torch.from_numpy(classes).long()].sum()
+    (grads,) = torch.autograd.grad(score, h)
+    cam = torch.relu((h * grads.mean(dim=(2, 3), keepdim=True)).sum(dim=1, keepdim=True))
+    return torch.nn.functional.interpolate(cam, size=x.shape[2:], mode="bilinear", align_corners=False).detach().numpy()
+
+
+def test_grad_cam_matches_torch():
+    model, params, buffers, x, classes = _eval_case()
+    to64 = lambda t: olaf.tree_map(lambda a: a.astype(np.float64), t)  # noqa: E731
+    spec = lambda t: olaf.tree_map(lambda a: olaf.TensorType(a.shape, olaf.f64), t)  # noqa: E731
+    traced = olaf.trace(lambda p, b, x, c: resnet.grad_cam(model, p, b, x, c), spec(params), spec(buffers), olaf.TensorType(x.shape, olaf.f64), olaf.TensorType(classes.shape, olaf.i32))
+    got, _ = traced.eager(to64(params), to64(buffers), x.astype(np.float64), classes)
+    assert relative(got, torch_grad_cam(params, buffers, x, classes)) < 1e-10
+
+
+@pytest.mark.gpu
+def test_grad_cam_on_device_matches_eager():
+    from olaf.backend.cuda.runtime import CudaProgram
+    from olaf.graph.interp import interpret
+    from olaf.pipeline import lower_graph, to_program
+
+    model, params, buffers, x, classes = _eval_case()
+    spec = lambda t: olaf.tree_map(lambda a: olaf.TensorType(a.shape, olaf.f32), t)  # noqa: E731
+    graph = lower_graph(olaf.trace(lambda p, b, x, c: resnet.grad_cam(model, p, b, x, c), spec(params), spec(buffers), olaf.TensorType(x.shape, olaf.f32), olaf.TensorType(classes.shape, olaf.i32)).graph)
+    arrays = [*olaf.tree_flatten(params)[0], *olaf.tree_flatten(buffers)[0], x, classes]
+    (want,), _ = interpret(graph, arrays)
+    (got,), _ = CudaProgram(to_program(graph)).run(arrays)
+    assert relative(got, want) < 1e-5

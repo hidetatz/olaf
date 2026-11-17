@@ -90,6 +90,18 @@ class ResNet(nn.Module):
         return self._nest({name: layer.init_buffers() for name, layer in self._flat_layers().items() if isinstance(layer, nn.BatchNorm)})
 
     def __call__(self, params, buffers, x, training: bool = True):
+        features, new = self.features(params, buffers, x, training)
+        return self.head(params, features), new
+
+    def head(self, params, h):
+        """Logits from the last stage's feature map (global average pooling, then fc)."""
+        # Global average pooling in f32, rounded once (PyTorch's adaptive_avg_pool2d for bf16).
+        pooled = olaf.mean(olaf.cast(h, DType.f32), axis=(2, 3)) if h.dtype is DType.bf16 else olaf.mean(h, axis=(2, 3))
+        pooled = olaf.cast(pooled, h.dtype) if pooled.dtype is not h.dtype else pooled
+        return self._flat_layers()["fc"](params["fc"], pooled)
+
+    def features(self, params, buffers, x, training: bool = True):
+        """The last stage's feature map [N, C, H, W] and the new buffers (Grad-CAM's target)."""
         layers = self._flat_layers()
         new: dict = {}
 
@@ -113,8 +125,23 @@ class ResNet(nn.Module):
             out = bn(f"{name}.bn2", conv(f"{name}.conv2", out))
             shortcut = bn(f"{name}.downsample.1", conv(f"{name}.downsample.0", h)) if f"{name}.downsample.0" in layers else h
             h = olaf.nn.relu(out + shortcut)
-        # Global average pooling in f32, rounded once (PyTorch's adaptive_avg_pool2d for bf16).
-        pooled = olaf.mean(olaf.cast(h, DType.f32), axis=(2, 3)) if h.dtype is DType.bf16 else olaf.mean(h, axis=(2, 3))
-        pooled = olaf.cast(pooled, h.dtype) if pooled.dtype is not h.dtype else pooled
-        logits = layers["fc"](params["fc"], pooled)
-        return logits, self._nest(new)
+        return h, self._nest(new)
+
+
+def grad_cam(model: ResNet, params, buffers, x, classes, size=None):
+    """Grad-CAM (Selvaraju et al. 2017) on the last stage: the class score's gradient with
+    respect to the feature map, averaged over positions, weighs the channels; the ReLU of the
+    weighted sum is the map, bilinearly upsampled to `size` (default: the input's). classes:
+    i32 [N]. Evaluation mode (running statistics)."""
+    features, _ = model.features(params, buffers, x, training=False)
+
+    def score(a):
+        logits = model.head(params, a)
+        picked = olaf.where(olaf.equal(olaf.iota(logits.shape, axis=1), olaf.broadcast_to(classes.reshape(logits.shape[0], 1), logits.shape)), logits, 0.0)
+        return olaf.sum(picked)
+
+    grads = olaf.grad(score)(features)
+    weights = olaf.mean(grads, axis=(2, 3))
+    N, C, H, W = features.shape
+    cam = olaf.nn.relu(olaf.sum(features * olaf.broadcast_to(weights.reshape(N, C, 1, 1), features.shape), axis=1)).reshape(N, 1, H, W)
+    return nn.interpolate_bilinear(cam, size or tuple(x.shape[2:]))

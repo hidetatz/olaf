@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from olaf.frontend.trace import Tensor, broadcast_to, cast, concat, constant, conv, cos, einsum, pad, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
+from olaf.frontend.trace import Tensor, abs, broadcast_to, cast, concat, constant, conv, conv_transpose, cos, einsum, exp, log, pad, where, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
 from olaf.graph.types import DType
 
 _LETTERS = "abcdefghijklmn"
@@ -254,6 +254,48 @@ class BatchNorm(Module):
         return _to(y, x.dtype), new
 
 
+@dataclass(frozen=True)
+class ConvTranspose(Module):
+    """torch.nn.ConvTranspose{1,2,3}d: weight [in, out/groups, *kernel], optional bias."""
+
+    in_channels: int
+    out_channels: int
+    kernel: tuple[int, ...]
+    stride: int | tuple = 1
+    padding: int | tuple = 0
+    output_padding: int | tuple = 0
+    groups: int = 1
+    bias: bool = True
+    dilation: int | tuple = 1
+    compute: DType | None = None
+
+    def init(self, rng: np.random.Generator) -> dict:
+        # torch computes fan_in from the weight's second axis: out/groups * kernel size.
+        fan_in = self.out_channels // self.groups * int(np.prod(self.kernel))
+        bound = 1.0 / math.sqrt(fan_in)
+        params = {"weight": rng.uniform(-bound, bound, (self.in_channels, self.out_channels // self.groups, *self.kernel)).astype(np.float32)}
+        if self.bias:
+            params["bias"] = rng.uniform(-bound, bound, (self.out_channels,)).astype(np.float32)
+        return params
+
+    def __call__(self, params, x: Tensor) -> Tensor:
+        y = conv_transpose(_to(x, self.compute), _to(params["weight"], self.compute), self.stride, self.padding, self.output_padding, self.dilation, self.groups)
+        if self.bias:
+            b = _to(params["bias"], self.compute)
+            y = y + broadcast_to(b.reshape(self.out_channels, *(1,) * len(self.kernel)), y.shape)
+        return y
+
+
+def leaky_relu(x: Tensor, slope: float = 0.01) -> Tensor:
+    return where(x > 0.0, x, x * slope)
+
+
+def binary_cross_entropy_with_logits(logits: Tensor, targets) -> Tensor:
+    """Mean of max(x, 0) - x * t + log(1 + exp(-|x|)), PyTorch's stable form."""
+    t = targets if isinstance(targets, Tensor) else broadcast_to(constant(float(targets), logits.dtype), logits.shape)
+    return mean(maximum(logits, 0.0) - logits * t + log(exp(neg(abs(logits))) + 1.0))
+
+
 def _strided(x: Tensor, axis: int, start: int, count: int, step: int) -> Tensor:
     """x[..., start : start + count * step : step, ...] along `axis` (no strided slice op: a
     slice, a reshape splitting off the step, and a slice of its first column). x must reach
@@ -315,8 +357,32 @@ def flatten(x: Tensor, start: int = 1) -> Tensor:
     return x.reshape(*x.shape[:start], int(np.prod(x.shape[start:])))
 
 
+def _linear_taps(size_in: int, size_out: int):
+    """Source indices and weights of torch's linear interpolation with align_corners=False:
+    output i samples (i + 0.5) * in / out - 0.5, clamped at 0, between floor and floor + 1."""
+    scale = size_in / size_out
+    src = np.maximum((np.arange(size_out) + 0.5) * scale - 0.5, 0.0)
+    lo = np.minimum(np.floor(src).astype(np.int64), size_in - 1)
+    hi = np.minimum(lo + 1, size_in - 1)
+    frac = (src - lo).astype(np.float64)
+    return lo.astype(np.int32), hi.astype(np.int32), frac
+
+
+def interpolate_bilinear(x: Tensor, size: tuple[int, int]) -> Tensor:
+    """torch.nn.functional.interpolate(x, size, mode="bilinear", align_corners=False) for
+    x [N, C, H, W]: per axis, a gather of the two neighbours and a blend with fixed weights."""
+    for axis, out in ((2, size[0]), (3, size[1])):
+        lo, hi, frac = _linear_taps(x.shape[axis], out)
+        shape = [1] * x.rank
+        shape[axis] = out
+        w = broadcast_to(constant(frac.astype(np.float64 if x.dtype is DType.f64 else np.float32), x.dtype).reshape(*shape), (*x.shape[:axis], out, *x.shape[axis + 1 :]))
+        a, b = take(x, constant(lo), axis=axis), take(x, constant(hi), axis=axis)
+        x = a + (b - a) * w
+    return x
+
+
 def relu(x: Tensor) -> Tensor:
     return maximum(x, 0.0)
 
 
-__all__ = ["BatchNorm", "Conv", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]
+__all__ = ["interpolate_bilinear", "BatchNorm", "Conv", "ConvTranspose", "binary_cross_entropy_with_logits", "leaky_relu", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]

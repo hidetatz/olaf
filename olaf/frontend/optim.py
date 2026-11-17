@@ -65,8 +65,8 @@ class AdamW:
         t = cast(count, DType.f64)
         correction1 = 1.0 - constant(b1, DType.f64) ** t
         correction2 = 1.0 - constant(b2, DType.f64) ** t
-        step_size = cast(constant(self.lr, DType.f64) / correction1, DType.f32)
-        root2 = cast(sqrt(correction2), DType.f32)
+        step_size64 = constant(self.lr, DType.f64) / correction1
+        root2_64 = sqrt(correction2)
         p_leaves, _ = tree_flatten(params)
         g_leaves, _ = tree_flatten(grads)
         updated = []
@@ -74,6 +74,9 @@ class AdamW:
             g = cast(g, p.dtype) if g.dtype is not p.dtype else g
             if self.weight_decay and self.decay(path):
                 p = p * (1.0 - self.lr * self.weight_decay)
+            # The corrections in the parameter's dtype (f32 master weights: rounded once).
+            step_size = step_size64 if p.dtype is DType.f64 else cast(step_size64, p.dtype)
+            root2 = root2_64 if p.dtype is DType.f64 else cast(root2_64, p.dtype)
             m = m_state.read() * b1 + g * (1.0 - b1)
             v = v_state.read() * b2 + g * g * (1.0 - b2)
             m_state.write(m)
