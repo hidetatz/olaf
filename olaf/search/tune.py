@@ -122,6 +122,72 @@ def measure(spec: str, shapes, dtype: str, capability: Capability, schedule: Dot
     return statistics.median(times)
 
 
+def tune_in_program(graph: Graph, capability: Capability, inputs, state, *, top: int = 5, log=print) -> dict[str, DotSchedule]:
+    """Refine the schedules in the context they run in: the whole program, its real operands.
+
+    A dot alone, on fresh contiguous inputs, is not the dot in a training step: there its
+    operands are views of earlier results and its epilogue carries fused work, and the
+    standalone ranking does not carry over (GPT-2 small's dots took the same total time with
+    standalone-tuned and default schedules). For each dot, the `top` standalone candidates are
+    compiled into the whole program in turn and the dot's own launches timed; the fastest stays.
+    Results replace the standalone ones in the cache, marked so they are not searched again.
+    """
+    from olaf.backend.cuda.runtime import CudaProgram, Session, profile
+    from olaf.pipeline import to_program
+
+    schedules = tune(graph, capability, log=log)  # standalone results and the cache
+    done = _load_marks()
+
+    def timed(assignment: dict[str, DotSchedule], key: str) -> float:
+        compiled = CudaProgram(to_program(graph, capability, schedules=assignment))
+        session = Session(compiled, {}, graphs=False)
+        session.load_state(state)
+        runs = []
+        for _ in range(3):
+            total = 0.0
+            for ms, n, label, task in profile(session, inputs, with_tasks=True):
+                if task.origin[2:3] == (key,):
+                    total += ms
+            runs.append(total)
+        return statistics.median(runs)
+
+    for key, (spec, shapes, dtype) in dots(graph, capability).items():
+        if key in done:
+            continue
+        ranked = sorted(((ms, c) for c in candidates(capability) if (ms := measure(spec, shapes, dtype, capability, c)) is not None), key=lambda mc: mc[0])
+        trial = [schedules[key], *[c for _, c in ranked if c != schedules[key]][: top - 1]]
+        best, best_ms = None, None
+        for candidate in trial:
+            ms = timed({**schedules, key: candidate}, key)
+            if best_ms is None or ms < best_ms:
+                best, best_ms = candidate, ms
+        if best_ms == 0.0:
+            done.add(key)  # no launch carries this dot (fused away, e.g. into attention)
+            _save_marks(done)
+            continue
+        schedules[key] = best
+        save(schedules)
+        done.add(key)
+        _save_marks(done)
+        log(f"in program: {spec} {shapes}: {best} ({best_ms:.3f} ms)")
+    return schedules
+
+
+def _marks_path() -> Path:
+    return cache_path().with_name("schedules_in_program.json")
+
+
+def _load_marks() -> set[str]:
+    try:
+        return set(json.loads(_marks_path().read_text()))
+    except Exception:
+        return set()
+
+
+def _save_marks(done: set[str]) -> None:
+    _marks_path().write_text(json.dumps(sorted(done)))
+
+
 def tune(graph: Graph, capability: Capability, *, log=print) -> dict[str, DotSchedule]:
     """Schedules for every dot of the lowered graph: cached ones, and newly searched ones."""
     schedules = load()

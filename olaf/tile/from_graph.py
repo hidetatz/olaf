@@ -461,10 +461,12 @@ class _Converter:
         matrix = len(base) == 1 and any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == next(iter(base)).value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
         bm, bn, bk = MATRIX_DOT_BLOCK if matrix else DOT_BLOCK
         stages, warps = (MATRIX_DOT_STAGES, MATRIX_DOT_WARPS) if matrix else (1, 4)
+        key = None
         if matrix:
             from olaf.search.schedule import dot_key
 
-            chosen = self.schedules.get(dot_key(op.attr("spec"), [v.type.shape for v in op.inputs], next(iter(base)).value, self.capability.digest()))
+            key = dot_key(op.attr("spec"), [v.type.shape for v in op.inputs], next(iter(base)).value, self.capability.digest())
+            chosen = self.schedules.get(key)
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
         extent = {c: 1 for c in size}
@@ -515,7 +517,9 @@ class _Converter:
             result = b.op("permute", result, perm=(1, 0))
         result = b.op("reshape", result, shape=tuple(extent[c] for c in out_labels))
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
-        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=("contract", op.attr("spec")))
+        # The schedule key is recorded so the search can find this dot's launches in a whole program.
+        origin = ("contract", op.attr("spec")) + ((key,) if key else ())
+        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=origin)
         return out
 
     def _matrix_dtype(self, value: Value) -> DType:

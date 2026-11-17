@@ -90,10 +90,10 @@ def olaf_tokens_per_s(tuned: bool = False) -> float:
     graph = lower(traced.graph)
     schedules = None
     if tuned:
-        from olaf.search.tune import tune
+        from olaf.search.tune import tune_in_program
 
         start = time.time()
-        schedules = tune(graph, AMPERE_RTX3060)
+        schedules = tune_in_program(graph, AMPERE_RTX3060, data(1), initial)
         print(f"olaf schedule search: {time.time() - start:.0f} s", flush=True)
     start = time.time()
     compiled = CudaProgram(to_program(graph, AMPERE_RTX3060, schedules=schedules))

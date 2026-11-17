@@ -327,17 +327,19 @@ class Session:
         return [from_device(self.fixed[n], program.buffer(n).type.dtype, self._shape(n)) for n in program.outputs]
 
 
-def profile(session: Session, inputs: Sequence) -> list[tuple[float, int, str]]:
+def profile(session: Session, inputs: Sequence, *, with_tasks: bool = False) -> list:
     """Time every launch of one step on its own: (total ms, launch count, label) per task template.
 
     Launches are timed one at a time with device events, so the sum exceeds a replayed step's
     time by the launch gaps a graph removes; the ranking is what this is for.
+    with_tasks: instead, one (ms, 1, label, task) per launch, in launch order.
     """
     compiled, program = session.compiled, session.compiled.program
     for name, array in zip(program.inputs, inputs):
         session.fixed[name].upload(to_device_bytes(np.asarray(array), program.buffer(name).type.dtype), compiled.stream)
     addresses = session.views[session.parity]
     totals: dict[str, list] = {}
+    per_launch: list = []
     for launch in program.launches:
         offsets = [evaluate(launch.offset(i), session.env) for i in range(len(launch.buffers))]
         kernel = compiled.kernels[launch.task.digest()].select(session.env, offsets)
@@ -351,7 +353,12 @@ def profile(session: Session, inputs: Sequence) -> list[tuple[float, int, str]]:
         shapes = "x".join(str(evaluate(d, session.env)) for d in launch.task.grid)
         general = " (general)" if kernel is not compiled.kernels[launch.task.digest()] or "mma.sync" not in kernel.lowered.text else ""
         label = f"{launch.task.name} grid={shapes} warps={launch.task.warps}{general if launch.task.name == 'contract' else ''}"
+        if with_tasks:
+            per_launch.append((t.ms, 1, label, launch.task))
+            continue
         entry = totals.setdefault(label, [0.0, 0])
         entry[0] += t.ms
         entry[1] += 1
+    if with_tasks:
+        return per_launch
     return sorted(((ms, n, label) for label, (ms, n) in totals.items()), reverse=True)
