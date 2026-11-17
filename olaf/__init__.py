@@ -40,6 +40,7 @@ from olaf.frontend.trace import (
     rsqrt,
     scan,
     scatter_add,
+    silu,
     sin,
     softmax,
     sqrt,

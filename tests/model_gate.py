@@ -44,7 +44,9 @@ class Case:
     """A model in both frameworks. params: olaf's pytree; its flattened paths are the torch
     state_dict names. torch_model(dtype, device) builds the twin; torch_loss(model, *inputs)
     computes its loss from NumPy inputs; olaf_loss(params, *inputs) traces olaf's.
-    autocast: run PyTorch's precision run under torch.autocast(bfloat16)."""
+    autocast: run PyTorch's precision run under torch.autocast(bfloat16).
+    named(tree): olaf parameters (or gradients) as {torch parameter name: array}; by default the
+    flattened paths, models with stacked blocks split them per layer."""
 
     params: dict
     olaf_loss: object
@@ -52,14 +54,22 @@ class Case:
     torch_loss: object
     input_specs: tuple
     autocast: bool = False
+    named: object = None
+
+    def torch_named(self, tree) -> dict:
+        if self.named is not None:
+            return self.named(tree)
+        from olaf.frontend.optim import _paths
+
+        return dict(zip(_paths(tree), olaf.tree_flatten(tree)[0]))
 
 
-def load(model: torch.nn.Module, params) -> None:
-    from olaf.frontend.optim import _paths
-
-    leaves, _ = olaf.tree_flatten(params)
-    state = {path: torch.from_numpy(np.asarray(v)) for path, v in zip(_paths(params), leaves)}
-    model.load_state_dict({k: v.to(model.state_dict()[k].dtype) for k, v in state.items()}, strict=True)
+def load(model: torch.nn.Module, named: dict) -> None:
+    target = model.state_dict()
+    # strict=False: buffers (rotary frequencies) are not parameters; every parameter must be set.
+    missing = {k for k, _ in model.named_parameters()} - set(named)
+    assert not missing, missing
+    model.load_state_dict({k: torch.from_numpy(np.ascontiguousarray(v)).to(target[k].dtype) for k, v in named.items()}, strict=False)
 
 
 def device_program(graph):
@@ -72,7 +82,7 @@ def device_program(graph):
 
 def torch_grads(case: Case, params, inputs, dtype, device, autocast=False):
     model = case.torch_model(dtype, device)
-    load(model, params)
+    load(model, case.torch_named(params))
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
         loss = case.torch_loss(model, *inputs)
     loss.backward()
@@ -86,7 +96,8 @@ def one_step(case: Case, params, inputs) -> tuple[float, dict]:
     specs = olaf.tree_map(lambda a: olaf.TensorType(np.shape(a), olaf.f32), params)
     traced = olaf.trace(lambda p, *xs: olaf.value_and_grad(lambda p: case.olaf_loss(p, *xs))(p), specs, *case.input_specs)
     outputs, _ = device_program(traced.graph).run([*olaf.tree_flatten(params)[0], *inputs])
-    ours = dict(zip(_paths(params), outputs[1:]))
+    _, structure = olaf.tree_flatten(params)
+    ours = case.torch_named(olaf.tree_unflatten(structure, list(outputs[1:])))
     truth_loss, truth = torch_grads(case, params, inputs, torch.float64, "cpu")
     theirs_loss, theirs = torch_grads(case, params, inputs, torch.float32, "cuda", case.autocast)
     ratios = {"loss": abs(float(outputs[0]) - truth_loss) / abs(truth_loss) / max(abs(theirs_loss - truth_loss) / abs(truth_loss), FLOOR)}
@@ -95,11 +106,12 @@ def one_step(case: Case, params, inputs) -> tuple[float, dict]:
     return max(ratios.values()), ratios
 
 
-def olaf_curve(case: Case, make_optimizer, batches) -> list[float]:
+def olaf_curve(case: Case, make_optimizer, batches, compiled=None) -> list[float]:
+    """compiled: a program from an earlier case of the same model (only the values differ)."""
     from olaf.backend.cuda.runtime import Session
 
     traced, initial = olaf.train_step(case.olaf_loss, case.params, make_optimizer, *case.input_specs)
-    session = Session(device_program(traced.graph), {}, graphs=False)
+    session = Session(compiled or device_program(traced.graph), {})
     session.load_state(initial)
     losses = []
     for inputs in batches:
@@ -110,7 +122,7 @@ def olaf_curve(case: Case, make_optimizer, batches) -> list[float]:
 
 def torch_curve(case: Case, make_optimizer, batches, dtype, device, autocast=False) -> list[float]:
     model = case.torch_model(dtype, device)
-    load(model, case.params)
+    load(model, case.torch_named(case.params))
     opt = make_optimizer(model)
     losses = []
     for inputs in batches:
@@ -127,9 +139,12 @@ def curve(make_case, olaf_optimizer, torch_optimizer, make_batches, seeds=range(
     """make_case(seed) -> Case and make_batches(seed) -> batches. Returns the ratio of the median
     distances to the f64 truth, and per-seed details."""
     d_ours, d_theirs, details = [], [], []
+    compiled = None
     for seed in seeds:
         case, batches = make_case(seed), make_batches(seed)
-        ours = olaf_curve(case, olaf_optimizer, batches)
+        if compiled is None:
+            compiled = device_program(olaf.train_step(case.olaf_loss, case.params, olaf_optimizer, *case.input_specs)[0].graph)
+        ours = olaf_curve(case, olaf_optimizer, batches, compiled)
         truth = torch_curve(case, torch_optimizer, batches, torch.float64, "cpu")
         theirs = torch_curve(case, torch_optimizer, batches, torch.float32, "cuda", case.autocast)
         d_ours.append(relative(ours, truth))

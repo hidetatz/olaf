@@ -412,6 +412,11 @@ def gelu(x: Tensor, approximate: str = "none") -> Tensor:
     return _emit("gelu", x, approximate=approximate)
 
 
+def silu(x: Tensor) -> Tensor:
+    """x * sigmoid(x) (torch.nn.functional.silu; computed in f32 for bf16 inputs, rounded once)."""
+    return _emit("silu", x)
+
+
 def layernorm(x: Tensor, weight: Tensor | None = None, bias: Tensor | None = None, axes=-1, eps: float = 1e-5) -> Tensor:
     inputs = (x,) if weight is None else (x, weight, bias)
     return _emit("layernorm", *inputs, axes=_axes(x, axes), eps=float(eps))

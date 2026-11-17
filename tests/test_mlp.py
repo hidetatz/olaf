@@ -62,7 +62,7 @@ def test_eager_forward_and_backward_match_torch_f64():
     traced = olaf.trace(lambda p, x, y: olaf.value_and_grad(lambda p: c.olaf_loss(p, x, y))(p), specs, olaf.TensorType((BATCH, 784), olaf.f64), SPECS[1])
     (loss, grads), _ = traced.eager(params64, x.astype(np.float64), y)
     model = torch_model(torch.float64, "cpu")
-    load(model, c.params)
+    load(model, c.torch_named(c.params))
     reference = torch_loss(model, x.astype(np.float64), y)
     reference.backward()
     assert abs(float(loss) - reference.item()) < 1e-10 * abs(reference.item())

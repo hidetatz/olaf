@@ -400,6 +400,13 @@ def _infer_gelu(inputs, attrs, regions):
     return [inputs[0]]
 
 
+@_register("silu", composite=True)
+def _infer_silu(inputs, attrs, regions):
+    _arity(inputs, 1, "silu")
+    _check(inputs[0].dtype.is_float, f"silu is float-only: {inputs[0]}")
+    return [inputs[0]]
+
+
 @_register("layernorm", composite=True)
 def _infer_layernorm(inputs, attrs, regions):
     # Inputs are x, or x, weight, bias. weight and bias match the normalized dimensions.

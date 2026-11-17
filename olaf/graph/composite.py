@@ -104,6 +104,18 @@ def _gelu(b, inputs, attrs):
     return [b.op("mul", b.op("mul", half, x), b.op("add", one, inner))]
 
 
+def sigmoid(b: GraphBuilder, x: Value) -> Value:
+    # 1 / (1 + exp(-x)): for x below about -88, exp(-x) overflows to inf in f32 and the result is
+    # 0, the correctly rounded value; no branch on the sign is needed.
+    return b.op("recip", b.op("add", b.full_like(x, 1.0), b.op("exp", b.op("neg", x))))
+
+
+@_rule("silu")
+def _silu(b, inputs, attrs):
+    x = inputs[0]
+    return [b.op("mul", x, sigmoid(b, x))]
+
+
 def gelu_tanh_argument(b: GraphBuilder, x: Value) -> Value:
     # x*x*x rather than pow(x, 3): pow lowers to exp and log on devices, and its VJP adds a log path.
     cube = b.op("mul", b.op("mul", x, x), x)

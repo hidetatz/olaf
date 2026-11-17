@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
-from olaf.graph.composite import attention_probabilities, attention_scores, round_probabilities, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, widen_bf16
+from olaf.graph.composite import attention_probabilities, attention_scores, round_probabilities, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, sigmoid, widen_bf16
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 from olaf.graph.types import DType
@@ -552,6 +552,15 @@ def _gelu(b, op, c):
         dt = b.op("mul", b.op("sub", one, b.op("mul", t, t)), du)
         slope = b.op("mul", half, b.op("add", b.op("add", one, t), b.op("mul", x, dt)))
     return [b.op("mul", c, slope)]
+
+
+@_rule("silu")
+def _silu(b, op, c):
+    # d/dx x s(x) = s (1 + x (1 - s)), with s the sigmoid of the forward decomposition.
+    x = op.inputs[0]
+    s = sigmoid(b, x)
+    one = b.full_like(x, 1.0)
+    return [b.op("mul", c, b.op("mul", s, b.op("add", one, b.op("mul", x, b.op("sub", one, s)))))]
 
 
 @_rule("layernorm")
