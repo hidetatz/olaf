@@ -76,8 +76,10 @@ class Case:
 
 def load(model: torch.nn.Module, named: dict) -> None:
     target = model.state_dict()
-    # strict=False: buffers (rotary frequencies) are not parameters; every parameter must be set.
-    missing = {k for k, _ in model.named_parameters()} - set(named)
+    # strict=False: buffers (rotary frequencies) are not parameters, and fixed parameters
+    # (requires_grad=False, as Whisper's encoder positions) may be left as initialized or set;
+    # every trained parameter must be set.
+    missing = {k for k, p in model.named_parameters() if p.requires_grad} - set(named)
     assert not missing, missing
     model.load_state_dict({k: torch.from_numpy(np.ascontiguousarray(v)).to(target[k].dtype) for k, v in named.items()}, strict=False)
 
@@ -96,7 +98,7 @@ def torch_grads(case: Case, params, inputs, dtype, device, autocast=False):
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=autocast):
         loss = case.torch_loss(model, *inputs)
     loss.backward()
-    return loss.item(), {k: p.grad.detach().cpu().double().numpy() for k, p in model.named_parameters()}
+    return loss.item(), {k: p.grad.detach().cpu().double().numpy() for k, p in model.named_parameters() if p.requires_grad}
 
 
 def one_step(case: Case, params, inputs) -> tuple[float, dict]:
