@@ -203,6 +203,37 @@ def _placed(ref: Ref, shape, dims):
     return tuple((moved.get(a) if a is not None else None, s) for a, s in ref.view.source)
 
 
+def _physical_order(view: View) -> tuple[int, ...] | None:
+    """The view's axes from outermost to innermost in memory, when that is not the logical
+    order; None when it is, or when the view has no such order (padding, broadcast or
+    overlapping axes, symbolic strides). Size-1 axes go first: they do not move in memory."""
+    rank = view.rank
+    if view.pad is not None or not all(isinstance(d, int) for d in (*view.shape, *view.strides)):
+        return None
+    moving = [a for a in range(rank) if view.shape[a] != 1]
+    if any(view.strides[a] <= 0 for a in moving):
+        return None
+    order = sorted(moving, key=lambda a: -view.strides[a])
+    if order == moving:
+        return None
+    for outer, inner in zip(order, order[1:]):
+        if view.strides[outer] < view.strides[inner] * view.shape[inner]:
+            return None
+    return (*(a for a in range(rank) if view.shape[a] == 1), *order)
+
+
+def _permuted(ref: Ref, perm) -> Ref:
+    """ref with new axis i = old axis perm[i] (as the permute op)."""
+    v = ref.view
+    pad = tuple(v.pad[p] for p in perm) if v.pad is not None else None
+    source = tuple((None if a is None else perm.index(a), s) for a, s in v.source) if v.source is not None else None
+    return replace(ref, view=View(tuple(v.shape[p] for p in perm), tuple(v.strides[p] for p in perm), v.offset, pad, v.fill, source))
+
+
+def _inverse(perm) -> tuple[int, ...]:
+    return tuple(perm.index(i) for i in range(len(perm)))
+
+
 def to_tile(graph: Graph, capability: Capability = CPU, schedules=None) -> Program:
     """Default tile shapes come from the capability: matrix instructions change the dot tiles.
 
@@ -221,6 +252,8 @@ class _Converter:
         self.launches: list[Launch] = []
         self.refs: dict[Value, Ref] = {}
         self.states: dict[str, Ref] = {}
+        self._grids: dict[tuple, Ref] = {}
+        self._plain: dict[tuple, Ref] = {}  # one copy per padded view (a pooling's windows share it)
 
     # -- buffers and tasks ----------------------------------------------------------------------
 
@@ -254,8 +287,25 @@ class _Converter:
         return self.elementwise("copy", TensorType(ref.shape, ref.dtype), [ref], lambda b, t, s, ts: t[0], out=out)
 
     def plain(self, ref: Ref) -> Ref:
-        """A ref without padding, for view ops that do not compose with pad."""
-        return self.materialize(ref) if ref.view.pad is not None else ref
+        """A ref without padding, for view ops that do not compose with pad. Materialized in
+        the view's memory order: a pooling's padded channels-last input copied channels-first
+        was a transpose, and its writer could not store into it directly."""
+        if ref.view.pad is None:
+            return ref
+        key = (ref.buffer, ref.view, ref.dtype)
+        if key not in self._plain:
+            self._plain[key] = self._unpadded(ref)
+        return self._plain[key]
+
+    def _unpadded(self, ref: Ref) -> Ref:
+        interior = tuple(d - lo - hi for d, (lo, hi) in zip(ref.shape, ref.view.pad))
+        order = _physical_order(replace(ref.view, shape=interior, pad=None, source=None))
+        if order is None:
+            return self.materialize(ref)
+        physical = TensorType(tuple(ref.shape[a] for a in order), ref.dtype)
+        out = self.new_buffer(physical, BufferKind.temp)
+        self.elementwise("copy", physical, [_permuted(ref, order)], lambda b, t, s, ts: t[0], out=out)
+        return _permuted(out, _inverse(order))
 
     # -- driver ---------------------------------------------------------------------------------
 
@@ -290,7 +340,49 @@ class _Converter:
 
     def _pointwise(self, op: Op, inputs: list[Ref]) -> Ref:
         attrs = {k: v for k, v in op.attrs}
-        return self.elementwise(op.kind, op.outputs[0].type, inputs, lambda b, t, s, ts: b.op(op.kind, *t, **attrs))
+        out_type = op.outputs[0].type
+        # Axes every input broadcasts along: computed once and broadcast again (a global
+        # pool's gradient is [N, C] spread over H x W; materialized, its layout also had no
+        # input to follow and pulled the backward pass to channels-first).
+        spread = [a for a, d in enumerate(out_type.shape) if d != 1 and all(r.view.strides[a] == 0 and (r.view.pad is None or r.view.pad[a] == (0, 0)) for r in inputs)]
+        if spread and inputs:
+            small = tuple(1 if a in spread else d for a, d in enumerate(out_type.shape))
+            narrowed = [replace(r, view=replace(r.view, shape=small, pad=r.view.pad)) for r in inputs]
+            out = self._pointwise_ref(op.kind, attrs, TensorType(small, out_type.dtype), narrowed)
+            v = out.view
+            strides = tuple(0 if a in spread else st for a, st in enumerate(v.strides))
+            source = tuple((None, 0) if c in spread else (c, st) for c, st in v.source) if v.source is not None else None
+            return replace(out, view=View(tuple(out_type.shape), strides, v.offset, v.pad, v.fill, source))
+        return self._pointwise_ref(op.kind, attrs, out_type, inputs)
+
+    def _pointwise_ref(self, kind: str, attrs: dict, out_type: TensorType, inputs: list[Ref]) -> Ref:
+        order = self._layout(out_type.shape, inputs)
+        if order is None:
+            return self.elementwise(kind, out_type, inputs, lambda b, t, s, ts: b.op(kind, *t, **attrs))
+        physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
+        out = self.elementwise(kind, physical, [_permuted(r, order) for r in inputs], lambda b, t, s, ts: b.op(kind, *t, **attrs))
+        return _permuted(out, _inverse(order))
+
+    def _layout(self, shape, inputs: list[Ref]) -> tuple[int, ...] | None:
+        """The memory order a pointwise result takes: its inputs' (full-shape inputs only, by
+        bytes; a tie keeps the logical order), or None for the logical order.
+
+        A result laid out logically from a permuted input reads it with strided loads (an
+        elementwise tile runs along the last logical axis) and hands the permutation to its
+        reader as a copy: a convolution computes channels-last, and laid out channels-first
+        its batch norm and ReLU read it across channels and the next convolution copied the
+        result back to channels-last (ResNet-18: two copies per convolution).
+        """
+        votes: dict[tuple[int, ...] | None, int] = {}
+        for r in inputs:
+            if tuple(r.shape) != tuple(shape) or r.view.pad is not None or any(st == 0 and d != 1 for st, d in zip(r.view.strides, r.shape)):
+                continue
+            order = _physical_order(r.view)
+            votes[order] = votes.get(order, 0) + np.dtype(r.dtype.numpy).itemsize
+        if not votes:
+            return None
+        best = max(votes.values())
+        return None if votes.get(None) == best else max(votes, key=lambda o: votes[o])
 
     def _op_iota(self, op: Op, inputs: list[Ref]) -> Ref:
         axis, dtype = op.attr("axis"), op.attr("dtype")
@@ -340,6 +432,8 @@ class _Converter:
         if unit is not None:
             return replace(ref, view=unit)
         if not ref.view.is_contiguous:
+            if ref.view.pad is not None:
+                ref = self.plain(ref)  # in memory order, then maybe viewable as `shape`
             strides = _reshaped_strides(ref.view, shape)
             if strides is not None:
                 return replace(ref, view=View(tuple(shape), strides, ref.view.offset))
@@ -384,6 +478,19 @@ class _Converter:
     def _op_reduce(self, op: Op, inputs: list[Ref]) -> Ref:
         (ref,) = inputs
         fn, axes = op.attr("fn"), op.attr("axes")
+        order = _physical_order(ref.view)
+        if order is None:
+            return self._reduce_split(ref, fn, axes, op.outputs[0].type)
+        # Reduced in memory order (a channels-last batch norm statistic is a column sum over
+        # contiguous channels, not a strided row sum over W), the kept axes in that order too.
+        kept = [a for a in order if a not in axes]
+        out_type = op.outputs[0].type
+        physical = TensorType(tuple(ref.shape[a] for a in kept), out_type.dtype)
+        result = self._reduce_split(_permuted(ref, order), fn, tuple(sorted(order.index(a) for a in axes)), physical)
+        logical = [a for a in range(ref.view.rank) if a not in axes]
+        return _permuted(result, tuple(kept.index(a) for a in logical))
+
+    def _reduce_split(self, ref: Ref, fn: str, axes, out_type: TensorType) -> Ref:
         split = self._split(ref, axes)
         if split is not None:
             # Two passes: P slices of one reduced axis in parallel, then the P partials.
@@ -393,7 +500,12 @@ class _Converter:
             shape = (*v.shape[:axis], parts, size // parts, *v.shape[axis + 1 :])
             strides = (*v.strides[:axis], v.strides[axis] * (size // parts), v.strides[axis], *v.strides[axis + 1 :])
             pad = None if v.pad is None else (*v.pad[:axis], (0, 0), (0, 0), *v.pad[axis + 1 :])
-            sliced = replace(ref, view=View(shape, strides, v.offset, pad, v.fill))
+            # Parts of one element keep a source map (the part index is the old index), so
+            # a pointwise producer can still be inlined into the first pass.
+            source = None
+            if v.source is not None and size // parts == 1:
+                source = tuple((None if a is None else a if a <= axis else a + 1, st) for a, st in v.source)
+            sliced = replace(ref, view=View(shape, strides, v.offset, pad, v.fill, source))
             inner_axes = tuple(a if a < axis else a + 1 for a in axes)
             kept_shape = tuple(d for i, d in enumerate(shape) if i not in inner_axes)
             # Partial sums stay in the accumulator dtype: rounding them to bf16 and again after
@@ -401,8 +513,8 @@ class _Converter:
             partial_dtype = accumulator_dtype(ref.dtype) if fn == "sum" else ref.dtype
             partial = self._reduce(sliced, fn, inner_axes, TensorType(kept_shape, partial_dtype))
             position = sum(1 for a in range(axis) if a not in axes)
-            return self._reduce(partial, fn, (position,), op.outputs[0].type)
-        return self._reduce(ref, fn, axes, op.outputs[0].type)
+            return self._reduce(partial, fn, (position,), out_type)
+        return self._reduce(ref, fn, axes, out_type)
 
     def _split(self, ref: Ref, axes) -> tuple[int, int] | None:
         """(axis, parts) when a reduction would leave most of the device idle, else None.
@@ -424,8 +536,14 @@ class _Converter:
         if blocks >= 2 * units:
             return None
         axis = max(axes, key=lambda a: shape[a])
+        # Each part still reduces the other reduced axes: a channels-last batch norm statistic
+        # over [N, H, W, C] splits N into parts of one image each, H x W rows apiece. Counting
+        # only the split axis (parts of 64 or more) left it 2 parts of 64 x 32 x 32 rows, and
+        # each lane summed thousands of values in sequence (f32 rounding error grows with that
+        # count; YOLO's f32 training gate failed at 2.3x PyTorch's error).
+        rest = math.prod(shape[a] for a in axes if a != axis)
         parts = 1
-        while blocks * parts * 2 <= self.capability.tuning.split_blocks_per_unit * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
+        while blocks * parts * 2 <= self.capability.tuning.split_blocks_per_unit * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) * rest >= 64:
             parts *= 2
         return (axis, parts) if parts > 1 else None
 
@@ -635,8 +753,11 @@ class _Converter:
         out_type = op.outputs[0].type
         out_spatial = out_type.shape[2:]
         kernel = w.shape[2:]
-        out = self.new_buffer(out_type, BufferKind.temp)
-        os_ = contiguous_strides(out_type.shape)
+        # Assembled channels-last, like the phases' own results (and the next layer's grid).
+        order = (0, *range(2, 2 + n), 1)
+        physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
+        out = _permuted(self.new_buffer(physical, BufferKind.temp), _inverse(order))
+        os_ = out.view.strides
         w = self.plain(w)
         for phase in np.ndindex(*ld):
             taps, lows, highs, counts, firsts = [], [], [], [], []
@@ -651,7 +772,8 @@ class _Converter:
                 counts.append(m)
                 lows.append(-base)
                 highs.append(m - 1 + t - x.shape[2 + i] + base)
-            target = View((*out_type.shape[:2], *counts), (os_[0], os_[1], *(st * s_ for st, s_ in zip(os_[2:], ld))), sum(r * st for r, st in zip(phase, os_[2:])))
+            # In memory order ([N, *counts, C]): the copy runs along the channels on both sides.
+            target = View((out_type.shape[0], *counts, out_type.shape[1]), (os_[0], *(st * s_ for st, s_ in zip(os_[2:], ld)), os_[1]), sum(r * st for r, st in zip(phase, os_[2:])))
             if 0 in counts:
                 continue
             if 0 in taps:
@@ -662,9 +784,38 @@ class _Converter:
             phase_type = TensorType((*out_type.shape[:2], *counts), out_type.dtype)
             attrs = {"stride": (1,) * n, "padding": tuple(zip(lows, highs)), "dilation": (1,) * n, "lhs_dilation": (1,) * n, "groups": g}
             phase_op = Op("conv", (Value(TensorType(x.shape, x.dtype)), Value(TensorType(sub.shape, w.dtype))), (Value(phase_type),), make_attrs(attrs))
-            result = self._op_conv(phase_op, [x, sub])
-            self.elementwise("copy", phase_type, [result], lambda b, t, s, ts: t[0], out=replace(out, view=target))
+            result = _permuted(self._op_conv(phase_op, [x, sub]), order)
+            self.elementwise("copy", TensorType(target.shape, out_type.dtype), [result], lambda b, t, s, ts: t[0], out=replace(out, view=target))
         return out
+
+    def _padded_grid(self, x: Ref, order, padding, tail: int) -> Ref:
+        """x [N, C, *spatial] (axes listed by `order` as batch, spatial..., channels) copied,
+        padded, to a flat channels-last [N, *padded, C] buffer with `tail` unwritten elements
+        after it (see _conv_grid_rows). One grid per input and padding: the forward conv and
+        its weight gradient's both read the forward's input padded the same way, and copied it
+        twice. The source view has a source map, so the copy's writer can store into the grid
+        directly (tile.normalize.eliminate_copies)."""
+        src = self.plain(x)
+        shape = tuple(src.shape[i] for i in order)
+        pad = ((0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding), (0, 0))
+        padded_shape = tuple(lo + d + hi for d, (lo, hi) in zip(shape, pad))
+        permuted = _permuted(src, tuple(order))
+        key = (src.buffer, permuted.view, pad)
+        known = self._grids.get(key)
+        if known is not None and math.prod(self.buffers[known.buffer].type.shape) >= math.prod(padded_shape) + tail:
+            return known
+        # The tail as whole extra images: the buffer keeps the grid's axes, so views of it have
+        # source maps (which moving the copy's writer into it needs).
+        extra = -(-tail // math.prod(padded_shape[1:])) if tail else 0
+        base = self.new_buffer(TensorType((padded_shape[0] + extra, *padded_shape[1:]), x.dtype), BufferKind.temp)
+        source = permuted.view.source
+        for axis, (lo, _) in enumerate(pad):
+            source = _shifted(source, axis, -lo)
+        view = View(padded_shape, permuted.view.strides, permuted.view.offset, pad, 0.0, source)
+        into = full_view(padded_shape)
+        self.elementwise("copy", TensorType(padded_shape, x.dtype), [replace(src, view=view)], lambda b, t, s, ts: t[0], out=replace(base, view=into))
+        self._grids[key] = base
+        return base
 
     def _spread_into(self, x: Ref, shape, strides, offset, padding, lhs_dilation, dtype, order=None) -> Ref:
         """A zeroed buffer of `shape` holding x's elements at `strides` (in x's [N, C, *spatial]
@@ -691,8 +842,8 @@ class _Converter:
         affine in m, so per image the windows are a [plane, KH, KW * C] operand whose
         reduction is contiguous (KW * C when undilated; C stays 16-byte aligned for the async
         copies, which a channels-first layout cannot give: its kernel offsets shift rows by
-        single elements). The result is [N, O, plane], the output's channels-first layout with
-        a row stride of Wp, so nothing is copied after. The positions outside the valid
+        single elements). The result is [N, plane, O], channels-last with a row stride of Wp,
+        read through a view as [N, O, *spatial]; its pointwise readers keep that layout. The positions outside the valid
         outputs are computed and dropped: (Hp * Wp) / (OH * OW) - 1 extra work, 7% for a padded
         3x3 over 56x56, 56% over 8x8. A stride s is computed at stride 1 and subsampled (s^n the
         work; cuDNN does better there). The buffer's tail is padded so the last rows' windows
@@ -716,14 +867,7 @@ class _Converter:
             # One pass writes the whole grid: the input read through a padded view (zeros
             # outside it), channels last. The tail past the grid is left unwritten: only rows
             # outside the valid outputs read it, and those are dropped.
-            base = self.new_buffer(TensorType(((N * plane + reach) * C,), x.dtype), BufferKind.temp)
-            src = self.plain(x)
-            order = (0, *range(2, 2 + n), 1)
-            padded_shape = (N, *spread, C)
-            pad = ((0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding), (0, 0))
-            source = replace(src, view=View(padded_shape, tuple(src.view.strides[i] for i in order), src.view.offset, pad, 0.0))
-            into = View(padded_shape, contiguous_strides(padded_shape), 0)
-            self.elementwise("copy", TensorType(padded_shape, x.dtype), [source], lambda b, t, s, ts: t[0], out=replace(base, view=into))
+            base = self._padded_grid(x, (0, *range(2, 2 + n), 1), padding, reach * C)
         else:
             base = self._spread_into(
                 x,
@@ -762,14 +906,13 @@ class _Converter:
         w_strides = [ws[0], *ws[1 : (n if merged else n + 1)], 1]
         weights = Ref(wt.buffer, View(tuple(w_shape), tuple(w_strides), 0), w.dtype)
         k_order = labels[1:] if across else labels[2:]
-        spec = f"{labels},o{k_order}->" + ("mo" if across else "nom")
-        rows_type = TensorType((N * plane, O) if across else (N, O, plane), out_type.dtype)
+        spec = f"{labels},o{k_order}->" + ("mo" if across else "nmo")
+        rows_type = TensorType((N * plane, O) if across else (N, plane, O), out_type.dtype)
         contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(rows_type),), make_attrs({"spec": spec}))
         result = self._op_contract(contract, [windows, weights])
-        if across:
-            view = View(tuple(out_type.shape), (plane * O, 1, *(st * r * O for st, r in zip(stride, row))), result.view.offset)
-            return self.materialize(replace(result, view=view))
-        view = View(tuple(out_type.shape), (O * plane, plane, *(st * r for st, r in zip(stride, row))), result.view.offset)
+        # Left channels-last: pointwise readers follow that layout (_layout), and the next
+        # convolution's grid is channels-last too.
+        view = View(tuple(out_type.shape), (plane * O, 1, *(st * r * O for st, r in zip(stride, row))), result.view.offset)
         return replace(result, view=view)
 
     def _conv_im2col(self, x: Ref, w: Ref, base: Ref, op: Op, spread, row, start) -> Ref:
@@ -800,7 +943,7 @@ class _Converter:
         result = self._op_contract(contract, [rows, weights])
         positions = contiguous_strides(out_spatial)
         view = View(tuple(out_type.shape), (math.prod(out_spatial) * O, 1, *(p * O for p in positions)), result.view.offset)
-        return self.materialize(replace(result, view=view))
+        return replace(result, view=view)
 
     def _swapped_layout(self, ref: Ref) -> Ref:
         """ref [A, B, ...] copied to memory laid out [B, A, ...] (and still read as [A, B, ...]).
@@ -839,13 +982,7 @@ class _Converter:
         out_type = op.outputs[0].type
         # The forward's input, padded, channels-last: [Nf, *spread, Cf].
         start = sum(max(-lo, 0) * r for (lo, _), r in zip(padding, row))
-        base = self.new_buffer(TensorType((Nf * plane * Cf,), xc.dtype), BufferKind.temp)
-        src = self.plain(xc)
-        order = (1, *range(2, 2 + n), 0)
-        padded_shape = (Nf, *spread, Cf)
-        pad = ((0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding), (0, 0))
-        source = replace(src, view=View(padded_shape, tuple(src.view.strides[i] for i in order), src.view.offset, pad, 0.0))
-        self.elementwise("copy", TensorType(padded_shape, xc.dtype), [source], lambda b, t, s, ts: t[0], out=replace(base, view=View(padded_shape, contiguous_strides(padded_shape), 0)))
+        base = self._padded_grid(xc, (1, *range(2, 2 + n), 0), padding, 0)
         # cols[nf, *outf, *kern, cf] = x[nf, outf * d + kern * s, cf] (this conv's stride s applies
         # to its output, the forward's kernel; its dilation d to its kernel, the forward's output).
         shape = (Nf, *outf, *kern, Cf)
@@ -873,6 +1010,61 @@ class _Converter:
         else:
             result = replace(result, view=View((KK, Of), (Of, 1), result.view.offset))
         # [(*kern, Cf), Of] read as this conv's output [Cf, Of, *kern].
+        ks = contiguous_strides(kern)
+        return self._swapped_layout(replace(result, view=View(tuple(out_type.shape), (Of, 1, *(k * Cf * Of for k in ks)), result.view.offset)))
+
+    def _conv_reduce_windows(self, op: Op, inputs: list[Ref], spread, row, plane) -> Ref:
+        """A weight gradient's conv read straight from the forward's channels-last grid.
+
+        In the forward's terms (see _conv_reduce_im2col) dW[u, v, c, o] = sum over n, h, w of
+        grid[n, h * s + u * d, w * s + v * d, c] * dY[n, h, w, o]: the windows are a view of
+        the grid (the one the forward conv read, _padded_grid), its last kernel axis merged
+        with the channels (KW * C contiguous), so nothing is copied, where im2col wrote KH *
+        KW times the input. The reduction runs over n, h and w, with w the inner, pipelined
+        axis: used when the forward's output rows are at least a 16-wide matrix tile (shorter
+        rows would pad every k step; im2col merges h and w there). The batch is split into
+        chunks reduced in parallel, then summed, as the output is a few dot tiles.
+        """
+        from olaf.graph.builder import make_attrs
+
+        xc, wc = inputs  # xc [Cf, Nf, *in], wc [Of, Nf, *outf] in the forward's names
+        stride, padding, dilation = (op.attr(k) for k in ("stride", "padding", "dilation"))
+        n = len(stride)
+        Cf, Nf = xc.shape[:2]
+        Of = wc.shape[0]
+        outf = tuple(wc.shape[2:])
+        kern = tuple(op.outputs[0].type.shape[2:])
+        out_type = op.outputs[0].type
+        start = sum(max(-lo, 0) * r for (lo, _), r in zip(padding, row))
+        tail = start + sum(((o - 1) * d + (k - 1) * st) * r for o, k, d, st, r in zip(outf, kern, dilation, stride, row)) + 1 - plane
+        base = self._padded_grid(xc, (1, *range(2, 2 + n), 0), padding, max(tail, 0) * Cf)
+        KK = kern[-1] * Cf
+        tiles = math.prod(kern[:-1]) * -(-KK // 128) * -(-Of // 128)
+        chunks = 1
+        while tiles * chunks * 2 <= 4 * self.capability.roofline.compute_units and Nf % (chunks * 2) == 0:
+            chunks *= 2
+        per = Nf // chunks
+        a_shape = (chunks, per, *outf, *kern[:-1], KK)
+        a_strides = (per * plane * Cf, plane * Cf, *(d * r * Cf for d, r in zip(dilation, row)), *(st * r * Cf for st, r in zip(stride[:-1], row[:-1])), 1)
+        a = Ref(base.buffer, View(a_shape, a_strides, start * Cf), xc.dtype)
+        ds = wc.view.strides
+        b = Ref(wc.buffer, View((chunks, per, *outf, Of), (per * ds[1], ds[1], *ds[2:], ds[0]), wc.view.offset), wc.dtype)
+        if wc.view.pad is not None:
+            b = replace(self.materialize(wc), dtype=wc.dtype)
+            ds = b.view.strides
+            b = Ref(b.buffer, View((chunks, per, *outf, Of), (per * ds[1], ds[1], *ds[2:], ds[0]), 0), wc.dtype)
+        positions, kernels = "hwz"[:n], "uvy"[: n - 1]
+        acc = accumulator_dtype(out_type.dtype)
+        partial_type = TensorType((chunks, *kern[:-1], KK, Of), acc if chunks > 1 else out_type.dtype)
+        spec = f"sn{positions}{kernels}k,sn{positions}o->s{kernels}ko"
+        contract = Op("contract", (Value(TensorType(a.shape, xc.dtype)), Value(TensorType(b.shape, wc.dtype))), (Value(partial_type),), make_attrs({"spec": spec}))
+        result = self._op_contract(contract, [a, b])
+        summed = (*kern[:-1], KK, Of)
+        if chunks > 1:
+            result = self._reduce(result, "sum", (0,), TensorType(summed, out_type.dtype))
+        else:
+            result = replace(result, view=View(summed, contiguous_strides(summed), result.view.offset))
+        # [*kern, Cf, Of] read as this conv's output [Cf, Of, *kern].
         ks = contiguous_strides(kern)
         return self._swapped_layout(replace(result, view=View(tuple(out_type.shape), (Of, 1, *(k * Cf * Of for k in ks)), result.view.offset)))
 
@@ -905,6 +1097,13 @@ class _Converter:
         # In the forward's terms the grid wastes plane / (its output positions, here the kernel).
         if all(ld == 1 for ld in lhs_dilation) and cols_bytes <= IM2COL_BYTES and plane / math.prod(w.shape[2:]) > IM2COL_WASTE:
             return self._conv_reduce_im2col(op, inputs, spread, row, plane)
+        # Otherwise the grid itself, through window views, where the output rows fill a matrix
+        # tile. Measured against im2col where both apply, the windows lost with few channels
+        # (MNIST's first weight gradient, 1 channel and a 5x5 kernel: 0.57 ms against 0.04),
+        # so im2col keeps the cases above; against the channels-first grid below they won
+        # (YOLO's step: 4.9 ms against 6.5).
+        if all(ld == 1 for ld in lhs_dilation) and stride[-1] == 1 and w.shape[-1] >= 16:
+            return self._conv_reduce_windows(op, inputs, spread, row, plane)
         K = C * plane
         tiles = math.prod(out_spatial) * -(-N // 128) * -(-O // 128)
         chunks = 1

@@ -139,6 +139,192 @@ def eliminate_copies(program: Program) -> Program:
     return replace(program, buffers=kept, launches=tuple(out), outputs=tuple(rename.get(n, n) for n in program.outputs))
 
 
+def eliminate_pad_copies(program: Program) -> Program:
+    """Let a value's writer store straight into the padded (and permuted) copy of it.
+
+    A convolution reads its input from a zero-padded channels-last grid (tile.from_graph,
+    _padded_grid), and copying the input there was a pass over every activation, forward and
+    backward (ResNet-18: about 30 such copies). When the copied buffer is a temp written once,
+    through its full view, and the copy reads all of it through a view with a source map (a
+    permutation and padding, nothing cropped or repeated), the writer can store each element
+    where the copy would have put it; every other reader reads the grid through its view
+    restrided the same way; only the border is left to write, by fill tasks over its slabs.
+    """
+    from olaf.tile.ir import full_view
+
+    buffers = {b.name: b for b in program.buffers}
+    launches = list(program.launches)
+    touches: dict[str, list[int]] = {}
+    writers: dict[str, list[int]] = {}
+    for i, launch in enumerate(launches):
+        for name, arg in zip(launch.buffers, launch.task.args):
+            touches.setdefault(name, []).append(i)
+            if arg.writes:
+                writers.setdefault(name, []).append(i)
+    replaced: dict[int, list[Launch]] = {}
+    moved: dict[str, tuple] = {}  # src -> (grid, the copy's write view, _interior_map, src shape)
+    for i, launch in enumerate(launches):
+        if launch.task.origin != ("copy",) or launch.offsets or len(launch.buffers) != 2 or not _pure_copy(launch.task):
+            continue
+        (src, read), (dst, write) = zip(launch.buffers, launch.task.args)
+        if read.writes or not write.writes or src in moved or dst in moved or any(m[0] in (src, dst) for m in moved.values()):
+            continue
+        a, b = buffers[src], buffers[dst]
+        if a.kind is not BufferKind.temp or b.kind is not BufferKind.temp or a.strides is not None or b.strides is not None or a.type.dtype != b.type.dtype:
+            continue
+        w = writers.get(src, [])
+        if len(w) != 1 or w[0] >= i or writers.get(dst) != [i] or min(touches[dst]) != i:
+            continue
+        writer = launches[w[0]]
+        if [arg for name, arg in zip(writer.buffers, writer.task.args) if name == src] != [Arg(full_view(a.type.shape), a.type.dtype, True)]:
+            continue
+        mapped = _interior_map(read.view, a.type.shape)
+        if mapped is None:
+            continue
+        if write.view.source is None or {c for c, _ in write.view.source if c is not None} != set(range(write.view.rank)):
+            continue
+        # The writer's tiles run along the buffer's last axis: it must stay contiguous in the
+        # grid, or every store is strided (a channels-last ReLU into a channels-first pooling
+        # grid: the copy, which walks in the grid's order, does that transpose better).
+        if _moved_view(full_view(a.type.shape), write.view, mapped, a.type.shape).strides[-1] != 1:
+            continue
+        views = [arg.view for j in touches[src] if j != i for name, arg in zip(launches[j].buffers, launches[j].task.args) if name == src]
+        if any(v.source is None and _axis_steps(v, a.type.shape) is None for v in views):
+            continue  # a view through a merging reshape: the grid's gaps break it
+        moved[src] = (dst, write.view, mapped, a.type.shape)
+        replaced[i] = _border_fills(write.view, read.view, dst, b.type.dtype)
+    if not moved:
+        return program
+    out = []
+    for i, launch in enumerate(launches):
+        if i in replaced:
+            out.extend(replaced[i])
+            continue
+        if not any(name in moved for name in launch.buffers):
+            out.append(launch)
+            continue
+        args, names = [], []
+        for name, arg in zip(launch.buffers, launch.task.args):
+            if name in moved:
+                dst, into, mapped, shape = moved[name]
+                arg = replace(arg, view=_moved_view(arg.view, into, mapped, shape))
+                name = dst
+            args.append(arg)
+            names.append(name)
+        task = launch.task
+        out.append(replace(launch, task=Task(task.name, task.grid, tuple(args), task.body, task.warps, task.origin), buffers=tuple(names)))
+    kept = tuple(b for b in program.buffers if b.name not in moved)
+    return replace(program, buffers=kept, launches=tuple(out))
+
+
+def _axis_steps(view: View, shape):
+    """For a view without a source map of a contiguous `shape` buffer: per view axis (buffer
+    axis, step) and per buffer axis the start, when every view axis moves along one buffer
+    axis and stays inside it (a split of an axis, as a batch cut into chunks, qualifies; a
+    merge of two does not). None otherwise."""
+    from olaf.tile.ir import contiguous_strides
+
+    if view.pad is not None or not all(isinstance(d, int) for d in (*view.shape, *view.strides, view.offset, *shape)):
+        return None
+    cs = contiguous_strides(shape)
+    rest, starts = view.offset, []
+    for st in cs:
+        starts.append(rest // st)
+        rest %= st
+    steps, reach = [], list(starts)
+    for d, st in zip(view.shape, view.strides):
+        if d == 1 or st == 0:
+            steps.append((None, 0))
+            continue
+        p = next((p for p in range(len(shape)) if st > 0 and st % cs[p] == 0 and st // cs[p] < shape[p]), None)
+        if p is None:
+            return None
+        steps.append((p, st // cs[p]))
+        reach[p] += (d - 1) * (st // cs[p])
+    if any(r >= n for r, n in zip(reach, shape)):
+        return None
+    return steps, starts
+
+
+def _moved_view(view: View, into: View, mapped, shape) -> View:
+    """`view` of the moved `shape` buffer, as a view of the grid that `into` (the copy's full
+    write view, with a source map) addresses; mapped is _interior_map of the copy's read."""
+    placed = {c: (q, q_start) for q, (c, q_start) in enumerate(into.source) if c is not None}
+    if view.source is None:
+        steps, starts = _axis_steps(view, shape)
+        offset: Dim = into.offset + sum(((o + lo) * into.strides[c] for o, (c, lo) in zip(starts, mapped) if c is not None), 0)
+        strides = tuple(0 if p is None or mapped[p][0] is None else k * into.strides[mapped[p][0]] for p, k in steps)
+        return View(view.shape, strides, offset)
+    strides: list[Dim] = [0] * view.rank
+    offset = into.offset
+    source: list = [(None, 0)] * len(into.source)
+    for p, (axis, start) in enumerate(view.source):
+        c, lo = mapped[p]
+        if c is None:
+            continue
+        (q, q_start), step = placed[c], into.strides[c]
+        if axis is not None:
+            strides[axis] = strides[axis] + step
+        # Padded axes: the address subtracts low itself, the source start includes -low.
+        at = start + (view.pad[axis][0] if view.pad is not None and axis is not None else 0)
+        offset = offset + (at + lo) * step
+        source[q] = (axis, start + lo + q_start)
+    return View(view.shape, tuple(strides), offset, view.pad, view.fill, tuple(source))
+
+
+def _interior_map(view: View, shape) -> list[tuple[int | None, int]] | None:
+    """Per buffer axis of a `shape` buffer, (view axis, its low padding), when `view` shows the
+    whole buffer exactly once inside its padding (nothing cropped, broadcast or strided)."""
+    if view.source is None or len(view.source) != len(shape):
+        return None
+    pad = view.pad or tuple((0, 0) for _ in view.shape)
+    used = set()
+    out = []
+    for p, (c, start) in enumerate(view.source):
+        if c is None:
+            if shape[p] != 1:
+                return None
+            out.append((None, 0))
+            continue
+        lo, hi = pad[c]
+        if c in used or start != -lo or view.shape[c] - lo - hi != shape[p] or not isinstance(view.shape[c], int):
+            return None
+        used.add(c)
+        out.append((c, lo))
+    if any(view.shape[c] != 1 for c in range(view.rank) if c not in used):
+        return None
+    return out
+
+
+def _border_fills(into: View, read: View, buffer: str, dtype: DType) -> list[Launch]:
+    """Tasks writing read.fill to the padded slabs of `into` (one per padded side and axis;
+    the corners are written twice, with the same value)."""
+    from olaf.tile.builder import INDEX, TileBuilder
+    from olaf.tile.ir import TileType, TValue
+
+    fills = []
+    for axis, (lo, hi) in enumerate(read.pad or ()):
+        for start, size in ((0, lo), (into.shape[axis] - hi, hi)):
+            if size == 0:
+                continue
+            shape = tuple(size if a == axis else d for a, d in enumerate(into.shape))
+            view = View(shape, into.strides, into.offset + start * into.strides[axis])
+            tile = [1] * len(shape)
+            budget = 1024
+            for a in range(len(shape) - 1, -1, -1):
+                tile[a] = min(budget, 1 << max(shape[a] - 1, 0).bit_length())
+                budget //= tile[a]
+                if budget < 2:
+                    break
+            grid = tuple(-(-d // t) for d, t in zip(shape, tile))
+            b = TileBuilder()
+            pids = [TValue(TileType((), INDEX)) for _ in shape]
+            starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]
+            b.emit("store", (b.full(tuple(tile), read.fill, dtype), *starts), {"arg": 0})
+            fills.append(Launch(Task("fill", grid, (Arg(view, dtype, True),), b.finish(pids), 4, ("fill",)), (buffer,)))
+    return fills
+
+
 def _pure_copy(task: Task) -> bool:
     """The body stores what it loads, unchanged (fusion may have inlined a producer into a copy)."""
     stores = [op for op in task.body.ops if op.kind == "store"]

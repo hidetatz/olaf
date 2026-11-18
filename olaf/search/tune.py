@@ -66,23 +66,22 @@ def save(schedules: dict[str, DotSchedule]) -> None:
 
 
 def dots(graph: Graph, capability: Capability) -> dict[str, tuple[str, list, str]]:
-    """dot_key -> (spec, operand shapes, b16 dtype) for the matrix-instruction dots of a lowered graph."""
-    from olaf.tile.from_graph import _Converter
+    """dot_key -> (spec, operand shapes, b16 dtype) for the matrix-instruction dots of a lowered graph.
 
-    converter = _Converter(graph, capability)
-    converter.producers = {v: op for op in graph.ops for v in op.outputs}
+    Read from the converted program's launches (their origins carry the key) rather than the
+    graph's contract ops: a convolution becomes contracts of its own during conversion (over
+    padded grids or im2col columns), with shapes no graph op has.
+    """
+    from olaf.tile.from_graph import to_tile
+
     found = {}
-    for op in graph.ops:
-        if op.kind != "contract" or len(op.inputs) != 2:
+    for launch in to_tile(graph, capability).launches:
+        origin = launch.task.origin
+        if origin[:1] != ("contract",) or len(origin) < 3:
             continue
-        base = {converter._matrix_dtype(v) for v in op.inputs}
-        if len(base) != 1 or not any(i.m == 16 and i.dtype_a == next(iter(base)).value for i in capability.matrix_instructions):
-            continue
-        shapes = [v.type.shape for v in op.inputs]
-        if not all(isinstance(d, int) for s in shapes for d in s):
-            continue
-        dtype = next(iter(base)).value
-        found[dot_key(op.attr("spec"), shapes, dtype, capability.digest())] = (op.attr("spec"), shapes, dtype)
+        spec, a, b, dtype, _ = origin[2].split("|")
+        shapes = [[int(d) for d in a.split("x")], [int(d) for d in b.split("x")]]
+        found[origin[2]] = (spec, shapes, dtype)
     return found
 
 
@@ -137,39 +136,42 @@ def tune_in_program(graph: Graph, capability: Capability, inputs, state, *, top:
 
     schedules = tune(graph, capability, log=log)  # standalone results and the cache
     done = _load_marks()
+    pending = {key: v for key, v in dots(graph, capability).items() if key not in done}
+    trials = {}
+    for key, (spec, shapes, dtype) in pending.items():
+        ranked = sorted(((ms, c) for c in candidates(capability) if (ms := measure(spec, shapes, dtype, capability, c)) is not None), key=lambda mc: mc[0])
+        trials[key] = [schedules[key], *[c for _, c in ranked if c != schedules[key]][: top - 1]]
 
-    def timed(assignment: dict[str, DotSchedule], key: str) -> float:
+    def timed(assignment: dict[str, DotSchedule]) -> dict[str, float]:
         compiled = CudaProgram(to_program(graph, capability, schedules=assignment))
         session = Session(compiled, {}, graphs=False)
         session.load_state(state)
         runs = []
         for _ in range(3):
-            total = 0.0
+            total = dict.fromkeys(pending, 0.0)
             for ms, n, label, task in profile(session, inputs, with_tasks=True):
-                if task.origin[2:3] == (key,):
-                    total += ms
+                if len(task.origin) > 2 and task.origin[2] in total:
+                    total[task.origin[2]] += ms
             runs.append(total)
-        return statistics.median(runs)
+        return {key: statistics.median(r[key] for r in runs) for key in pending}
 
-    for key, (spec, shapes, dtype) in dots(graph, capability).items():
-        if key in done:
-            continue
-        ranked = sorted(((ms, c) for c in candidates(capability) if (ms := measure(spec, shapes, dtype, capability, c)) is not None), key=lambda mc: mc[0])
-        trial = [schedules[key], *[c for _, c in ranked if c != schedules[key]][: top - 1]]
-        best, best_ms = None, None
-        for candidate in trial:
-            ms = timed({**schedules, key: candidate}, key)
-            if best_ms is None or ms < best_ms:
-                best, best_ms = candidate, ms
-        if best_ms == 0.0:
-            done.add(key)  # no launch carries this dot (fused away, e.g. into attention)
-            _save_marks(done)
-            continue
-        schedules[key] = best
-        save(schedules)
+    # Every dot's launches are timed on their own, so one program per round tries the round's
+    # candidate of every dot at once: `top` whole-program compiles instead of `top` per dot (a
+    # ResNet-18 step has 37 distinct dots, most of them inside convolutions).
+    best = {}
+    for r in range(top):
+        assignment = {**schedules, **{key: t[min(r, len(t) - 1)] for key, t in trials.items()}}
+        for key, ms in timed(assignment).items():
+            if key not in best or ms < best[key][1]:
+                best[key] = (assignment[key], ms)
+    for key, (chosen, ms) in best.items():
+        if ms > 0.0:  # 0: no launch carries this dot (fused away, e.g. into attention)
+            schedules[key] = chosen
+            spec, shapes, _ = pending[key]
+            log(f"in program: {spec} {shapes}: {chosen} ({ms:.3f} ms)")
         done.add(key)
-        _save_marks(done)
-        log(f"in program: {spec} {shapes}: {best} ({best_ms:.3f} ms)")
+    save(schedules)
+    _save_marks(done)
     return schedules
 
 

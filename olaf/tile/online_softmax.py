@@ -94,6 +94,10 @@ def _contract(index: int, launch: Launch) -> _Contract | None:
     if len(dots) != 1 or len(stores) != 1:
         return None
     producers = {v: op for op in ops for v in op.outputs}
+    if _epilogue_start(launch) is not None:
+        # The fused tasks compute the product from the operands alone: work fused after the
+        # dot (a scale) would be dropped. _split_epilogue moves it to a task of its own first.
+        return None
     args = []
     for value in dots[0].inputs[:2]:
         while value in producers and producers[value].kind in ("reshape", "permute", "cast"):
@@ -764,6 +768,291 @@ def _forward_task(p: _Program, f: _Forward, write_stats: bool) -> Launch:
 
 
 def fuse_online_softmax(program: Program) -> Program:
+    """See the module docstring. Softmax numerators that fusion duplicated into their readers
+    are split out first (_split_shared_exp), and the split kept only where the chain fuses."""
+    split, made = _split_shared_exp(program, None)
+    if not made:
+        return _fuse_online_softmax(program)
+    fused = _fuse_online_softmax(split)
+    kept = {name for name in made if name not in {b.name for b in fused.buffers}}
+    if kept == set(made):
+        return fused
+    if not kept:
+        return _fuse_online_softmax(program)
+    return _fuse_online_softmax(_split_shared_exp(program, kept)[0])
+
+
+def _split_shared_exp(program: Program, only: set[str] | None) -> tuple[Program, list[str]]:
+    """Undo fusion's duplication of the chain's intermediates into their readers, so the
+    chain has the tasks the match starts from again:
+
+    - X = f(S), the scaled (and masked) scores, recomputed by the row max and by the exp task;
+    - E = exp(X - F(m)), recomputed by the row sum and by the normalization P = E / G(l).
+
+    Fusion copies a cheap producer into every reader. Without a mask (Whisper's encoder and
+    cross-attention; the scale sits in the score product's epilogue) E is two operations;
+    with a mask and a constant scale X is three; both are copied, and the match fails. Each
+    split is a pointwise task's subexpression that a row reduction also computes (compared
+    structurally, _key), written by its own task and loaded by both. The new buffers are
+    named s0_..., s1_... in order; `only` keeps the listed ones (those whose chain fused).
+    """
+    launches = list(program.launches)
+    buffers = list(program.buffers)
+    made: list[str] = []
+    # Score products with an epilogue (the scale, fused into them) whose result a row max
+    # reads: the epilogue goes to its own task, the X = f(S) step the match knows.
+    split_launches = []
+    for launch in launches:
+        out = next((n for n, x in zip(launch.buffers, launch.task.args) if x.writes), None)
+        row_max = out is not None and any(out in r.buffers and _reduce(r, "max", r.task.args[r.buffers.index(out)].view.rank) for r in launches)
+        if launch.task.origin[:1] == ("contract",) and row_max and _epilogue_start(launch) is not None:
+            name = f"s{len(made)}_{out}"
+            made.append(name)
+            if only is None or name in only:
+                product = _epilogue_start(launch)
+                out_type = next(b.type for b in buffers if b.name == out)
+                buffer_type = replace(out_type, dtype=product.type.dtype)
+                buffers.append(Buffer(name, buffer_type, BufferKind.temp))
+                split_launches.extend(_split_epilogue(launch, name, buffer_type))
+                continue
+        split_launches.append(launch)
+    launches = split_launches
+    shapes = {b.name: b.type for b in buffers}
+    readers: dict[str, list[int]] = {}
+    for i, launch in enumerate(launches):
+        for name, arg in zip(launch.buffers, launch.task.args):
+            if not arg.writes:
+                readers.setdefault(name, []).append(i)
+    inserts: dict[int, list[Launch]] = {}
+    changed: dict[int, Launch] = {}
+    for i, launch in enumerate(launches):
+        target = _split_candidate(launch)
+        if target is None or i in changed:
+            continue
+        value, fn = target
+        producers = {v: op for op in launch.task.body.ops for v in op.outputs}
+        key = _key(value, producers, launch)
+        loads = [op for op in _walk(launch.task.body) if op.kind == "load" and _depends(value, producers, op)]
+        full = [op for op in loads if launch.task.args[op.attr("arg")].view.shape == shapes[launch.buffers[next(a for a, (n, x) in enumerate(zip(launch.buffers, launch.task.args)) if x.writes)]].shape]
+        if not full:
+            continue
+        names = {launch.buffers[op.attr("arg")] for op in loads}
+        rank = len(full[0].attr("shape"))
+        reduction = None
+        for j in sorted({j for n in names for j in readers.get(n, [])} - {i}):
+            if j in changed or not _reduce(launches[j], fn, rank):
+                continue
+            summand = _summand(launches[j])
+            if summand is not None and _key(summand[1], summand[2], launches[j]) == key:
+                reduction = j, summand
+                break
+        if reduction is None:
+            continue
+        name = f"s{len(made)}_{launch.buffers[0]}"
+        made.append(name)
+        if only is not None and name not in only:
+            continue
+        out_name = next(n for n, x in zip(launch.buffers, launch.task.args) if x.writes)
+        buffer_type = replace(shapes[out_name], dtype=value.type.dtype)
+        buffers.append(Buffer(name, buffer_type, BufferKind.temp))
+        view = full_view(buffer_type.shape)
+        store = next(op for op in launch.task.body.ops if op.kind == "store")
+        starts = store.inputs[1:]
+        n_args = len(launch.task.args)
+        # The new task: the pointwise task's ops up to `value`, stored.
+        ops = _needed(launch.task.body.ops, [value]) + [TOp("store", (value, *starts), (), (("arg", n_args),))]
+        writer = _pruned(Launch(Task("exp" if fn == "sum" else "scores", launch.task.grid, (*launch.task.args, Arg(view, value.type.dtype, True)), Body(launch.task.body.params, tuple(ops), ()), launch.task.warps, ("exp" if fn == "sum" else "scores",)), (*launch.buffers, name)))
+        # The pointwise task loads it.
+        loaded = TValue(value.type)
+        load = TOp("load", tuple(starts), (loaded,), (("arg", n_args), ("dtype", value.type.dtype), ("other", 0), ("shape", value.type.shape)))
+        ops = [load if op.outputs and op.outputs[0] is value else TOp(op.kind, tuple(loaded if v is value else v for v in op.inputs), op.outputs, op.attrs, op.regions) for op in launch.task.body.ops if op.kind != "store"]
+        body = Body(launch.task.body.params, tuple(_needed(ops, list(store.inputs)) + [store]), ())
+        pointwise = _pruned(Launch(Task(launch.task.name, launch.task.grid, (*launch.task.args, Arg(view, value.type.dtype, False)), body, launch.task.warps, launch.task.origin), (*launch.buffers, name)))
+        # The reduction loads it (masked with its own neutral element, as the bounds select did).
+        j, (combine, _, _, at) = reduction
+        r = launches[j]
+        r_value = TValue(at.outputs[0].type.__class__(at.attr("shape"), value.type.dtype))
+        r_load = TOp("load", at.inputs, (r_value,), (("arg", len(r.task.args)), ("dtype", value.type.dtype), ("other", 0 if fn == "sum" else float("-inf")), ("shape", at.attr("shape"))))
+        reduced = _pruned(Launch(Task(r.task.name, r.task.grid, (*r.task.args, Arg(view, value.type.dtype, False)), _replace_summand(r.task.body, combine, r_load, r_value), r.task.warps, r.task.origin), (*r.buffers, name)))
+        inserts.setdefault(min(i, j), []).append(writer)
+        changed[i], changed[j] = pointwise, reduced
+    if not changed and len(launches) == len(program.launches):
+        return program, made
+    out = []
+    for i, launch in enumerate(launches):
+        out.extend(inserts.get(i, []))
+        out.append(changed.get(i, launch))
+    return replace(program, buffers=tuple(buffers), launches=tuple(out)), made
+
+
+def _epilogue_start(launch: Launch) -> TValue | None:
+    """The contract's product tile where an epilogue begins (the value its first epilogue
+    op reads), or None when the store takes the product through casts and layout ops only."""
+    ops = launch.task.body.ops
+    loop = next((op for op in ops if op.kind == "for"), None)
+    stores = [op for op in ops if op.kind == "store"]
+    if loop is None or len(stores) != 1:
+        return None
+    plain = set(loop.outputs)
+    for op in ops:
+        if op.kind in ("cast", "permute", "reshape") and op.inputs[0] in plain:
+            plain.update(op.outputs)
+    value = stores[0].inputs[0]
+    if value in plain:
+        return None
+    for op in ops:
+        if op.kind not in ("cast", "permute", "reshape", "store") and any(v in plain for v in op.inputs):
+            return next(v for v in op.inputs if v in plain)
+    return None
+
+
+def _split_epilogue(launch: Launch, name: str, buffer_type) -> tuple[Launch, Launch]:
+    """A contract with an epilogue as the plain contract (its product stored to `name`) and a
+    pointwise task applying the epilogue to it, over the same grid and tiles."""
+    ops = launch.task.body.ops
+    store = next(op for op in ops if op.kind == "store")
+    product = _epilogue_start(launch)
+    starts = store.inputs[1:]
+    n_args = len(launch.task.args)
+    view = full_view(buffer_type.shape)
+    head = _needed(ops, [product, *starts])
+    contract = _pruned(Launch(Task(launch.task.name, launch.task.grid, (*launch.task.args, Arg(view, product.type.dtype, True)), Body(launch.task.body.params, tuple(head) + (TOp("store", (product, *starts), (), (("arg", n_args),)),), ()), launch.task.warps, launch.task.origin), (*launch.buffers, name)))
+    loaded = TValue(product.type)
+    load = TOp("load", tuple(starts), (loaded,), (("arg", n_args), ("dtype", product.type.dtype), ("other", 0), ("shape", product.type.shape)))
+    index = _needed(ops, list(starts))
+    rest = [op for op in ops if op.kind != "store" and not any(op is h for h in head)]
+    rest = [TOp(op.kind, tuple(loaded if v is product else v for v in op.inputs), op.outputs, op.attrs, op.regions) for op in rest]
+    body = Body(launch.task.body.params, tuple(index) + (load,) + tuple(_needed(rest, [store.inputs[0]])) + (store,), ())
+    epilogue = _pruned(Launch(Task("scores", launch.task.grid, (*launch.task.args, Arg(view, product.type.dtype, False)), body, launch.task.warps, ("scores",)), (*launch.buffers, name)))
+    return contract, epilogue
+
+
+def _split_candidate(launch: Launch):
+    """(value, the reduction that recomputes it) of a pointwise task of the chain: exp(sub(A,
+    F)) with A not a plain load gives (A, "max"); [cast](div(exp(...), G)) gives the exp and
+    "sum"."""
+    if launch.task.origin[:1] == ("contract",) or any(op.regions for op in launch.task.body.ops):
+        return None
+    stores = [op for op in launch.task.body.ops if op.kind == "store"]
+    if len(stores) != 1:
+        return None
+    producers = {v: op for op in launch.task.body.ops for v in op.outputs}
+    value = stores[0].inputs[0]
+    if producers.get(value) is not None and producers[value].kind == "cast":
+        value = producers[value].inputs[0]
+    op = producers.get(value)
+    if op is not None and op.kind == "div":
+        exp = producers.get(op.inputs[0])
+        return (exp.outputs[0], "sum") if exp is not None and exp.kind == "exp" else None
+    if op is not None and op.kind == "exp":
+        sub = producers.get(op.inputs[0])
+        if sub is None or sub.kind != "sub":
+            return None
+        a = producers.get(sub.inputs[0])
+        return (sub.inputs[0], "max") if a is not None and a.kind != "load" else None
+    return None
+
+
+def _summand(launch: Launch):
+    """(combining op, the value it reduces, the loop's producers, a full-tile load in it) of a
+    one-loop row reduction, the view-bounds select (fuse's) stripped from the value."""
+    loops = [op for op in launch.task.body.ops if op.kind == "for"]
+    if len(loops) != 1:
+        return None
+    region = loops[0].regions[0]
+    producers = {v: op for op in region.ops for v in op.outputs}
+    combines = [op for op in region.ops if op.kind in ("add", "max") and op.outputs[0] in region.results]
+    if len(combines) != 1:
+        return None
+    value = next((v for v in combines[0].inputs if v not in region.params), None)
+    op = producers.get(value)
+    if op is not None and op.kind == "where":
+        cmp, other = producers.get(op.inputs[0]), producers.get(op.inputs[2])
+        iota = producers.get(cmp.inputs[0]) if cmp is not None and cmp.kind == "cmp" else None
+        if iota is not None and iota.kind == "iota" and other is not None and other.kind == "full":
+            value = op.inputs[1]
+    loads = [o for o in region.ops if o.kind == "load" and _depends(value, producers, o) and o.attr("shape") == combines[0].outputs[0].type.shape]
+    if not loads:
+        return None
+    return combines[0], value, producers, loads[0]
+
+
+def _depends(value: TValue, producers: dict, target: TOp) -> bool:
+    stack, seen = [value], set()
+    while stack:
+        v = stack.pop()
+        op = producers.get(v)
+        if op is None or id(op) in seen:
+            continue
+        if op is target:
+            return True
+        seen.add(id(op))
+        stack.extend(op.inputs)
+    return False
+
+
+def _key(value: TValue, producers: dict, launch: Launch):
+    """A structural description of how value is computed, independent of tile shapes and of
+    how the coordinates are produced (program ids or a loop variable)."""
+    if value.type.shape == () and value.type.dtype is INDEX:
+        return ("index",)
+    op = producers.get(value)
+    if op is None:
+        return ("param",)
+    if op.kind == "load":
+        arg = launch.task.args[op.attr("arg")]
+        return ("load", launch.buffers[op.attr("arg")], arg.view, op.attr("dtype"))
+    attrs = tuple((k, v) for k, v in op.attrs if k not in ("shape", "arg", "other"))
+    return (op.kind, attrs, tuple(_key(v, producers, launch) for v in op.inputs))
+
+
+def _replace_summand(body: Body, combine: TOp, load: TOp, value: TValue) -> Body:
+    ops = []
+    for op in body.ops:
+        if op.kind == "for":
+            region = op.regions[0]
+            inner = []
+            for o in region.ops:
+                if o is combine:
+                    inner.append(load)
+                    carry = next(v for v in o.inputs if v in region.params)
+                    inner.append(TOp(o.kind, (carry, value), o.outputs, o.attrs))
+                else:
+                    inner.append(o)
+            inner = _needed(inner, list(region.results))
+            op = TOp(op.kind, op.inputs, op.outputs, op.attrs, (Body(region.params, tuple(inner), region.results),))
+        ops.append(op)
+    return Body(body.params, tuple(ops), body.results)
+
+
+def _needed(ops, roots) -> list[TOp]:
+    """The ops that roots depend on, in order (the callers add their stores)."""
+    producers = {v: op for op in ops for v in op.outputs}
+    keep, stack = set(), list(roots)
+    while stack:
+        v = stack.pop()
+        op = producers.get(v)
+        if op is None or id(op) in keep:
+            continue
+        keep.add(id(op))
+        stack.extend(op.inputs)
+        for r in op.regions:
+            stack.extend(r.results)
+            stack.extend(i for o in r.ops for i in o.inputs)
+    return [op for op in ops if id(op) in keep]
+
+
+def _pruned(launch: Launch) -> Launch:
+    """launch without the args its body no longer touches."""
+    from olaf.tile.fuse import _MEMORY, _renumber
+
+    used = sorted({op.attr("arg") for op in _walk(launch.task.body) if op.kind in _MEMORY})
+    remap = {old: new for new, old in enumerate(used)}
+    task = launch.task
+    return Launch(Task(task.name, task.grid, tuple(task.args[i] for i in used), _renumber(task.body, remap), task.warps, task.origin), tuple(launch.buffers[i] for i in used))
+
+
+def _fuse_online_softmax(program: Program) -> Program:
     p = _Program(program)
     replaced: dict[int, list[Launch]] = {}
     removed: set[int] = set()

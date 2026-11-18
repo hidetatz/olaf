@@ -3,11 +3,13 @@
 Sizes are realistic for the RTX 3060 (the tests' configurations are so small that launch
 overhead is all they show). Every model trains in bf16 autocast style with AdamW (DCGAN: two
 Adams); Grad-CAM, an inference-time computation, times one Grad-CAM batch. olaf runs with the
-default dot schedules (no search). As docs/design.md prescribes: warm-up, then 5 timings of
+default dot schedules unless --tuned (then the in-program schedule search runs first, its
+results cached in ~/.cache/olaf). As docs/design.md prescribes: warm-up, then 5 timings of
 STEPS steps, medians compared. Each model runs in its own process (GPU memory).
 
     python bench/models.py            # all models, one process each
     python bench/models.py resnet     # one model
+    python bench/models.py resnet --tuned --olaf-only
 """
 
 from __future__ import annotations
@@ -28,6 +30,8 @@ sys.path.insert(0, str(ROOT / "tests"))
 import olaf  # noqa: E402
 
 STEPS = 10
+TUNED = "--tuned" in sys.argv
+OLAF_ONLY = "--olaf-only" in sys.argv
 MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam"]
 
 
@@ -54,8 +58,16 @@ def olaf_time(traced, initial, inputs) -> tuple[float, float]:
     from olaf.backend.cuda.runtime import CudaProgram, Session
     from olaf.pipeline import lower_graph, to_program
 
+    graph = lower_graph(traced.graph)
+    schedules = None
+    if TUNED:
+        from olaf.search.tune import tune_in_program
+
+        start = time.time()
+        schedules = tune_in_program(graph, AMPERE_RTX3060, inputs, initial, log=lambda m: print(m, file=sys.stderr, flush=True))
+        print(f"schedule search: {time.time() - start:.0f} s", file=sys.stderr, flush=True)
     start = time.time()
-    compiled = CudaProgram(to_program(lower_graph(traced.graph), AMPERE_RTX3060))
+    compiled = CudaProgram(to_program(graph, AMPERE_RTX3060, schedules=schedules))
     compile_s = time.time() - start
     session = Session(compiled, {})
     session.load_state(initial)
@@ -276,29 +288,19 @@ def build(name):
 
 def run_one(name):
     label, (traced, initial, inputs), step = build(name)
-    if name == "gradcam":
-        from olaf.backend.capability import AMPERE_RTX3060
-        from olaf.backend.cuda.runtime import CudaProgram, Session
-        from olaf.pipeline import lower_graph, to_program
-
-        start = time.time()
-        compiled = CudaProgram(to_program(lower_graph(traced.graph), AMPERE_RTX3060))
-        compile_s = time.time() - start
-        session = Session(compiled, {})
-        ms = timed(_replayer(session, inputs), compiled.stream.synchronize)
-    else:
-        ms, compile_s = olaf_time(traced, initial, inputs)
-    eager, compiled_ms, torch_compile_s = torch_times(step)
+    ms, compile_s = olaf_time(traced, initial, inputs)
+    eager, compiled_ms, torch_compile_s = (float("nan"),) * 3 if OLAF_ONLY else torch_times(step)
     print(f"RESULT|{name}|{label}|{ms:.2f}|{eager:.2f}|{compiled_ms:.2f}|{compile_s:.0f}|{torch_compile_s:.0f}", flush=True)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        run_one(sys.argv[1])
+    names = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    if names and "--child" in flags:
+        run_one(names[0])
         sys.exit()
-    rows = []
-    for name in MODELS:
-        out = subprocess.run([sys.executable, __file__, name], capture_output=True, text=True, timeout=3600)
+    for name in names or MODELS:
+        out = subprocess.run([sys.executable, __file__, name, "--child", *flags], capture_output=True, text=True, timeout=7200)
         line = next((ln for ln in out.stdout.splitlines() if ln.startswith("RESULT|")), None)
         if line is None:
             print(f"{name}: failed\n{out.stderr[-3000:]}", flush=True)

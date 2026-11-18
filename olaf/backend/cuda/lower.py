@@ -844,7 +844,7 @@ class _Emitter:
             self.barrier()
             first = self.emit(f"llvm.icmp \"eq\" {self.emit(f'llvm.urem {lane}, {self.i32(4)} : i32')}, {self.i32(0)} : i32")
             for slot, value in enumerate(rows):
-                row = row_coords[slot][-1] if False else row_coords[slot][self.row_position(acc, out_t)]
+                row = row_coords[slot][self.row_position(acc, out_t)]
                 index = self.emit(f"llvm.add {self.emit(f'llvm.mul {warp_n}, {self.i32(acc.em)} : i32')}, {row} : i32")
                 self.guarded(first, lambda index=index, value=value: self.store_shared(index, value, dtype))
             self.barrier()

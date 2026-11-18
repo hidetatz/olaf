@@ -290,7 +290,8 @@ def test_align_rows_restrides_ragged_bf16_buffers():
     program = to_tile(graph)
     aligned = align_rows(program)
     padded = [b for b in aligned.buffers if b.strides is not None]
-    assert padded and all(b.strides[-2] == 16 for b in padded)
+    # (The transposed slice's result follows its input's layout: 7-element rows, padded to 8.)
+    assert any(b.type.shape[-1] == 13 and b.strides[-2] == 16 for b in padded) and all(b.strides[-2] % 8 == 0 for b in padded)
     for a, e in zip(run_program(aligned, [x])[0], interpret(graph, [x])[0]):
         assert rel(a, e) < 1e-6
 
@@ -347,13 +348,39 @@ def test_online_softmax_fusion(backward):
         assert rel(a, e) < 1e-2, rel(a, e)
 
 
+@pytest.mark.parametrize("sq,sk", [(100, 100), (64, 150)])
+def test_online_softmax_fusion_without_a_mask(sq, sk):
+    # Without a mask the numerator exp(S - max) is cheap, and fusion copies it into both of
+    # its readers (the row sum and the normalization); the pass splits it out again to match.
+    # (sq != sk: Whisper's cross-attention.)
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.graph.ir import bf16_round
+    from olaf.tile.fuse import fuse_epilogues
+    from olaf.tile.online_softmax import fuse_online_softmax
+
+    rng = np.random.default_rng(4)
+    q, k, v = (bf16_round(rng.normal(size=(1, 2, n, 64))) for n in (sq, sk, sk))
+
+    def fn(q, k, v):
+        loss = lambda q, k, v: olaf.sum(olaf.cast(olaf.attention(q, k, v), F32) ** 2.0)  # noqa: E731
+        return olaf.value_and_grad(loss, (0, 1, 2))(q, k, v)
+
+    graph = lower(olaf.trace(fn, tt(1, 2, sq, 64, dtype=olaf.bf16), tt(1, 2, sk, 64, dtype=olaf.bf16), tt(1, 2, sk, 64, dtype=olaf.bf16)).graph)
+    before = fuse(fuse_epilogues(to_tile(graph, AMPERE_RTX3060), shared_cheap_only=True))
+    after = fuse_online_softmax(before)
+    names = {launch.task.name for launch in after.launches}
+    assert "attention" in names and "attention_dkv" in names
+    for a, e in zip(olaf.tree_flatten(run_program(after, [q, k, v])[0])[0], olaf.tree_flatten(interpret(graph, [q, k, v])[0])[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
 def test_online_softmax_skips_masked_tiles_of_a_causal_mask():
     from olaf.backend.capability import AMPERE_RTX3060
-    from olaf.tile.online_softmax import _causal_offset, _match_forward, _Program, fuse_online_softmax
+    from olaf.tile.online_softmax import _causal_offset, _match_forward, _Program, _split_shared_exp, fuse_online_softmax
 
     graph, args = _attention_case(True, s=200)
     before = fuse(to_tile(graph, AMPERE_RTX3060))
-    p = _Program(before)
+    p = _Program(_split_shared_exp(before, None)[0])
     forward = next(f for f in (_match_forward(p, i) for i in range(len(before.launches))) if f is not None)
     assert _causal_offset(p, forward) == 0
     after = fuse_online_softmax(before)
@@ -590,3 +617,61 @@ def test_row_fusion_keeps_statistics_that_kept_reductions_read():
     assert {n for launch in program.launches for n in launch.buffers if n in temps} <= written
     for got, want in zip(run_program(program, [x])[0], interpret(graph, [x])[0]):
         np.testing.assert_allclose(got, want, rtol=1e-6)
+
+
+def test_pointwise_results_follow_their_inputs_layout():
+    # A channels-last input (a permuted view) gives a channels-last result: no strided reads,
+    # and a reduction over it runs in memory order. Values match the eager interpreter.
+    x = R.normal(size=(2, 5, 6, 3)).astype(np.float32)
+
+    def fn(a):
+        cl = olaf.permute(a, (0, 3, 1, 2))  # [N, C, H, W] logically, channels-last in memory
+        y = olaf.exp(cl) * 2.0 + cl
+        return y, olaf.sum(y, axis=(0, 2, 3))
+
+    graph = lower(olaf.trace(fn, tt(2, 5, 6, 3)).graph)
+    program = to_tile(graph)
+    exp = next(launch for launch in program.launches if launch.task.name == "exp")
+    out = next(arg for arg in exp.task.args if arg.writes)
+    assert out.view.shape == (2, 5, 6, 3)  # computed in memory order
+    for a, e in zip(run_program(program, [x])[0], interpret(graph, [x])[0]):
+        assert rel(a, e) < 1e-6
+
+
+def test_broadcast_only_pointwise_runs_on_the_small_shape():
+    # Every input broadcasts along H and W: computed once per [N, C], broadcast after.
+    x, g = R.normal(size=(2, 3, 4, 4)).astype(np.float32), R.normal(size=(2, 3)).astype(np.float32)
+
+    def fn(a, b):
+        spread = olaf.broadcast_to(b.reshape(2, 3, 1, 1), (2, 3, 4, 4))
+        return a * olaf.exp(spread)
+
+    graph = lower(olaf.trace(fn, tt(2, 3, 4, 4), tt(2, 3)).graph)
+    program = to_tile(graph)
+    exp = next(launch for launch in program.launches if launch.task.name == "exp")
+    assert next(arg for arg in exp.task.args if arg.writes).view.shape == (2, 3, 1, 1)
+    for a, e in zip(run_program(program, [x, g])[0], interpret(graph, [x, g])[0]):
+        assert rel(a, e) < 1e-6
+
+
+def test_conv_input_writer_stores_into_the_padded_grid():
+    # relu(x) feeds a padded convolution: relu writes the grid itself (no copy into it, the
+    # border filled separately), and the weight gradient's reads of the same grid still match.
+    from olaf.pipeline import to_program
+    from olaf.tile.normalize import eliminate_pad_copies
+
+    x, w = R.normal(size=(2, 4, 18, 18)).astype(np.float32), R.normal(size=(5, 4, 3, 3)).astype(np.float32)
+
+    def fn(x, w):
+        loss = lambda x, w: olaf.sum(olaf.conv(olaf.maximum(x, 0.0), w, 1, 1) ** 2.0)  # noqa: E731
+        return olaf.value_and_grad(loss, argnums=(0, 1))(x, w)
+
+    graph = lower(olaf.trace(fn, tt(2, 4, 18, 18), tt(5, 4, 3, 3)).graph)
+    before = to_tile(graph)
+    after = eliminate_pad_copies(before)
+    copies = lambda p: sum(launch.task.origin == ("copy",) for launch in p.launches)  # noqa: E731
+    assert copies(after) < copies(before)
+    want = interpret(graph, [x, w])[0]
+    for program in (after, to_program(graph)):
+        for a, e in zip(olaf.tree_flatten(run_program(program, [x, w])[0])[0], olaf.tree_flatten(want)[0]):
+            assert rel(a, e) < 1e-6

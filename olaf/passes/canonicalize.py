@@ -8,8 +8,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+import numpy as np
+
 from olaf.graph.builder import dead_code_elimination, make_attrs
-from olaf.graph.ir import Graph, Op, Value
+from olaf.graph.ir import ConstantData, Graph, Op, Value
+from olaf.graph.types import DType
 
 # A rule returns a replacement Value (identity), a new Op, new Ops (the last one defines the
 # result), or None (no match).
@@ -160,7 +163,27 @@ def _concat_of_concat(op, defs):
     return Op("concat", tuple(flat), op.outputs, op.attrs)
 
 
+# Unary ops folded on scalar constants, computed as the eager interpreter computes them.
+_FOLDABLE = {"rsqrt": lambda x: 1 / np.sqrt(x), "sqrt": np.sqrt, "recip": lambda x: 1 / x, "neg": np.negative}
+
+
+def _fold_scalar_constant(op, defs):
+    """A unary op of a scalar f32/f64 constant is a constant. Attention's scale is rsqrt(head
+    size): left as a task, fusion copied it into the score product's readers, and the
+    attention pattern (tile.online_softmax) no longer matched."""
+    if op.kind not in _FOLDABLE or len(op.inputs) != 1:
+        return None
+    d = defs.get(op.inputs[0])
+    if d is None or d.kind != "constant":
+        return None
+    data = d.attr("value")
+    if data.shape != () or data.dtype not in (DType.f32, DType.f64):
+        return None
+    return Op("constant", (), op.outputs, make_attrs({"value": ConstantData.of(_FOLDABLE[op.kind](data.array), data.dtype)}))
+
+
 RULES: tuple[Rule, ...] = (
+    _fold_scalar_constant,
     _reshape_identity,
     _reshape_of_reshape,
     _permute_identity,

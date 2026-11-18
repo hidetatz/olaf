@@ -19,6 +19,12 @@ CONVS = [
     ((2, 3, 12, 12), (4, 3, 5, 5), 3, 2, 1, 1),  # stride not dividing the input
     ((2, 2, 16), (3, 2, 3), 2, 1, 1, 1),  # 1-D (Whisper's front end)
     ((1, 2, 5, 6, 6), (3, 2, 3, 3, 3), 1, 1, 1, 1),  # 3-D
+    # Weight gradients over large grids: read through window views of the channels-last grid
+    # (the first and the 1-D case), or through im2col (the strided and the dilated case).
+    ((2, 16, 18, 18), (4, 16, 3, 3), 1, 1, 1, 1),
+    ((2, 16, 34, 34), (4, 16, 3, 3), 2, 1, 1, 1),
+    ((1, 16, 20, 20), (4, 16, 3, 3), 1, 2, (2, 1), 1),
+    ((2, 16, 40), (3, 16, 3), 1, 1, 1, 1),
 ]
 
 # (x shape, w shape, stride, padding, output_padding, groups)
