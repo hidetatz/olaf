@@ -27,15 +27,16 @@ class Config:
 @dataclass(frozen=True)
 class Generator(nn.Module):
     config: Config
+    compute: DType | None = None
 
     def _layers(self):
         c = self.config
         return {
-            "convt1": nn.ConvTranspose(c.nz, 2 * c.width, (4, 4), 1, 0, bias=False),
+            "convt1": nn.ConvTranspose(c.nz, 2 * c.width, (4, 4), 1, 0, bias=False, compute=self.compute),
             "bn1": nn.BatchNorm(2 * c.width),
-            "convt2": nn.ConvTranspose(2 * c.width, c.width, (4, 4), 2, 1, bias=False),
+            "convt2": nn.ConvTranspose(2 * c.width, c.width, (4, 4), 2, 1, bias=False, compute=self.compute),
             "bn2": nn.BatchNorm(c.width),
-            "convt3": nn.ConvTranspose(c.width, c.channels, (4, 4), 2, 1, bias=False),
+            "convt3": nn.ConvTranspose(c.width, c.channels, (4, 4), 2, 1, bias=False, compute=self.compute),
         }
 
     def init(self, rng):
@@ -56,13 +57,14 @@ class Generator(nn.Module):
 @dataclass(frozen=True)
 class Discriminator(nn.Module):
     config: Config
+    compute: DType | None = None
 
     def _layers(self):
         c = self.config
         return {
-            "conv1": nn.Conv(c.channels, c.width, (4, 4), 2, 1),
-            "conv2": nn.Conv(c.width, 2 * c.width, (4, 4), 2, 1),
-            "conv3": nn.Conv(2 * c.width, 1, (4, 4), 1, 0),
+            "conv1": nn.Conv(c.channels, c.width, (4, 4), 2, 1, compute=self.compute),
+            "conv2": nn.Conv(c.width, 2 * c.width, (4, 4), 2, 1, compute=self.compute),
+            "conv3": nn.Conv(2 * c.width, 1, (4, 4), 1, 0, compute=self.compute),
         }
 
     def init(self, rng):
@@ -72,15 +74,16 @@ class Discriminator(nn.Module):
         L = self._layers()
         h = nn.leaky_relu(L["conv1"](p["conv1"], x), 0.2)
         h = nn.leaky_relu(L["conv2"](p["conv2"], h), 0.2)
-        return L["conv3"](p["conv3"], h).reshape(x.shape[0])
+        out = L["conv3"](p["conv3"], h).reshape(x.shape[0])
+        return olaf.cast(out, DType.f32) if out.dtype is DType.bf16 else out
 
 
-def gan_step(config: Config, g_params, d_params, g_buffers, make_g_opt, make_d_opt, batch: int, size: int = 16, dtype: DType = DType.f32):
+def gan_step(config: Config, g_params, d_params, g_buffers, make_g_opt, make_d_opt, batch: int, size: int = 16, dtype: DType = DType.f32, compute: DType | None = None):
     """The traced alternating step, as PyTorch's DCGAN loop: generate once; update the
     discriminator on real and (detached) generated images; then update the generator through
     the updated discriminator. Inputs (real images, z); returns (d_loss, g_loss).
     Returns the traced step and its initial state."""
-    G, D = Generator(config), Discriminator(config)
+    G, D = Generator(config, compute), Discriminator(config, compute)
     types = lambda tree: olaf.tree_map(lambda a: TensorType(np.shape(a), dtype), tree)  # noqa: E731
     g_states, g_paths = parameter_states(types(g_params), "g")
     d_states, d_paths = parameter_states(types(d_params), "d")
