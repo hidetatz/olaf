@@ -67,11 +67,20 @@ def _elementwise_tile(shape, tuning) -> tuple[int, ...]:
         # A long row (the 50257-wide logits) is tiled along itself, so the elements a thread
         # owns share their row: a broadcast row statistic is one load for all of them.
         return tuple(1 for _ in shape[:-1]) + (elements,)
-    last = _block(shape[-1], block)
-    rows = 1
+    tile = [1] * len(shape)
+    tile[-1] = _block(shape[-1], block)
     if len(shape) >= 2:
-        rows = _block(shape[-2], max(1, elements // last))
-    return tuple(1 for _ in shape[:-2]) + ((rows,) if len(shape) >= 2 else ()) + (last,)
+        tile[-2] = _block(shape[-2], max(1, elements // tile[-1]))
+    # While the trailing axes fit whole, the tile goes on into the axes before them: a
+    # [512, 512, 3, 3] weight otherwise had 4 x 4 tiles, 16 elements for 128 threads (its
+    # optimizer update took 2 ms instead of 0.2).
+    budget = elements // (tile[-1] * (tile[-2] if len(shape) >= 2 else 1))
+    for a in range(len(shape) - 3, -1, -1):
+        if budget < 2 or not all(isinstance(shape[i], int) and tile[i] >= shape[i] for i in range(a + 1, len(shape))):
+            break
+        tile[a] = _block(shape[a], budget)
+        budget //= tile[a]
+    return tuple(tile)
 
 
 def _ceil_div(d: Dim, t: int) -> Dim:
@@ -576,7 +585,10 @@ class _Converter:
 
             return builder.for_range(builder.index(0), builder.index(total), 1, [acc], body, stages=stages)[0]
 
-        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels)
+        # Only when the innermost loop is too short to pipeline: with long inner loops (a
+        # weight gradient over batch x sequence, 32 steps of the sequence) nesting measured
+        # faster (Llama's step: 213 ms nested, 239 flattened).
+        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels) and -(-size[k_inner] // ek) < 8
         acc0 = b.full((em, en), 0, acc_dtype)
         acc = flat_loop(b, dict(out_starts), acc0) if flatten else loop(b, 0, dict(out_starts), acc0)
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
@@ -594,6 +606,8 @@ class _Converter:
         """conv as one dense matrix product over the padded grid (see _conv_grid_rows and
         _conv_grid_reduce), or, where neither fits (groups), over window views (_conv_windows)."""
         g = op.attr("groups")
+        if any(ld > 1 for ld in op.attr("lhs_dilation")) and all(d == 1 for d in op.attr("dilation")) and all(st == 1 for st in op.attr("stride")):
+            return self._conv_phases(op, inputs)
         out_positions = math.prod(op.outputs[0].type.shape[2:])
         kernel_positions = math.prod(inputs[1].shape[2:])
         if g == 1 and out_positions < kernel_positions:
@@ -601,6 +615,56 @@ class _Converter:
         if g == 1:
             return self._conv_grid_rows(op, inputs)
         return self._conv_windows(op, inputs)
+
+    def _conv_phases(self, op: Op, inputs: list[Ref]) -> Ref:
+        """A convolution over an input dilated by s (the input gradient of a stride-s
+        convolution, a transposed convolution) as s^n convolutions without the zeros.
+
+        Output position o = m * s + r reads the dilated input only at taps u with
+        u = t * s + q_r, q_r = (low - r) mod s, and those taps read input element
+        m + (r + q_r - low) / s + t: per phase r a plain stride-1 convolution of the input with
+        every s-th tap of the kernel. Computed over the dilated input instead, (s^n - 1) / s^n
+        of the products are with zeros. Each phase's result goes to its strided positions of
+        the output; a phase without taps is zeros.
+        """
+        from olaf.graph.builder import make_attrs
+
+        x, w = inputs
+        ld, padding, g = op.attr("lhs_dilation"), op.attr("padding"), op.attr("groups")
+        n = len(ld)
+        out_type = op.outputs[0].type
+        out_spatial = out_type.shape[2:]
+        kernel = w.shape[2:]
+        out = self.new_buffer(out_type, BufferKind.temp)
+        os_ = contiguous_strides(out_type.shape)
+        w = self.plain(w)
+        for phase in np.ndindex(*ld):
+            taps, lows, highs, counts, firsts = [], [], [], [], []
+            for i, (r, s_) in enumerate(zip(phase, ld)):
+                lo = padding[i][0]
+                q = (lo - r) % s_
+                t = max(0, -(-(kernel[i] - q) // s_))
+                m = max(0, -(-(out_spatial[i] - r) // s_))
+                base = (r + q - lo) // s_
+                taps.append(t)
+                firsts.append(q)
+                counts.append(m)
+                lows.append(-base)
+                highs.append(m - 1 + t - x.shape[2 + i] + base)
+            target = View((*out_type.shape[:2], *counts), (os_[0], os_[1], *(st * s_ for st, s_ in zip(os_[2:], ld))), sum(r * st for r, st in zip(phase, os_[2:])))
+            if 0 in counts:
+                continue
+            if 0 in taps:
+                self.elementwise("fill", TensorType(target.shape, out_type.dtype), [], lambda b, tiles, starts, tile: b.full(tile, 0, out_type.dtype), out=replace(out, view=target))
+                continue
+            wv = w.view
+            sub = Ref(w.buffer, View((*w.shape[:2], *taps), (*wv.strides[:2], *(st * s_ for st, s_ in zip(wv.strides[2:], ld))), wv.offset + sum(q * st for q, st in zip(firsts, wv.strides[2:]))), w.dtype)
+            phase_type = TensorType((*out_type.shape[:2], *counts), out_type.dtype)
+            attrs = {"stride": (1,) * n, "padding": tuple(zip(lows, highs)), "dilation": (1,) * n, "lhs_dilation": (1,) * n, "groups": g}
+            phase_op = Op("conv", (Value(TensorType(x.shape, x.dtype)), Value(TensorType(sub.shape, w.dtype))), (Value(phase_type),), make_attrs(attrs))
+            result = self._op_conv(phase_op, [x, sub])
+            self.elementwise("copy", phase_type, [result], lambda b, t, s, ts: t[0], out=replace(out, view=target))
+        return out
 
     def _spread_into(self, x: Ref, shape, strides, offset, padding, lhs_dilation, dtype, order=None) -> Ref:
         """A zeroed buffer of `shape` holding x's elements at `strides` (in x's [N, C, *spatial]
@@ -738,6 +802,19 @@ class _Converter:
         view = View(tuple(out_type.shape), (math.prod(out_spatial) * O, 1, *(p * O for p in positions)), result.view.offset)
         return self.materialize(replace(result, view=view))
 
+    def _swapped_layout(self, ref: Ref) -> Ref:
+        """ref [A, B, ...] copied to memory laid out [B, A, ...] (and still read as [A, B, ...]).
+        A weight gradient's conv computes [C, O, *kernel]; autodiff then swaps its first two
+        axes into the weight's [O, C, *kernel], and the optimizer reads that along the kernel:
+        laid out the other way, every one of its reads was strided (2.2 ms for one 512 x 512 x
+        3 x 3 update instead of 0.05)."""
+        shape = tuple(ref.shape)
+        swapped = (shape[1], shape[0], *shape[2:])
+        out = self.new_buffer(TensorType(swapped, ref.dtype), BufferKind.temp)
+        cs = contiguous_strides(swapped)
+        view = View(shape, (cs[1], cs[0], *cs[2:]), 0)
+        return self.elementwise("copy", TensorType(shape, ref.dtype), [ref], lambda b, t, s, ts: t[0], out=replace(out, view=view))
+
     def _conv_reduce_im2col(self, op: Op, inputs: list[Ref], spread, row, plane) -> Ref:
         """A weight gradient's conv (small output, kernel as large as the input) as the
         transposed product of the forward's im2col columns and the output gradient.
@@ -797,7 +874,7 @@ class _Converter:
             result = replace(result, view=View((KK, Of), (Of, 1), result.view.offset))
         # [(*kern, Cf), Of] read as this conv's output [Cf, Of, *kern].
         ks = contiguous_strides(kern)
-        return replace(result, view=View(tuple(out_type.shape), (Of, 1, *(k * Cf * Of for k in ks)), result.view.offset))
+        return self._swapped_layout(replace(result, view=View(tuple(out_type.shape), (Of, 1, *(k * Cf * Of for k in ks)), result.view.offset)))
 
     def _conv_grid_reduce(self, op: Op, inputs: list[Ref]) -> Ref:
         """conv with a small output and a large kernel (a weight gradient: the "kernel" is the
@@ -858,7 +935,7 @@ class _Converter:
         if chunks > 1:
             result = self._reduce(result, "sum", (1 + n,), TensorType((O, *out_spatial, N), out_type.dtype))
         rs = contiguous_strides((O, *out_spatial, N))
-        return replace(result, view=View(tuple(out_type.shape), (rs[-1], rs[0], *rs[1:-1]), result.view.offset))
+        return self._swapped_layout(replace(result, view=View(tuple(out_type.shape), (rs[-1], rs[0], *rs[1:-1]), result.view.offset)))
 
     def _conv_windows(self, op: Op, inputs: list[Ref]) -> Ref:
         """conv as a contract over a window view of the input (implicit GEMM: nothing is copied
@@ -957,7 +1034,34 @@ class _Converter:
         # For each axis of the indexed tensor: the tile axis giving its coordinate, or -1 for the indexed axis.
         return tuple(i if i < axis else -1 if i == axis else i - 1 + n_index for i in range(rank))
 
+    def _reversal(self, op: Op) -> bool:
+        """gather(x, (K - 1) - iota(K), axis): x reversed along the axis (autodiff's flip of a
+        convolution kernel; Graph IR has no reverse op)."""
+        if op.attr("batch_dims") != 0 or op.inputs[1].type.rank != 1:
+            return False
+        size = op.inputs[0].type.shape[op.attr("axis")]
+        sub = self.producers.get(op.inputs[1])
+        if sub is None or sub.kind != "sub" or op.inputs[1].type.shape != (size,):
+            return False
+        top, ramp = (self.producers.get(v) for v in sub.inputs)
+        if ramp is None or ramp.kind != "iota" or ramp.attr("axis") != 0:
+            return False
+        while top is not None and top.kind == "broadcast":
+            top = self.producers.get(top.inputs[0])
+        if top is None or top.kind != "constant":
+            return False
+        values = np.asarray(top.attr("value").array)
+        return values.size == 1 and int(values.reshape(-1)[0]) == size - 1
+
     def _op_gather(self, op: Op, inputs: list[Ref]) -> Ref:
+        if self._reversal(op) and isinstance(inputs[0].shape[op.attr("axis")], int):
+            # A view with a negative stride: the copy that consumes it (a convolution's weight
+            # going channels-last) does the reversal on the way, instead of a pass of its own.
+            x, axis = self.plain(inputs[0]), op.attr("axis")
+            v = x.view
+            strides = list(v.strides)
+            strides[axis] = -v.strides[axis]
+            return replace(x, view=View(v.shape, tuple(strides), v.offset + (v.shape[axis] - 1) * v.strides[axis]))
         x, index = self.plain(inputs[0]), inputs[1]
         axis, batch_dims = op.attr("axis"), op.attr("batch_dims")
         out_type = op.outputs[0].type

@@ -87,8 +87,11 @@ def run_program(program: Program, inputs: Sequence, state: Mapping[str, np.ndarr
             fill = np.nan if b.type.dtype.is_float else 0
             storage[b.name] = np.full(evaluate(b.elements(), env), fill, b.type.dtype.numpy)
     for index, launch in enumerate(program.launches):
-        arrays = [storage[n][evaluate(launch.offset(i), env) :] for i, n in enumerate(launch.buffers)]
-        _run_task(launch.task, arrays, env)
+        # Whole arrays and the launch offsets added to the addresses, as the device does with
+        # pointers: a slice from the offset would let a negative stride (a reversed view)
+        # wrap around to the array's end instead of reading before the offset.
+        arrays = [storage[n] for n in launch.buffers]
+        _run_task(launch.task, arrays, env, [evaluate(launch.offset(i), env) for i in range(len(launch.buffers))])
         if after_launch is not None:
             after_launch(index, launch, storage)
 
@@ -106,8 +109,8 @@ def _symbols(program: Program) -> dict:
     return symbol_table(Graph(tuple(Value(b.type) for b in program.buffers), (), ()))
 
 
-def _run_task(task: Task, arrays: list[np.ndarray], env: dict[str, int]) -> None:
-    views = [_Bound(a.view, env) for a in task.args]
+def _run_task(task: Task, arrays: list[np.ndarray], env: dict[str, int], offsets=None) -> None:
+    views = [_Bound(a.view, env, (offsets or [0] * len(task.args))[i]) for i, a in enumerate(task.args)]
     grid = tuple(evaluate(d, env) for d in task.grid)
     with np.errstate(all="ignore"):
         for pid in np.ndindex(*grid):
@@ -118,10 +121,10 @@ def _run_task(task: Task, arrays: list[np.ndarray], env: dict[str, int]) -> None
 class _Bound:
     """A view with its dimensions evaluated."""
 
-    def __init__(self, view: View, env: dict[str, int]) -> None:
+    def __init__(self, view: View, env: dict[str, int], base: int = 0) -> None:
         self.shape = tuple(evaluate(d, env) for d in view.shape)
         self.strides = tuple(evaluate(d, env) for d in view.strides)
-        self.offset = evaluate(view.offset, env)
+        self.offset = evaluate(view.offset, env) + base  # base: the launch's offset of the argument
         self.pad = tuple((evaluate(lo, env), evaluate(hi, env)) for lo, hi in view.pad) if view.pad is not None else None
         self.fill = view.fill
 
