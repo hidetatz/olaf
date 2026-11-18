@@ -123,8 +123,8 @@ def _operand(e, region, load: TOp, axes: list[int]) -> _Operand | None:
     e.aligned_args.add(load.attr("arg"))  # its launch offset (tile.normalize) is checked at launch
     iv = region.params[0]
     for s in load.inputs:
-        if s is not iv and s not in e.values:
-            return None  # a start computed inside the loop: cannot be evaluated for a future stage
+        if not _evaluable(e, s, iv):
+            return None  # a start computed inside the loop from more than index arithmetic on it
     return _Operand(load.attr("arg"), view, list(load.inputs), rows_axis, cols_axis, contiguous_cols, shape[rows_axis], shape[cols_axis])
 
 
@@ -771,9 +771,28 @@ def prefetch_streamed(e, plan, iv_reg: str, lo, step, iv: TValue) -> None:
     e.barrier()
 
 
+_INDEX_OPS = {"add": "llvm.add", "sub": "llvm.sub", "mul": "llvm.mul", "floordiv": "llvm.udiv", "mod": "llvm.urem"}
+
+
+def _evaluable(e, value: TValue, iv: TValue | None) -> bool:
+    """A start _start can compute for any stage: the loop variable, a value from outside the
+    loop, a scalar constant, or index arithmetic on those (a loop over several reduced labels
+    splits its variable into each label's position by division; tile/from_graph.py)."""
+    if (iv is not None and value is iv) or value in e.values:
+        return True
+    op = e.producers.get(value)
+    if op is None or op.outputs[0].type.shape != ():
+        return False
+    if op.kind == "full":
+        return True
+    return op.kind in _INDEX_OPS and all(_evaluable(e, v, iv) for v in op.inputs)
+
+
 def _start(e, value: TValue, iv: TValue | None, k: str) -> str | None:
-    """The register holding a copy's start: k for the loop variable, an emitted value, or a
-    scalar constant (which a loop body may create before it is emitted)."""
+    """The register holding a copy's start at loop position k: k for the loop variable, an
+    emitted value, a scalar constant (which a loop body may create before it is emitted), or
+    index arithmetic on those, emitted again for this k. Indices are never negative, so the
+    divisions are unsigned."""
     if iv is not None and value is iv:
         return k
     if value in e.values:
@@ -781,4 +800,9 @@ def _start(e, value: TValue, iv: TValue | None, k: str) -> str | None:
     op = e.producers.get(value)
     if op is not None and op.kind == "full" and op.outputs[0].type.shape == ():
         return e.i32(op.attr("value"))
+    if op is not None and op.kind in _INDEX_OPS and op.outputs[0].type.shape == ():
+        a, b = (_start(e, v, iv, k) for v in op.inputs)
+        if a is None or b is None:
+            return None
+        return e.emit(f"{_INDEX_OPS[op.kind]} {a}, {b} : i32")
     return None

@@ -26,6 +26,12 @@ from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides, full_view
 
 # Schedule defaults (tile sizes, split targets) are the capability's: backend/capability.Tuning.
+# A convolution over fewer padded positions than this runs its rows across images (_conv_grid_rows).
+SMALL_PLANE = 1024
+# Convolutions whose padded grid (stride included) is more than this times their outputs copy
+# their windows out instead (im2col), within a size limit for the copy.
+IM2COL_WASTE = 1.3
+IM2COL_BYTES = 512 << 20
 
 
 @dataclass(frozen=True)
@@ -432,6 +438,14 @@ class _Converter:
             warps = max(4, min(32, extent[inner_reduced] // 256))
         else:
             extent[inner_reduced] = _block(shape[inner_reduced], self.capability.tuning.row_reduce_block)
+            # Reduced axes that end the shape share one tile: a batch norm's statistic sums
+            # [N, C, H, W] over N, H and W, and a 16-wide W alone made 16-element steps (19 GB/s).
+            budget = self.capability.tuning.row_reduce_block // extent[inner_reduced]
+            for a in range(inner_reduced - 1, -1, -1):
+                if a not in axes or budget < 2 or not isinstance(shape[a], int) or extent[a + 1] != shape[a + 1]:
+                    break
+                extent[a] = _block(shape[a], budget)
+                budget //= extent[a]
         out_tile = tuple(extent[a] for a in kept)
         tile_shape = tuple(extent[a] for a in range(rank))
         grid = tuple(_ceil_div(shape[a], extent[a]) for a in kept)
@@ -499,12 +513,15 @@ class _Converter:
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
         extent = {c: 1 for c in size}
+        # Matrix instructions need 16-wide tiles; a narrower extent (a first layer's 3 input
+        # channels) is padded up and masked rather than falling back to scalar products.
+        least = 16 if matrix else 1
         if m_inner:
-            extent[m_inner] = _block(size[m_inner], bm)
+            extent[m_inner] = max(least, _block(size[m_inner], bm))
         if n_inner:
-            extent[n_inner] = _block(size[n_inner], bn)
+            extent[n_inner] = max(least, _block(size[n_inner], bn))
         if k_inner:
-            extent[k_inner] = _block(size[k_inner], bk)
+            extent[k_inner] = max(least, _block(size[k_inner], bk))
         em, en, ek = (extent[c] if c else 1 for c in (m_inner, n_inner, k_inner))
         out_type = op.outputs[0].type
         out = self.new_buffer(out_type, BufferKind.temp)
@@ -654,9 +671,18 @@ class _Converter:
                 x.dtype,
                 order=(0, *range(2, 2 + n), 1),
             )
+        out_spatial = tuple(out_type.shape[2:])
+        waste = plane / math.prod(out_spatial)
+        if waste > IM2COL_WASTE and N * math.prod(out_spatial) * math.prod(kernel) * C * 2 <= IM2COL_BYTES:
+            return self._conv_im2col(x, w, base, op, spread, row, start)
         letters = "uvz"[:n]
         merged = dilation[-1] == 1  # the last kernel axis and the channels are one contiguous run
-        shape, strides, labels = [N, plane], [plane * C, C], "nm"
+        # Small planes (a CIFAR network's later stages: 6x6 padded) would leave most of a
+        # 128-row tile empty per image; their rows run on across images instead (the grid is
+        # channels-last, so image n + 1 starts where image n ends), and the [rows, O] result is
+        # copied to the channels-first output.
+        across = plane < SMALL_PLANE
+        shape, strides, labels = ([N * plane], [C], "m") if across else ([N, plane], [plane * C, C], "nm")
         for i in range(n - 1 if merged else n):
             shape.append(kernel[i])
             strides.append(dilation[i] * row[i] * C)
@@ -671,13 +697,107 @@ class _Converter:
         w_shape = [O, *kernel[: n - 1 if merged else n], kernel[-1] * C if merged else C]
         w_strides = [ws[0], *ws[1 : (n if merged else n + 1)], 1]
         weights = Ref(wt.buffer, View(tuple(w_shape), tuple(w_strides), 0), w.dtype)
-        k_order = labels[2:]
-        spec = f"{labels},o{k_order}->nom"
-        rows_type = TensorType((N, O, plane), out_type.dtype)
+        k_order = labels[1:] if across else labels[2:]
+        spec = f"{labels},o{k_order}->" + ("mo" if across else "nom")
+        rows_type = TensorType((N * plane, O) if across else (N, O, plane), out_type.dtype)
         contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(rows_type),), make_attrs({"spec": spec}))
         result = self._op_contract(contract, [windows, weights])
+        if across:
+            view = View(tuple(out_type.shape), (plane * O, 1, *(st * r * O for st, r in zip(stride, row))), result.view.offset)
+            return self.materialize(replace(result, view=view))
         view = View(tuple(out_type.shape), (O * plane, plane, *(st * r for st, r in zip(stride, row))), result.view.offset)
         return replace(result, view=view)
+
+    def _conv_im2col(self, x: Ref, w: Ref, base: Ref, op: Op, spread, row, start) -> Ref:
+        """The windows copied out ([N * out positions, kernel * C], channels last, contiguous
+        on both sides of the copy), then one dense matrix product. Used where computing every
+        grid position would waste more than IM2COL_WASTE: small planes (a padded 6x6 around 4x4
+        outputs is 2.25x the work) and strided convolutions (stride s computed at stride 1 is
+        s^n the work), where copying k^n times the (small) input costs less."""
+        from olaf.graph.builder import make_attrs
+
+        stride, dilation = op.attr("stride"), op.attr("dilation")
+        n = len(stride)
+        N, C = x.shape[:2]
+        O = w.shape[0]
+        kernel = tuple(w.shape[2:])
+        out_type = op.outputs[0].type
+        out_spatial = tuple(out_type.shape[2:])
+        plane = math.prod(spread)
+        shape = (N, *out_spatial, *kernel, C)
+        windows = Ref(base.buffer, View(shape, (plane * C, *(st * r * C for st, r in zip(stride, row)), *(d * r * C for d, r in zip(dilation, row)), 1), start * C), x.dtype)
+        cols = self.elementwise("copy", TensorType(shape, x.dtype), [windows], lambda b, t, s, ts: t[0])
+        M, K = N * math.prod(out_spatial), math.prod(kernel) * C
+        rows = Ref(cols.buffer, View((M, K), (K, 1), 0), x.dtype)
+        wt = self.materialize(replace(w, view=View((O, *kernel, w.shape[1]), (w.view.strides[0], *w.view.strides[2:], w.view.strides[1]), w.view.offset)))
+        weights = Ref(wt.buffer, View((O, K), (K, 1), 0), w.dtype)
+        result_type = TensorType((M, O), out_type.dtype)
+        contract = Op("contract", (Value(TensorType((M, K), x.dtype)), Value(TensorType((O, K), w.dtype))), (Value(result_type),), make_attrs({"spec": "mk,ok->mo"}))
+        result = self._op_contract(contract, [rows, weights])
+        positions = contiguous_strides(out_spatial)
+        view = View(tuple(out_type.shape), (math.prod(out_spatial) * O, 1, *(p * O for p in positions)), result.view.offset)
+        return self.materialize(replace(result, view=view))
+
+    def _conv_reduce_im2col(self, op: Op, inputs: list[Ref], spread, row, plane) -> Ref:
+        """A weight gradient's conv (small output, kernel as large as the input) as the
+        transposed product of the forward's im2col columns and the output gradient.
+
+        The conv here is conv(x^T, dy^T): its batch is the forward's input channels, its
+        channels the forward's batch, its kernel the forward's output positions and its output
+        the forward's kernel positions. In the forward's terms it is dW = dY^T cols, with cols
+        [batch, out positions, kernel positions x channels] the windows copied out channels-last
+        (aligned and contiguous, unlike reading the grid at each kernel offset). Its result is
+        only kernel x channels by O, a few tiles, and its reduction (batch x out positions)
+        long, so the batch is split into chunks reduced in parallel, then summed.
+        """
+        from olaf.graph.builder import make_attrs
+
+        xc, wc = inputs  # xc [Cf, Nf, *in], wc [Of, Nf, *outf] in the forward's names
+        stride, padding, dilation = (op.attr(k) for k in ("stride", "padding", "dilation"))
+        n = len(stride)
+        Cf, Nf = xc.shape[:2]
+        Of = wc.shape[0]
+        outf = tuple(wc.shape[2:])  # the forward's output positions: this conv's kernel
+        kern = tuple(op.outputs[0].type.shape[2:])  # the forward's kernel positions: this conv's output
+        out_type = op.outputs[0].type
+        # The forward's input, padded, channels-last: [Nf, *spread, Cf].
+        start = sum(max(-lo, 0) * r for (lo, _), r in zip(padding, row))
+        base = self.new_buffer(TensorType((Nf * plane * Cf,), xc.dtype), BufferKind.temp)
+        src = self.plain(xc)
+        order = (1, *range(2, 2 + n), 0)
+        padded_shape = (Nf, *spread, Cf)
+        pad = ((0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding), (0, 0))
+        source = replace(src, view=View(padded_shape, tuple(src.view.strides[i] for i in order), src.view.offset, pad, 0.0))
+        self.elementwise("copy", TensorType(padded_shape, xc.dtype), [source], lambda b, t, s, ts: t[0], out=replace(base, view=View(padded_shape, contiguous_strides(padded_shape), 0)))
+        # cols[nf, *outf, *kern, cf] = x[nf, outf * d + kern * s, cf] (this conv's stride s applies
+        # to its output, the forward's kernel; its dilation d to its kernel, the forward's output).
+        shape = (Nf, *outf, *kern, Cf)
+        windows = View(shape, (plane * Cf, *(d * r * Cf for d, r in zip(dilation, row)), *(st * r * Cf for st, r in zip(stride, row)), 1), start * Cf)
+        cols = self.elementwise("copy", TensorType(shape, xc.dtype), [replace(base, view=windows)], lambda b, t, s, ts: t[0])
+        P, KK = math.prod(outf), math.prod(kern) * Cf
+        tiles = -(-KK // 128) * -(-Of // 128)
+        chunks = 1
+        while tiles * chunks * 2 <= 4 * self.capability.roofline.compute_units and Nf % (chunks * 2) == 0:
+            chunks *= 2
+        per = Nf // chunks
+        a = Ref(cols.buffer, View((chunks, per, P, KK), (per * P * KK, P * KK, KK, 1), 0), xc.dtype)
+        dy = wc if wc.view.is_contiguous or all(st != 0 for st in wc.view.strides) else self.materialize(wc)
+        ds = dy.view.strides  # [Of, Nf, *outf]; the output positions must merge into one axis
+        if not all(ds[2 + i] == ds[3 + i] * outf[i + 1] for i in range(n - 1)):
+            dy = self.materialize(dy)
+            ds = dy.view.strides
+        b = Ref(dy.buffer, View((chunks, per, P, Of), (per * ds[1], ds[1], ds[1 + n], ds[0]), dy.view.offset), dy.dtype)
+        acc = accumulator_dtype(out_type.dtype)
+        partial_type = TensorType((chunks, KK, Of), acc if chunks > 1 else out_type.dtype)
+        contract = Op("contract", (Value(TensorType(a.shape, xc.dtype)), Value(TensorType(b.shape, dy.dtype))), (Value(partial_type),), make_attrs({"spec": "snpk,snpo->sko"}))
+        result = self._op_contract(contract, [a, b])
+        if chunks > 1:
+            result = self._reduce(result, "sum", (0,), TensorType((KK, Of), out_type.dtype))
+        else:
+            result = replace(result, view=View((KK, Of), (Of, 1), result.view.offset))
+        # [(*kern, Cf), Of] read as this conv's output [Cf, Of, *kern].
+        ks = contiguous_strides(kern)
+        return replace(result, view=View(tuple(out_type.shape), (Of, 1, *(k * Cf * Of for k in ks)), result.view.offset))
 
     def _conv_grid_reduce(self, op: Op, inputs: list[Ref]) -> Ref:
         """conv with a small output and a large kernel (a weight gradient: the "kernel" is the
@@ -704,6 +824,10 @@ class _Converter:
         spread = [(s - 1) * ld + 1 + max(lo, 0) + max(hi, 0) for s, ld, (lo, hi) in zip(x.shape[2:], lhs_dilation, padding)]
         row = [math.prod(spread[i + 1 :]) for i in range(n)]
         plane = math.prod(spread)
+        cols_bytes = C * math.prod(w.shape[2:]) * math.prod(out_spatial) * N * 2
+        # In the forward's terms the grid wastes plane / (its output positions, here the kernel).
+        if all(ld == 1 for ld in lhs_dilation) and cols_bytes <= IM2COL_BYTES and plane / math.prod(w.shape[2:]) > IM2COL_WASTE:
+            return self._conv_reduce_im2col(op, inputs, spread, row, plane)
         K = C * plane
         tiles = math.prod(out_spatial) * -(-N // 128) * -(-O // 128)
         chunks = 1
