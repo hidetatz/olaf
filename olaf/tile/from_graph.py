@@ -10,6 +10,8 @@ Tile sizes here are defaults, not tuned choices: the schedule search replaces th
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 
@@ -537,7 +539,29 @@ class _Converter:
             pipelined = stages if label == k_inner else 1
             return builder.for_range(builder.index(0), builder.dim(size[label]), extent[label], [acc], body, stages=pipelined)[0]
 
-        acc = loop(b, 0, dict(out_starts), b.full((em, en), 0, acc_dtype))
+        def flat_loop(builder: TileBuilder, starts: dict[str, TValue], acc: TValue) -> TValue:
+            """All reduced labels in one loop, its step split into each label's position by
+            division: nested loops would pipeline only the innermost (a convolution's 64
+            channels in 32-wide steps: two iterations between the 3x3 kernel loops)."""
+            tiles = -(-size[k_inner] // ek)
+            outer = [c for c in k_labels if c != k_inner]
+            total = tiles * math.prod(size[c] for c in outer)
+
+            def body(inner: TileBuilder, iv: TValue, carries: list[TValue]) -> list[TValue]:
+                here = dict(starts)
+                rest = iv
+                here[k_inner] = inner.op("mul", inner.op("mod", rest, inner.index(tiles)), inner.index(ek))
+                rest = inner.op("floordiv", rest, inner.index(tiles))
+                for c in reversed(outer):
+                    here[c] = inner.op("mod", rest, inner.index(size[c]))
+                    rest = inner.op("floordiv", rest, inner.index(size[c]))
+                return [step(inner, here, carries[0])]
+
+            return builder.for_range(builder.index(0), builder.index(total), 1, [acc], body, stages=stages)[0]
+
+        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels)
+        acc0 = b.full((em, en), 0, acc_dtype)
+        acc = flat_loop(b, dict(out_starts), acc0) if flatten else loop(b, 0, dict(out_starts), acc0)
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
         tiled = [c for c in out_labels if c in (m_inner, n_inner)]
         if tiled == [n_inner, m_inner] and m_inner and n_inner:
@@ -550,6 +574,169 @@ class _Converter:
         return out
 
     def _op_conv(self, op: Op, inputs: list[Ref]) -> Ref:
+        """conv as one dense matrix product over the padded grid (see _conv_grid_rows and
+        _conv_grid_reduce), or, where neither fits (groups), over window views (_conv_windows)."""
+        g = op.attr("groups")
+        out_positions = math.prod(op.outputs[0].type.shape[2:])
+        kernel_positions = math.prod(inputs[1].shape[2:])
+        if g == 1 and out_positions < kernel_positions:
+            return self._conv_grid_reduce(op, inputs)
+        if g == 1:
+            return self._conv_grid_rows(op, inputs)
+        return self._conv_windows(op, inputs)
+
+    def _spread_into(self, x: Ref, shape, strides, offset, padding, lhs_dilation, dtype, order=None) -> Ref:
+        """A zeroed buffer of `shape` holding x's elements at `strides` (in x's [N, C, *spatial]
+        order) from `offset`: x padded and dilated, in whatever layout the strides say.
+
+        order: the axis order the copy walks (its tiles run along the last), so that its stores
+        are the contiguous side: into a channels-last buffer, writes along the channels are
+        coalesced and the strided side is the reads, which the caches absorb (the other way
+        round, NCHW to NHWC ran at 16 GB/s)."""
+        base = self.elementwise("fill", TensorType(tuple(shape), dtype), [], lambda b, tiles, starts, tile: b.full(tile, 0, dtype))
+        src = self.plain(x)
+        order = tuple(order or range(len(x.shape)))
+        src = replace(src, view=View(tuple(src.shape[i] for i in order), tuple(src.view.strides[i] for i in order), src.view.offset))
+        into = View(tuple(x.shape[i] for i in order), tuple(strides[i] for i in order), offset)
+        self.elementwise("copy", TensorType(src.shape, dtype), [src], lambda b, t, s, ts: t[0], out=replace(base, view=into))
+        return base
+
+    def _conv_grid_rows(self, op: Op, inputs: list[Ref]) -> Ref:
+        """conv as one matrix product per image, its rows every position of the padded grid.
+
+        The input goes, padded and dilated, to a zeroed channels-last [N, *padded spatial, C]
+        buffer. Numbering output positions over the whole padded plane, not just the valid
+        ones, row m at kernel offset (u, v) starts at element (m + u * d * Wp + v * d) * C:
+        affine in m, so per image the windows are a [plane, KH, KW * C] operand whose
+        reduction is contiguous (KW * C when undilated; C stays 16-byte aligned for the async
+        copies, which a channels-first layout cannot give: its kernel offsets shift rows by
+        single elements). The result is [N, O, plane], the output's channels-first layout with
+        a row stride of Wp, so nothing is copied after. The positions outside the valid
+        outputs are computed and dropped: (Hp * Wp) / (OH * OW) - 1 extra work, 7% for a padded
+        3x3 over 56x56, 56% over 8x8. A stride s is computed at stride 1 and subsampled (s^n the
+        work; cuDNN does better there). The buffer's tail is padded so the last rows' windows
+        stay inside it.
+        """
+        from olaf.graph.builder import make_attrs
+
+        x, w = inputs
+        stride, padding, dilation, lhs_dilation = (op.attr(k) for k in ("stride", "padding", "dilation", "lhs_dilation"))
+        n = len(stride)
+        N, C = x.shape[:2]
+        O = w.shape[0]
+        kernel = tuple(w.shape[2:])
+        out_type = op.outputs[0].type
+        spread = [(s - 1) * ld + 1 + max(lo, 0) + max(hi, 0) for s, ld, (lo, hi) in zip(x.shape[2:], lhs_dilation, padding)]
+        row = [math.prod(spread[i + 1 :]) for i in range(n)]
+        plane = math.prod(spread)
+        start = sum(max(-lo, 0) * r for (lo, _), r in zip(padding, row))  # negative padding crops
+        reach = start + sum((k - 1) * d * r for k, d, r in zip(kernel, dilation, row))
+        if all(ld == 1 for ld in lhs_dilation):
+            # One pass writes the whole grid: the input read through a padded view (zeros
+            # outside it), channels last. The tail past the grid is left unwritten: only rows
+            # outside the valid outputs read it, and those are dropped.
+            base = self.new_buffer(TensorType(((N * plane + reach) * C,), x.dtype), BufferKind.temp)
+            src = self.plain(x)
+            order = (0, *range(2, 2 + n), 1)
+            padded_shape = (N, *spread, C)
+            pad = ((0, 0), *((max(lo, 0), max(hi, 0)) for lo, hi in padding), (0, 0))
+            source = replace(src, view=View(padded_shape, tuple(src.view.strides[i] for i in order), src.view.offset, pad, 0.0))
+            into = View(padded_shape, contiguous_strides(padded_shape), 0)
+            self.elementwise("copy", TensorType(padded_shape, x.dtype), [source], lambda b, t, s, ts: t[0], out=replace(base, view=into))
+        else:
+            base = self._spread_into(
+                x,
+                ((N * plane + reach) * C,),
+                (plane * C, 1, *(ld * r * C for ld, r in zip(lhs_dilation, row))),
+                sum(max(lo, 0) * r for (lo, _), r in zip(padding, row)) * C,
+                padding,
+                lhs_dilation,
+                x.dtype,
+                order=(0, *range(2, 2 + n), 1),
+            )
+        letters = "uvz"[:n]
+        merged = dilation[-1] == 1  # the last kernel axis and the channels are one contiguous run
+        shape, strides, labels = [N, plane], [plane * C, C], "nm"
+        for i in range(n - 1 if merged else n):
+            shape.append(kernel[i])
+            strides.append(dilation[i] * row[i] * C)
+            labels += letters[i]
+        shape.append(kernel[-1] * C if merged else C)
+        strides.append(1)
+        labels += "c"
+        windows = Ref(base.buffer, View(tuple(shape), tuple(strides), start * C), x.dtype)
+        # The weight channels-last too: [O, *kernel, C], merged like the windows.
+        wt = self.materialize(replace(w, view=View((O, *kernel, w.shape[1]), (w.view.strides[0], *w.view.strides[2:], w.view.strides[1]), w.view.offset)))
+        ws = contiguous_strides((O, *kernel, w.shape[1]))
+        w_shape = [O, *kernel[: n - 1 if merged else n], kernel[-1] * C if merged else C]
+        w_strides = [ws[0], *ws[1 : (n if merged else n + 1)], 1]
+        weights = Ref(wt.buffer, View(tuple(w_shape), tuple(w_strides), 0), w.dtype)
+        k_order = labels[2:]
+        spec = f"{labels},o{k_order}->nom"
+        rows_type = TensorType((N, O, plane), out_type.dtype)
+        contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(rows_type),), make_attrs({"spec": spec}))
+        result = self._op_contract(contract, [windows, weights])
+        view = View(tuple(out_type.shape), (O * plane, plane, *(st * r for st, r in zip(stride, row))), result.view.offset)
+        return replace(result, view=view)
+
+    def _conv_grid_reduce(self, op: Op, inputs: list[Ref]) -> Ref:
+        """conv with a small output and a large kernel (a weight gradient: the "kernel" is the
+        output gradient) as [N * out, K] x [K, O] with K = C * Hp * Wp, the whole padded grid.
+
+        The input stays [N, C, *padded spatial]; the kernel is zero-padded to that grid (placed
+        at its dilation). Output position p then reads the input at k + p * stride (elements),
+        so the reduction is one contiguous axis of both operands; kernel positions outside the
+        real kernel are zeros. Their work, (Hp * Wp) / (KH * KW) - 1, is the price.
+
+        The output (O x 3 x 3 x C for a 3x3 weight gradient) is a handful of dot tiles, too
+        few to fill the device, and K is long (N * Hp * Wp), so K is split into chunks that
+        are reduced in parallel (an extra label of the product) and then summed.
+        """
+        from olaf.graph.builder import make_attrs
+
+        x, w = inputs
+        stride, padding, dilation, lhs_dilation = (op.attr(k) for k in ("stride", "padding", "dilation", "lhs_dilation"))
+        n = len(stride)
+        N, C = x.shape[:2]
+        O = w.shape[0]
+        out_type = op.outputs[0].type
+        out_spatial = tuple(out_type.shape[2:])
+        spread = [(s - 1) * ld + 1 + max(lo, 0) + max(hi, 0) for s, ld, (lo, hi) in zip(x.shape[2:], lhs_dilation, padding)]
+        row = [math.prod(spread[i + 1 :]) for i in range(n)]
+        plane = math.prod(spread)
+        K = C * plane
+        tiles = math.prod(out_spatial) * -(-N // 128) * -(-O // 128)
+        chunks = 1
+        while tiles * chunks * 2 <= 4 * self.capability.roofline.compute_units and K // (chunks * 2) >= 1024:
+            chunks *= 2
+        chunk = -(-K // chunks)
+        chunk = -(-chunk // 64) * 64  # whole k tiles per chunk
+        start = sum(max(-lo, 0) * r for (lo, _), r in zip(padding, row))
+        reach = start + sum((o - 1) * st * r for o, st, r in zip(out_spatial, stride, row)) + chunk * chunks - K
+        base = self._spread_into(
+            x,
+            (N * K + reach,),
+            (K, plane, *(ld * r for ld, r in zip(lhs_dilation, row))),
+            sum(max(lo, 0) * r for (lo, _), r in zip(padding, row)),
+            padding,
+            lhs_dilation,
+            x.dtype,
+        )
+        kpad = self._spread_into(w, (O, chunk * chunks), (chunk * chunks, plane, *(d * r for d, r in zip(dilation, row))), 0, [(0, 0)] * n, [1] * n, w.dtype)
+        letters = "pqr"[:n]
+        windows = Ref(base.buffer, View((N, *out_spatial, chunks, chunk), (K, *(st * r for st, r in zip(stride, row)), chunk, 1), start), x.dtype)
+        kernel = Ref(kpad.buffer, View((O, chunks, chunk), (chunk * chunks, chunk, 1), 0), w.dtype)
+        acc = accumulator_dtype(out_type.dtype)
+        spec = f"n{letters}sk,osk->o{letters}sn"
+        partial_type = TensorType((O, *out_spatial, chunks, N), acc if chunks > 1 else out_type.dtype)
+        contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(kernel.shape, w.dtype))), (Value(partial_type),), make_attrs({"spec": spec}))
+        result = self._op_contract(contract, [windows, kernel])
+        if chunks > 1:
+            result = self._reduce(result, "sum", (1 + n,), TensorType((O, *out_spatial, N), out_type.dtype))
+        rs = contiguous_strides((O, *out_spatial, N))
+        return replace(result, view=View(tuple(out_type.shape), (rs[-1], rs[0], *rs[1:-1]), result.view.offset))
+
+    def _conv_windows(self, op: Op, inputs: list[Ref]) -> Ref:
         """conv as a contract over a window view of the input (implicit GEMM: nothing is copied
         per window).
 
