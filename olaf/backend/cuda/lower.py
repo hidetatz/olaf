@@ -119,6 +119,15 @@ class MmaRows:
     rank: int
 
 
+@dataclass(frozen=True)
+class MmaCols:
+    """An MmaAcc whose rows were split into several tile axes (implicit GEMM rows n, h, w):
+    only the column pairing is left, slots q and q + 1 being columns c and c + 1 of one row."""
+
+    col_axis: int
+    rank: int
+
+
 @dataclass
 class _Emitter:
     task: Task
@@ -594,6 +603,9 @@ class _Emitter:
             if src.coords is None:
                 return [self.make(out_t, list(src.regs))]
             if [d for d in src.type.shape if d != 1] != [d for d in out_t.shape if d != 1]:
+                split = self.split_relabel(src, out_t)
+                if split is not None:
+                    return [split]
                 return [self.make(out_t, list(self.cyclic(src).regs))]
             # Only unit axes appear or disappear: relabel the coordinates.
             return [self.relabel(src, out_t, self.unit_map(src.type.shape, out_t.shape))]
@@ -689,6 +701,53 @@ class _Emitter:
             out.append(big.pop(0) if d != 1 else None)
         return out
 
+    def split_relabel(self, src: _Value, out_t: TileType) -> _Value | None:
+        """A reshape that only splits axes (an accumulator's rows into a convolution's n, h, w),
+        as new coordinates computed from the old by division: no data moves. None for other
+        reshapes."""
+        big = [(i, d) for i, d in enumerate(src.type.shape) if d != 1]
+        parts: list[tuple[int, int, int] | None] = [None] * out_t.rank  # (source axis, inner size, extent)
+        out_big = [k for k, d in enumerate(out_t.shape) if d != 1]
+        j = 0
+        for axis, d in big:
+            run = []
+            size = 1
+            while j < len(out_big) and size < d:
+                run.append(out_big[j])
+                size *= out_t.shape[out_big[j]]
+                j += 1
+            if size != d:
+                return None
+            inner = 1
+            for k in reversed(run):
+                parts[k] = (axis, inner, out_t.shape[k])
+                inner *= out_t.shape[k]
+        if j != len(out_big):
+            return None
+        key = ("split", id(src.coords), tuple(out_t.shape))
+        if key not in self.coords_cache:
+            zero = self.i32(0)
+            coords = []
+            for c in src.coords:
+                row = []
+                for k, part in enumerate(parts):
+                    if part is None:
+                        row.append(zero)
+                        continue
+                    axis, inner, extent = part
+                    q = self.entry(f"llvm.udiv {c[axis]}, {self.i32(inner)} : i32") if inner > 1 else c[axis]
+                    row.append(self.entry(f"llvm.urem {q}, {self.i32(extent)} : i32") if inner * extent < src.type.shape[axis] else q)
+                coords.append(row)
+            self.coords_cache[key] = coords
+            self.keep.append(src.coords)
+        structure = None
+        acc = src.structure
+        if isinstance(acc, (MmaAcc, MmaCols)):
+            col = [k for k, part in enumerate(parts) if part is not None and part[0] == acc.col_axis]
+            if len(col) == 1:
+                structure = MmaCols(col[0], out_t.rank)
+        return _Value(list(src.regs), False, out_t, self.coords_cache[key], src.valid, structure)
+
     def relabel(self, src: _Value, out_t: TileType, mapping: list[int | None]) -> _Value:
         """src with output axis k taken from source axis mapping[k] (None: a unit axis). No data moves."""
         zero = self.i32(0)
@@ -698,6 +757,8 @@ class _Emitter:
             inverse = {m: k for k, m in enumerate(mapping) if m is not None}
             if isinstance(structure, MmaAcc):
                 structure = MmaAcc(structure.em, structure.en, structure.wm, structure.wn, inverse[structure.row_axis], inverse[structure.col_axis], out_t.rank)
+            elif isinstance(structure, MmaCols):
+                structure = MmaCols(inverse[structure.col_axis], out_t.rank)
             else:
                 structure = MmaRows(structure.acc, inverse[structure.row_axis], out_t.rank)
         # Relabeled coordinates are entry-block names; caching them persistently keeps one list
@@ -1195,7 +1256,7 @@ class _Emitter:
         arg = op.attr("arg")
         view = self.task.args[arg].view
         dtype = value.type.dtype
-        if not isinstance(acc, MmaAcc) or dtype not in (DType.bf16, DType.f32) or view.pad is not None or self.task.args[arg].dtype is not dtype:
+        if not isinstance(acc, (MmaAcc, MmaCols)) or dtype not in (DType.bf16, DType.f32) or view.pad is not None or self.task.args[arg].dtype is not dtype:
             return False
         col = acc.col_axis
         if view.strides[col] != 1:

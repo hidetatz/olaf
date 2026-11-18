@@ -643,13 +643,29 @@ class _Converter:
         # Matrix instructions need 16-wide tiles; a narrower extent (a first layer's 3 input
         # channels) is padded up and masked rather than falling back to scalar products.
         least = 16 if matrix else 1
+        m_tiled = [m_inner] if m_inner else []
         if m_inner:
             extent[m_inner] = max(least, _block(size[m_inner], bm))
+            # Rows shorter than a tile (a convolution's 8 output columns, labels n, h, w of
+            # implicit GEMM rows) would leave most of it empty; the tile reaches over the labels
+            # before them instead, while each inner one is covered whole. The rows are then not
+            # one affine axis: the dot's operand copies split a row number into the labels.
+            run = {m_inner: _block(size[m_inner], bm)}
+            for c in reversed(m_labels[:-1]):
+                first = next(iter(run))
+                total = math.prod(run.values())
+                if not matrix or run[first] != size[first] or total * 2 > bm or not isinstance(size[c], int):
+                    break
+                run = {c: _block(size[c], bm // total), **run}
+            if len(run) > 1 and math.prod(run.values()) % least == 0:
+                m_tiled = list(run)
+                extent.update(run)
         if n_inner:
             extent[n_inner] = max(least, _block(size[n_inner], bn))
         if k_inner:
             extent[k_inner] = max(least, _block(size[k_inner], bk))
-        em, en, ek = (extent[c] if c else 1 for c in (m_inner, n_inner, k_inner))
+        en, ek = (extent[c] if c else 1 for c in (n_inner, k_inner))
+        em = math.prod(extent[c] for c in m_tiled)
         out_type = op.outputs[0].type
         out = self.new_buffer(out_type, BufferKind.temp)
         acc_dtype = accumulator_dtype(ra.dtype)
@@ -659,17 +675,18 @@ class _Converter:
         pids = [TValue(TileType((), INDEX)) for _ in out_labels]
         out_starts = {c: p if extent[c] == 1 else b.op("mul", p, b.index(extent[c])) for c, p in zip(out_labels, pids)}
 
-        def operand(builder: TileBuilder, arg: int, term: str, ref: Ref, starts: dict[str, TValue], rows: str | None, cols: str | None) -> TValue:
+        def operand(builder: TileBuilder, arg: int, term: str, ref: Ref, starts: dict[str, TValue], rows: list[str], cols: str | None) -> TValue:
             tile = builder.op("load", *(starts[c] for c in term), arg=arg, shape=tuple(extent[c] for c in term), dtype=ref.dtype, other=0)
-            # Move the two tiled labels last (rows, then cols) and drop the unit axes around them.
-            order = [i for i, c in enumerate(term) if c not in (rows, cols)] + [term.index(c) for c in (rows, cols) if c]
+            # Move the tiled labels last (rows, then cols) and drop the unit axes around them.
+            tiled = [*rows, *([cols] if cols else [])]
+            order = [i for i, c in enumerate(term) if c not in tiled] + [term.index(c) for c in tiled]
             if order != list(range(len(term))):
                 tile = builder.op("permute", tile, perm=tuple(order))
-            return builder.op("reshape", tile, shape=(extent[rows] if rows else 1, extent[cols] if cols else 1))
+            return builder.op("reshape", tile, shape=(math.prod(extent[c] for c in rows), extent[cols] if cols else 1))
 
         def step(builder: TileBuilder, starts: dict[str, TValue], acc: TValue) -> TValue:
-            a = operand(builder, 0, ta, ra, starts, m_inner, k_inner)
-            bt = operand(builder, 1, tb, rb, starts, k_inner, n_inner)
+            a = operand(builder, 0, ta, ra, starts, m_tiled, k_inner)
+            bt = operand(builder, 1, tb, rb, starts, [k_inner] if k_inner else [], n_inner)
             return builder.op("dot", a, bt, acc)
 
         def loop(builder: TileBuilder, depth: int, starts: dict[str, TValue], acc: TValue) -> TValue:
@@ -710,9 +727,16 @@ class _Converter:
         acc0 = b.full((em, en), 0, acc_dtype)
         acc = flat_loop(b, dict(out_starts), acc0) if flatten else loop(b, 0, dict(out_starts), acc0)
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
-        tiled = [c for c in out_labels if c in (m_inner, n_inner)]
-        if tiled == [n_inner, m_inner] and m_inner and n_inner:
-            result = b.op("permute", result, perm=(1, 0))
+        if len(m_tiled) > 1:
+            held = [*m_tiled, n_inner]
+            result = b.op("reshape", result, shape=(*(extent[c] for c in m_tiled), en))
+            perm = sorted(range(len(held)), key=lambda i: out_labels.index(held[i]) if held[i] else len(out_labels))
+            if perm != list(range(len(held))):
+                result = b.op("permute", result, perm=tuple(perm))
+        else:
+            tiled = [c for c in out_labels if c in (m_inner, n_inner)]
+            if tiled == [n_inner, m_inner] and m_inner and n_inner:
+                result = b.op("permute", result, perm=(1, 0))
         result = b.op("reshape", result, shape=tuple(extent[c] for c in out_labels))
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
         # The schedule key is recorded so the search can find this dot's launches in a whole program.
@@ -881,6 +905,8 @@ class _Converter:
             )
         out_spatial = tuple(out_type.shape[2:])
         waste = plane / math.prod(out_spatial)
+        if waste > IM2COL_WASTE and self._implicit_rows(C, out_spatial, dilation):
+            return self._conv_implicit(x, w, base, op, spread, row, start)
         if waste > IM2COL_WASTE and N * math.prod(out_spatial) * math.prod(kernel) * C * 2 <= IM2COL_BYTES:
             return self._conv_im2col(x, w, base, op, spread, row, start)
         letters = "uvz"[:n]
@@ -913,6 +939,45 @@ class _Converter:
         # Left channels-last: pointwise readers follow that layout (_layout), and the next
         # convolution's grid is channels-last too.
         view = View(tuple(out_type.shape), (plane * O, 1, *(st * r * O for st, r in zip(stride, row))), result.view.offset)
+        return replace(result, view=view)
+
+    @staticmethod
+    def _implicit_rows(C, out_spatial, dilation) -> bool:
+        """Whether _conv_implicit applies: the dot's 16-byte operand copies need channel runs of
+        8, and its row tile spans output rows only when each is covered whole (a power of two,
+        tile/from_graph._op_contract)."""
+        last = out_spatial[-1]
+        return isinstance(C, int) and C % 8 == 0 and dilation[-1] == 1 and isinstance(last, int) and last & (last - 1) == 0
+
+    def _conv_implicit(self, x: Ref, w: Ref, base: Ref, op: Op, spread, row, start) -> Ref:
+        """Implicit GEMM: the dot reads the windows straight from the channels-last grid, its
+        rows the output positions (n, *out), its reduction (*kernel[:-1], KW * C). Where
+        _conv_im2col copies KH * KW times the input out first (0.9 GB a ResNet-18 step), the
+        rows here are not one affine axis: a row tile spans whole output rows of a few images
+        and the operand copies split a row number into n, h, w (backend/cuda/mma.py)."""
+        from olaf.graph.builder import make_attrs
+
+        stride, dilation = op.attr("stride"), op.attr("dilation")
+        n = len(stride)
+        N, C = x.shape[:2]
+        O = w.shape[0]
+        kernel = tuple(w.shape[2:])
+        out_type = op.outputs[0].type
+        out_spatial = tuple(out_type.shape[2:])
+        plane = math.prod(spread)
+        positions, kernels = "hwz"[:n], "uvy"[: n - 1]
+        shape = (N, *out_spatial, *kernel[:-1], kernel[-1] * C)
+        strides = (plane * C, *(st * r * C for st, r in zip(stride, row)), *(d * r * C for d, r in zip(dilation[:-1], row[:-1])), 1)
+        windows = Ref(base.buffer, View(shape, strides, start * C), x.dtype)
+        wt = self.materialize(replace(w, view=View((O, *kernel, w.shape[1]), (w.view.strides[0], *w.view.strides[2:], w.view.strides[1]), w.view.offset)))
+        K = kernel[-1] * C
+        weights = Ref(wt.buffer, View((O, *kernel[:-1], K), (*contiguous_strides((O, *kernel[:-1], K)),), 0), w.dtype)
+        rows_type = TensorType((N, *out_spatial, O), out_type.dtype)
+        spec = f"n{positions}{kernels}k,o{kernels}k->n{positions}o"
+        contract = Op("contract", (Value(TensorType(windows.shape, x.dtype)), Value(TensorType(weights.shape, w.dtype))), (Value(rows_type),), make_attrs({"spec": spec}))
+        result = self._op_contract(contract, [windows, weights])
+        cs = contiguous_strides(rows_type.shape)
+        view = View(tuple(out_type.shape), (cs[0], 1, *cs[1:-1]), result.view.offset)
         return replace(result, view=view)
 
     def _conv_im2col(self, x: Ref, w: Ref, base: Ref, op: Op, spread, row, start) -> Ref:

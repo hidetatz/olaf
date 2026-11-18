@@ -27,6 +27,7 @@ Lowered.aligned and checked at launch, with the general kernel as the fallback.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from olaf.graph.dim import Dim
@@ -48,6 +49,10 @@ class _Operand:
     contiguous_cols: bool  # True: stored [rows][cols]; False: stored [cols][rows]
     rows: int
     cols: int
+    # The view axes the strided side's index runs over, outermost first: one axis, or several
+    # when a tile's rows span labels that are not one affine axis (implicit GEMM rows n, h, w;
+    # tile/from_graph.py). A copy's row number is split into them by division.
+    strided_axes: tuple[tuple[int, int], ...] = ()  # (view axis, tile extent)
 
     @property
     def stored_rows(self) -> int:
@@ -62,11 +67,12 @@ class _Operand:
         return self.rows * self.cols * 2
 
 
-def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tuple[TOp, list[int]] | None:
+def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tuple[TOp, list[tuple[int, ...]]] | None:
     """Follow reshape/permute (and one exact b16 -> f32 cast) back to a load.
 
-    Returns the load and the tile axes of the 2-D (rows, cols). A widening cast is exact, so an
-    f32 dot of widened b16 values is the b16 dot with an f32 accumulator.
+    Returns the load and, for the 2-D (rows, cols), the tile axes each is made of (outermost
+    first; usually one). A widening cast is exact, so an f32 dot of widened b16 values is the
+    b16 dot with an f32 accumulator.
     """
     chain = []
     while value in producers and producers[value].kind in ("reshape", "permute", "cast"):
@@ -80,7 +86,7 @@ def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tu
     if load is None or load.kind != "load":
         return None
     shape = list(load.attr("shape"))
-    axes = list(range(len(shape)))
+    axes: list[tuple[int, ...]] = [(a,) for a in range(len(shape))]
     for op in reversed(chain):
         if op.kind == "permute":
             perm = op.attr("perm")
@@ -88,10 +94,19 @@ def _trace_operand(e, region, value: TValue, producers: dict[TValue, TOp]) -> tu
         else:
             big = [(a, d) for a, d in zip(axes, shape) if d != 1]
             target = [d for d in op.attr("shape") if d != 1]
-            if [d for _, d in big] != target:
+            # Each target axis is a run of consecutive source axes (a merge, row-major).
+            merged, i = [], 0
+            for d in target:
+                group, size = (), 1
+                while i < len(big) and size < d:
+                    group, size = group + big[i][0], size * big[i][1]
+                    i += 1
+                if size != d:
+                    return None
+                merged.append(group)
+            if i != len(big):
                 return None
-            axes = [a for a, _ in big]
-            shape = target
+            axes, shape = merged, target
     if len(axes) != 2:
         return None
     return load, axes
@@ -101,11 +116,12 @@ def _operand(e, region, load: TOp, axes: list[int]) -> _Operand | None:
     view = e.task.args[load.attr("arg")].view
     if load.attr("dtype") not in _PTX_TYPE:
         return None
-    rows_axis, cols_axis = axes
+    rows_axes, cols_axes = axes
+    rows_axis, cols_axis = rows_axes[-1], cols_axes[-1]
     shape = load.attr("shape")
-    if view.strides[cols_axis] == 1:
+    if len(cols_axes) == 1 and view.strides[cols_axis] == 1:
         contiguous_cols = True
-    elif view.strides[rows_axis] == 1:
+    elif len(rows_axes) == 1 and view.strides[rows_axis] == 1:
         contiguous_cols = False
     else:
         return None
@@ -125,7 +141,8 @@ def _operand(e, region, load: TOp, axes: list[int]) -> _Operand | None:
     for s in load.inputs:
         if not _evaluable(e, s, iv):
             return None  # a start computed inside the loop from more than index arithmetic on it
-    return _Operand(load.attr("arg"), view, list(load.inputs), rows_axis, cols_axis, contiguous_cols, shape[rows_axis], shape[cols_axis])
+    rows, cols = (math.prod(shape[a] for a in g) for g in axes)
+    return _Operand(load.attr("arg"), view, list(load.inputs), rows_axis, cols_axis, contiguous_cols, rows, cols, tuple((a, shape[a]) for a in (rows_axes if contiguous_cols else cols_axes)))
 
 
 def lower_matrix_loop(e, op: TOp, args):
@@ -229,8 +246,22 @@ class _MatrixLoop:
             c = e.entry(f"llvm.add %tid, {e.i32(i * e.threads)} : i32") if i else "%tid"
             row = e.entry(f"llvm.udiv {c}, {e.i32(per_row)} : i32")
             chunk = e.entry(f"llvm.urem {c}, {e.i32(per_row)} : i32")
-            plan.append((row, chunk, self.swizzled(operand, row, chunk)))
+            plan.append((row, chunk, self.swizzled(operand, row, chunk), self.split_row(operand, row)))
         return plan
+
+    def split_row(self, operand: _Operand, row: str) -> list[tuple[int, str]]:
+        """A stored row's index along each strided view axis (entry block): (axis, index)."""
+        axes = operand.strided_axes
+        if len(axes) <= 1:
+            return []
+        e = self.e
+        parts, inner = [], 1
+        for k in range(len(axes) - 1, -1, -1):
+            axis, extent = axes[k]
+            q = e.entry(f"llvm.udiv {row}, {e.i32(inner)} : i32") if inner > 1 else row
+            parts.append((axis, e.entry(f"llvm.urem {q}, {e.i32(extent)} : i32") if k else q))
+            inner *= extent
+        return parts
 
     def fragment_offsets(self, lane: str, wm_idx: str, wn_idx: str):
         """Byte offsets of each lane's ldmatrix row address, for A[i][kk] and B[p][kk]."""
@@ -319,9 +350,13 @@ class _MatrixLoop:
         starts = [_start(e, s, iv, k) for s in operand.starts]
         contiguous = operand.cols_axis if operand.contiguous_cols else operand.rows_axis
         strided = operand.rows_axis if operand.contiguous_cols else operand.cols_axis
-        for row, chunk, smem_offset in plan:
+        for row, chunk, smem_offset, parts in plan:
             coords = list(starts)
-            coords[strided] = e.emit(f"llvm.add {starts[strided]}, {row} : i32")
+            if parts:
+                for axis, index in parts:
+                    coords[axis] = e.emit(f"llvm.add {starts[axis]}, {index} : i32")
+            else:
+                coords[strided] = e.emit(f"llvm.add {starts[strided]}, {row} : i32")
             coords[contiguous] = e.emit(f"llvm.add {starts[contiguous]}, {e.emit(f'llvm.mul {chunk}, {e.i32(8)} : i32')} : i32")
             offset, inside, padded = e.view_address(operand.view, coords)
             inside = inside or e.const(True, "i1")
@@ -598,7 +633,9 @@ def _global_operand(e, value: TValue):
     view = e.task.args[load.attr("arg")].view
     if load.attr("dtype") not in _PTX_TYPE or view.pad is not None or e.task.args[load.attr("arg")].writes:
         return None
-    rows_axis, cols_axis = axes
+    if any(len(g) != 1 for g in axes):
+        return None
+    rows_axis, cols_axis = (g[0] for g in axes)
     contiguous_cols = view.strides[cols_axis] == 1
     if not contiguous_cols and view.strides[rows_axis] != 1:
         return None

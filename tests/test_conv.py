@@ -150,9 +150,20 @@ def test_conv_transpose_on_device_matches_eager(xs, ws, stride, padding, output_
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("xs,ws,stride,padding,dilation,groups", [CONVS[1], CONVS[2], ((4, 32, 16, 16), (64, 32, 3, 3), 1, 1, 1, 1)])
+@pytest.mark.parametrize(
+    "xs,ws,stride,padding,dilation,groups",
+    [
+        CONVS[1],
+        CONVS[2],
+        ((4, 32, 16, 16), (64, 32, 3, 3), 1, 1, 1, 1),
+        # Small planes, plain and strided: implicit GEMM, row tiles over n, h and w.
+        ((6, 32, 8, 8), (64, 32, 3, 3), 1, 1, 1, 1),
+        ((6, 32, 16, 16), (64, 32, 3, 3), 2, 1, 1, 1),
+    ],
+)
 def test_bf16_conv_on_device_matches_eager(xs, ws, stride, padding, dilation, groups):
     # bf16 operands go to the matrix instructions through strided window views.
+    from olaf.backend.capability import AMPERE_RTX3060
     from olaf.backend.cuda.runtime import CudaProgram
     from olaf.graph.interp import interpret
     from olaf.graph.ir import bf16_round
@@ -163,6 +174,7 @@ def test_bf16_conv_on_device_matches_eager(xs, ws, stride, padding, dilation, gr
     fn = lambda x, w: olaf.conv(x, w, stride, padding, dilation, groups)  # noqa: E731
     graph = lower_graph(olaf.trace(lambda x, w: (fn(x, w), olaf.grad(lambda x, w: olaf.sum(olaf.cast(fn(x, w), olaf.f32) ** 2.0), argnums=(0, 1))(x, w)), *spec).graph)
     want, _ = interpret(graph, [x, w])
-    got, _ = CudaProgram(to_program(graph)).run([x, w])
+    # The device's capability, so the dots take the matrix instructions' tiles and lowering.
+    got, _ = CudaProgram(to_program(graph, AMPERE_RTX3060)).run([x, w])
     for a, b in zip(got, want):
         assert relative(a, b) < 1e-2

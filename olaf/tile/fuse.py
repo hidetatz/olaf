@@ -53,7 +53,7 @@ class _Pointwise:
     coordinate: frozenset[TValue]
     store: TOp
     cost: int
-    widens: bool = False  # bytes per output element exceed the bytes it reads per element
+    widens: bool = False  # output in a wider type than its inputs, and no fewer bytes than it reads (see _pointwise)
 
 
 def fuse(program: Program) -> Program:
@@ -88,6 +88,14 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
         if arg.view != full_view(target.type.shape) or other.inputs[1:] != starts or other.inputs[0].type.shape != store.inputs[0].type.shape:
             return None
     coordinate = _coordinate_values(body)
+    args = launch.task.args
+    total = _elements(args[store.attr("arg")].view)
+    # Values computed only from small broadcast operands (a batch norm's per-channel mean and
+    # rstd over a whole activation) vary along few axes; f32 arithmetic on them is not counted:
+    # a reader recomputing them per element spends a few instructions where materializing the
+    # task's output costs its bytes (BN's backward: 33 MB of f32 per layer, written once and
+    # read twice).
+    small = {op.outputs[0] for op in body.ops if op.kind == "load" and _small(args[op.attr("arg")].view, total)}
     cost = 0
     for op in body.ops:
         if op.kind == "load" and (op.inputs != starts or op.attr("shape") != store.inputs[0].type.shape):
@@ -102,13 +110,40 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
             return None
         if op.kind == "broadcast" and op.attr("dims") != ():
             return None
+        if op.kind not in _FREE and op.inputs and all(v in small or v in coordinate or _is_scalar_constant(body, v) for v in op.inputs):
+            small.update(op.outputs)
+            if op.outputs[0].type.dtype is not DType.f64:
+                continue
+        elif op.kind == "cast" and op.inputs[0] in small:
+            small.update(op.outputs)
         if op.kind not in _FREE:
             # f64 arithmetic is never cheap: duplicated into a reader it runs once per thread,
             # and consumer GPUs do f64 at 1/64 of the f32 rate (AdamW's f64 bias corrections,
             # inlined into GPT-2's 38M-element embedding update, would be ~1e9 f64 operations).
             cost += CHEAP_OPS + 1 if op.outputs and op.outputs[0].type.dtype is DType.f64 else 1
-    read = sum(_BYTES[a.dtype] for a in launch.task.args if not a.writes and any(st != 0 for st in a.view.strides))
-    return _Pointwise(launch, starts, coordinate, store, cost, _BYTES[store.inputs[0].type.dtype] > read)
+    # Widening: the output takes no fewer bytes than the inputs it reads, in a wider type than
+    # each (bf16 in, f32 out: GELU's input; a residual gradient summing two bf16 tensors in
+    # f32). Reading the inputs again in each reader then moves no more than reading the
+    # output would, and its write goes away. Same-type chains (f32 attention scores) stay as
+    # they are: duplicating them breaks up the patterns later passes match.
+    reads = [_BYTES[a.dtype] for a in args if not a.writes and not _small(a.view, total)]
+    out_bytes = _BYTES[store.inputs[0].type.dtype]
+    return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads))
+
+
+def _elements(view: View) -> Dim:
+    """Distinct elements a view addresses (axes of stride 0 repeat them)."""
+    count: Dim = 1
+    for d, st in zip(view.shape, view.strides):
+        if st != 0:
+            count = count * d
+    return count
+
+
+def _small(view: View, total: Dim) -> bool:
+    """A broadcast operand that a task rereads from cache: under 1/64 of its output's elements."""
+    n = _elements(view)
+    return isinstance(n, int) and isinstance(total, int) and n * 64 <= total
 
 
 def _coordinate_values(body: Body) -> frozenset[TValue]:
@@ -157,7 +192,7 @@ class _Rewriter:
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
         view = self.launch.task.args[op.attr("arg")].view
-        if recipe is None or (view.source is None and not _same_layout(recipe, name, self.buffers)):
+        if recipe is None or (view.source is None and not _same_layout(recipe, name, self.buffers) and _stepped(recipe, view, self.buffers[name]) is None):
             return None
         if view.source is None and self.readers[name] > 1 and _narrows(recipe):
             # Its output stays for the other readers (a bf16 copy for a dot): reading the wider
@@ -218,7 +253,12 @@ class _Rewriter:
             ins = [mapped.get(v, v) for v in op.inputs]
             if op.kind == "load":
                 arg = producer.task.args[op.attr("arg")]
-                view = _compose(arg.view, consumer_view) if consumer_view.source is not None else _same_layout_view(arg.view, consumer_view)
+                if consumer_view.source is not None:
+                    view = _compose(arg.view, consumer_view)
+                elif _same_layout(recipe, producer.buffers[recipe.store.attr("arg")], self.buffers):
+                    view = _same_layout_view(arg.view, consumer_view)
+                else:
+                    view = _stepped_view(arg.view, consumer_view, *_stepped(recipe, consumer_view, self.buffers[producer.buffers[recipe.store.attr("arg")]]))
                 slot = self.arg_index(producer.buffers[op.attr("arg")], Arg(view, arg.dtype, False))
                 if index is not None:
                     out = b.op("load_indexed", index, *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), axis_map=load.attr("axis_map"), other=op.attr("other"))
@@ -327,6 +367,27 @@ def _same_layout(recipe: _Pointwise, name: str, buffers: dict[str, Buffer]) -> b
         if source.type.shape != out.type.shape or source.strides is not None or arg.view != full_view(out.type.shape):
             return False
     return True
+
+
+def _stepped(recipe: _Pointwise, view: View, out: Buffer):
+    """For a consumer view without a source map in which every axis steps along one axis of
+    the producer's (contiguous) output, without carrying into the next: per view axis
+    (producer axis, step) and the producer coordinates of its first element
+    (tile.normalize._axis_steps), else None. A split reduction reads a [128, 8, 8, 256]
+    activation as [64, 2, 8, 8, 256]: the producer's input views compose with that exactly as
+    with a source map, which cannot say "axis 0 is 2a + b"."""
+    from olaf.tile.normalize import _axis_steps
+
+    if out.strides is not None or any(op.kind == "iota" for op in recipe.launch.task.body.ops):
+        return None
+    return _axis_steps(view, out.type.shape)
+
+
+def _stepped_view(inner: View, outer: View, steps, starts) -> View:
+    """inner, a producer input view, seen through outer (see _stepped)."""
+    strides = tuple(0 if p is None else k * inner.strides[p] for p, k in steps)
+    offset = inner.offset + sum((o * st for o, st in zip(starts, inner.strides)), 0)
+    return View(outer.shape, strides, offset)
 
 
 def _narrows(recipe: _Pointwise) -> bool:

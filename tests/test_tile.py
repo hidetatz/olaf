@@ -1,5 +1,7 @@
 """Graph IR -> Tile IR conversion: the tile interpreter must match the eager interpreter."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -675,3 +677,33 @@ def test_conv_input_writer_stores_into_the_padded_grid():
     for program in (after, to_program(graph)):
         for a, e in zip(olaf.tree_flatten(run_program(program, [x, w])[0])[0], olaf.tree_flatten(want)[0]):
             assert rel(a, e) < 1e-6
+
+
+def test_widened_sum_with_per_channel_terms_is_recomputed_in_each_reader():
+    # A batch norm backward's shape: two bf16 tensors summed in f32, then shifted and scaled
+    # per channel, read by a split column sum and by a pointwise task. The per-channel
+    # arithmetic is not counted against recomputation and the output (f32 from bf16) is wider
+    # than its inputs, so no full-size f32 buffer is written; the split sum reads [N, H, W, C]
+    # through a view without a source map (fuse._stepped). Values match the interpreter.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import to_program
+
+    shape = (64, 8, 8, 32)
+    a, b = (bf16_round(R.normal(size=shape).astype(np.float32)) for _ in range(2))
+    m, s = R.normal(size=(32,)).astype(np.float32), R.normal(size=(32,)).astype(np.float32)
+
+    def fn(a, b, m, s):
+        y = (olaf.cast(a, F32) + olaf.cast(b, F32) - olaf.broadcast_to(m, shape)) * olaf.rsqrt(olaf.broadcast_to(s * s + 1.0, shape))
+        return olaf.sum(y, axis=(0, 1, 2)), olaf.cast(y * 3.0, olaf.bf16)
+
+    graph = lower(olaf.trace(fn, tt(*shape, dtype=olaf.bf16), tt(*shape, dtype=olaf.bf16), tt(32), tt(32)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    sizes = {buf.name: math.prod(buf.type.shape) for buf in program.buffers}
+    for launch in program.launches:
+        for name, arg in zip(launch.buffers, launch.task.args):
+            assert not (arg.writes and arg.dtype is F32 and sizes[name] == math.prod(shape)), launch.task.origin
+    got = run_program(program, [a, b, m, s])[0]
+    want = interpret(graph, [a, b, m, s])[0]
+    assert rel(got[0], want[0]) < 1e-5
+    assert rel(got[1].astype(np.float32), want[1].astype(np.float32)) < 1e-2
