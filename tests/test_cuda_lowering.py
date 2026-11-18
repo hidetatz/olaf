@@ -157,6 +157,31 @@ def test_matrix_instruction_dot_all_orientations(spec):
     assert rel(actual, expected) < 1e-2
 
 
+def test_linear_layer_gradients_split_and_swap_their_products():
+    """A weight gradient with few output tiles and a long batch x sequence reduction runs as
+    partial products over the batch (then summed); an input gradient written weight-first
+    takes the activation as its rows, so the accumulator's columns are the output's
+    contiguous axis and the fused residual add reads along them."""
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    B, S, D = 4, 1024, 96
+    dy, x, w, r = (bf16_round(R.normal(size=s)) for s in ((B, S, D), (B, S, D), (D, D), (B, S, D)))
+
+    def fn(dy, x, w, r):
+        return olaf.einsum("aby,abz->zy", dy, x), olaf.cast(olaf.einsum("zy,abz->aby", w, dy), F32) + olaf.cast(r, F32)
+
+    graph = lower(olaf.trace(fn, *(tt(*a.shape, dtype=olaf.bf16) for a in (dy, x, w, r))).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    contracts = {launch.task.origin[1]: launch.task for launch in program.launches if launch.task.origin[0] == "contract"}
+    assert set(contracts) == {"abz,aby->azy", "zy,abz->aby"}, set(contracts)
+    assert contracts["zy,abz->aby"].args[0].view.shape == (B, S, D)
+    expected, _ = interpret(graph, [dy, x, w, r])
+    actual, _ = CudaProgram(program).run([dy, x, w, r])
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
 def test_matrix_instruction_dot_falls_back_when_unaligned():
     # K = S is symbolic: 16-byte copies need S % 8 == 0, so S = 13 must take the general kernel
     # chosen at launch, and S = 64 the mma kernel.

@@ -618,6 +618,25 @@ class _Converter:
         (ta, tb), (ra, rb) = terms, inputs
         m_labels = [c for c in out_labels if c in ta and c not in tb]
         n_labels = [c for c in out_labels if c in tb and c not in ta]
+        # The accumulator's columns should run along the output's contiguous label: a dot whose
+        # rows are that label (an input gradient x @ W^T written as W's term first) stores
+        # through a transposed accumulator, and fused epilogues then read every operand across
+        # the register layout (Whisper's fc1 input gradient: 2.95 ms against 0.67 ms unfused).
+        # Not when the new rows are shorter than a tile and than the old ones: a weight
+        # gradient into 3 output channels would run 16-row tiles (DCGAN's last layer: 0.87 ms
+        # against 0.24 ms with the batch as rows and a transposed store).
+        values = list(op.inputs)
+        size0 = {**dict(zip(ta, ra.shape)), **dict(zip(tb, rb.shape))}
+        if (
+            m_labels
+            and n_labels
+            and out_labels.index(m_labels[-1]) > out_labels.index(n_labels[-1])
+            and isinstance(size0[n_labels[-1]], int)
+            and isinstance(size0[m_labels[-1]], int)
+            and size0[n_labels[-1]] >= min(size0[m_labels[-1]], self.capability.tuning.matrix_dot_block[0])
+        ):
+            (ta, tb), (ra, rb), (m_labels, n_labels) = (tb, ta), (rb, ra), (n_labels, m_labels)
+            values.reverse()
         k_labels = [c for c in ta if c in tb and c not in out_labels]
         if any(c not in out_labels and c not in k_labels for c in ta + tb):
             raise NotImplementedError(f"contract labels summed in one operand only: {op.attr('spec')}")
@@ -639,6 +658,9 @@ class _Converter:
             chosen = self.schedules.get(key)
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
+            split = self._contract_split(op, (ta, tb), (ra, rb), values, out_labels, k_labels, size, bm, bn)
+            if split is not None:
+                return split
         extent = {c: 1 for c in size}
         # Matrix instructions need 16-wide tiles; a narrower extent (a first layer's 3 input
         # channels) is padded up and masked rather than falling back to scalar products.
@@ -743,6 +765,48 @@ class _Converter:
         origin = ("contract", op.attr("spec")) + ((key,) if key else ())
         self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=origin)
         return out
+
+    def _contract_split(self, op: Op, terms: tuple[str, str], refs: tuple[Ref, Ref], values: list[Value], out_labels: str, k_labels: list[str], size: dict, bm: int, bn: int) -> Ref | None:
+        """A product with too few output tiles for the device and a long reduction (a linear
+        layer's weight gradient, 384 x 384 over batch x sequence: 9 tiles on 28 SMs) as partial
+        products over the outer reduced labels, which become output labels, then summed.
+
+        Only whole labels move (the batch of a weight gradient): their partial products need no
+        new views. The partials are kept in the accumulator's type and summed once, so the sum
+        rounds to the output type once, as the unsplit product does.
+        """
+        ta, tb = terms
+        if not all(isinstance(size[c], int) for c in size):
+            return None
+        m_inner = next((c for c in reversed(out_labels) if c in ta and c not in tb), None)
+        n_inner = next((c for c in reversed(out_labels) if c in tb and c not in ta), None)
+        if m_inner is None or n_inner is None:
+            return None
+        tiles = math.prod(size[c] for c in out_labels if c not in (m_inner, n_inner)) * _ceil_div(size[m_inner], bm) * _ceil_div(size[n_inner], bn)
+        k_inner = [c for c in ta if c in k_labels][-1]
+        reduced = math.prod(size[c] for c in k_labels)
+        units = self.capability.roofline.compute_units
+        moved = []
+        # 2 tiles per unit: 128 x 128 tiles with 3 stages fit about 2 blocks on an SM. Each part
+        # keeps at least 1024 of the reduction, so the partials' write and sum (an f32 output
+        # per part) stay small against the products.
+        for c in (c for c in ta if c in k_labels and c != k_inner):
+            if tiles >= 2 * units or reduced // size[c] < 1024:
+                break
+            moved.append(c)
+            tiles *= size[c]
+            reduced //= size[c]
+        if not moved:
+            return None
+        from olaf.graph.builder import make_attrs
+
+        partial_labels = "".join(moved) + out_labels
+        acc = accumulator_dtype(refs[0].dtype)
+        partial_type = TensorType(tuple(size[c] for c in partial_labels), acc)
+        spec = f"{ta},{tb}->{partial_labels}"
+        partial = Op("contract", tuple(values), (Value(partial_type),), make_attrs({"spec": spec}))
+        result = self._op_contract(partial, list(refs))
+        return self._reduce(result, "sum", tuple(range(len(moved))), op.outputs[0].type)
 
     def _op_conv(self, op: Op, inputs: list[Ref]) -> Ref:
         """conv as one dense matrix product over the padded grid (see _conv_grid_rows and
