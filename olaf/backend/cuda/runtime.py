@@ -156,6 +156,14 @@ def check_index_range(program: Program, env: dict[str, int]) -> None:
                 )
 
 
+def compile_for(program: Program, capability) -> dict[str, dict[str, str]]:
+    """PTX of every task of `program` for capability.target, without a device: for targets
+    there is no hardware to run on (tests/test_targets.py). {task digest: {kernel: PTX}}."""
+    if not capability.target:
+        raise ValueError(f"{capability.name} names no code generation target")
+    return {key: _compiled(task, capability.target)[1] for key, task in program.tasks().items()}
+
+
 class CudaProgram:
     def __init__(self, program: Program) -> None:
         self.program = program

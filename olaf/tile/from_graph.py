@@ -23,29 +23,7 @@ from olaf.graph.types import DType, TensorType
 from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
 from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TileType, TValue, View, contiguous_strides, full_view
 
-ELEMENTWISE_BLOCK = 128
-ELEMENTWISE_ELEMENTS = 1024
-# Reduced chunk per loop step: wide for row reductions (one value per output, 8 registers per
-# thread at 128 threads), narrow when an inner axis is kept, where the accumulator holds
-# chunk x 128 values (32 per thread).
-ROW_REDUCE_BLOCK = 1024
-# Rows up to this long are reduced in one loop step (with more warps, at most 8 elements per
-# thread), as tile/rows.py fuses rows up to tile.rows.ROW_LIMIT only when one step covers them.
-WHOLE_ROW_LIMIT = 8192
-# A split reduction aims at up to this many blocks per compute unit, and a column reduction
-# reads this many rows per loop step. Measured on the RTX 3060 by graph replay, column sums of
-# 4096 x {768, 2304, 3072} bf16 and 4096 x 768 f32: 4 blocks and 32 rows gave 224 / 149 / 190
-# and 303 GB/s; 8 blocks and 16 rows give 255 / 309 / 318 and 311 GB/s. 32 rows is the part
-# that hurt, though not monotonically in width (2304 columns was the slowest).
-SPLIT_BLOCKS_PER_UNIT = 8
-COLUMN_REDUCE_BLOCK = 16
-DOT_BLOCK = (32, 32, 32)  # M, N, K, without matrix instructions
-# With a 16x8x16 matrix instruction: 128x128 output tiles over 8 warps (64x32 per warp) and a
-# 3-stage async copy pipeline over 32-wide K steps. 3 stages of bf16 A and B tiles take 48 KiB of
-# shared memory, which leaves room on Ampere (100 KiB per SM) for two blocks per SM.
-MATRIX_DOT_BLOCK = (128, 128, 32)
-MATRIX_DOT_WARPS = 8
-MATRIX_DOT_STAGES = 3
+# Schedule defaults (tile sizes, split targets) are the capability's: backend/capability.Tuning.
 
 
 @dataclass(frozen=True)
@@ -65,9 +43,9 @@ def _block(size: Dim, limit: int) -> int:
     return limit
 
 
-def _elementwise_tile(shape) -> tuple[int, ...]:
-    """Tile of an elementwise task: up to ELEMENTWISE_BLOCK along the last axis and, when that
-    is narrow, rows of the axis before it, up to ELEMENTWISE_ELEMENTS in all.
+def _elementwise_tile(shape, tuning) -> tuple[int, ...]:
+    """Tile of an elementwise task: up to tuning.elementwise_block along the last axis and, when
+    that is narrow, rows of the axis before it, up to tuning.elementwise_elements in all.
 
     One 128-element row per instance (one element per thread) left GPT-2's elementwise passes
     far from memory bandwidth: 24576 tiny blocks for a 4 x 1024 x 768 tensor, too little in
@@ -76,14 +54,15 @@ def _elementwise_tile(shape) -> tuple[int, ...]:
     """
     if not shape:
         return ()
-    if isinstance(shape[-1], int) and shape[-1] >= ELEMENTWISE_ELEMENTS:
+    block, elements = tuning.elementwise_block, tuning.elementwise_elements
+    if isinstance(shape[-1], int) and shape[-1] >= elements:
         # A long row (the 50257-wide logits) is tiled along itself, so the elements a thread
         # owns share their row: a broadcast row statistic is one load for all of them.
-        return tuple(1 for _ in shape[:-1]) + (ELEMENTWISE_ELEMENTS,)
-    last = _block(shape[-1], ELEMENTWISE_BLOCK)
+        return tuple(1 for _ in shape[:-1]) + (elements,)
+    last = _block(shape[-1], block)
     rows = 1
     if len(shape) >= 2:
-        rows = _block(shape[-2], max(1, ELEMENTWISE_ELEMENTS // last))
+        rows = _block(shape[-2], max(1, elements // last))
     return tuple(1 for _ in shape[:-2]) + ((rows,) if len(shape) >= 2 else ()) + (last,)
 
 
@@ -242,7 +221,7 @@ class _Converter:
         """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile."""
         out = out or self.new_buffer(out_type, kind)
         shape = out.shape
-        tile = _elementwise_tile(shape)
+        tile = _elementwise_tile(shape, self.capability.tuning)
         grid = tuple(_ceil_div(d, t) for d, t in zip(shape, tile))
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
@@ -424,12 +403,12 @@ class _Converter:
         inner = rank - 1 if rank - 1 in kept else None
         blocks = 1
         for a in kept:
-            blocks *= -(-shape[a] // (_block(shape[a], ELEMENTWISE_BLOCK) if a == inner else 1))
+            blocks *= -(-shape[a] // (_block(shape[a], self.capability.tuning.elementwise_block) if a == inner else 1))
         if blocks >= 2 * units:
             return None
         axis = max(axes, key=lambda a: shape[a])
         parts = 1
-        while blocks * parts * 2 <= SPLIT_BLOCKS_PER_UNIT * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
+        while blocks * parts * 2 <= self.capability.tuning.split_blocks_per_unit * units and shape[axis] % (parts * 2) == 0 and shape[axis] // (parts * 2) >= 64:
             parts *= 2
         return (axis, parts) if parts > 1 else None
 
@@ -441,16 +420,16 @@ class _Converter:
         inner_reduced = max(axes)
         extent = {a: 1 for a in range(rank)}
         if inner_kept is not None:
-            extent[inner_kept] = _block(shape[inner_kept], ELEMENTWISE_BLOCK)
+            extent[inner_kept] = _block(shape[inner_kept], self.capability.tuning.elementwise_block)
         warps = 4
         if inner_kept is not None:
-            extent[inner_reduced] = _block(shape[inner_reduced], COLUMN_REDUCE_BLOCK)
-        elif axes == (rank - 1,) and isinstance(shape[-1], int) and ROW_REDUCE_BLOCK < shape[-1] <= WHOLE_ROW_LIMIT:
+            extent[inner_reduced] = _block(shape[inner_reduced], self.capability.tuning.column_reduce_block)
+        elif axes == (rank - 1,) and isinstance(shape[-1], int) and self.capability.tuning.row_reduce_block < shape[-1] <= self.capability.tuning.whole_row_limit:
             # The whole row in one step, so row fusion (tile/rows.py) can replay it.
-            extent[inner_reduced] = _block(shape[-1], WHOLE_ROW_LIMIT)
+            extent[inner_reduced] = _block(shape[-1], self.capability.tuning.whole_row_limit)
             warps = max(4, min(32, extent[inner_reduced] // 256))
         else:
-            extent[inner_reduced] = _block(shape[inner_reduced], ROW_REDUCE_BLOCK)
+            extent[inner_reduced] = _block(shape[inner_reduced], self.capability.tuning.row_reduce_block)
         out_tile = tuple(extent[a] for a in kept)
         tile_shape = tuple(extent[a] for a in range(rank))
         grid = tuple(_ceil_div(shape[a], extent[a]) for a in kept)
@@ -507,8 +486,8 @@ class _Converter:
         # values with an f32 accumulator, which is exact (products of b16 values fit in f32).
         base = {self._matrix_dtype(v) for v in op.inputs}
         matrix = len(base) == 1 and any(i.m == 16 and i.n == 8 and i.k == 16 and i.dtype_a == next(iter(base)).value and i.dtype_acc == "f32" for i in self.capability.matrix_instructions)
-        bm, bn, bk = MATRIX_DOT_BLOCK if matrix else DOT_BLOCK
-        stages, warps = (MATRIX_DOT_STAGES, MATRIX_DOT_WARPS) if matrix else (1, 4)
+        bm, bn, bk = self.capability.tuning.matrix_dot_block if matrix else self.capability.tuning.dot_block
+        stages, warps = (self.capability.tuning.matrix_dot_stages, self.capability.tuning.matrix_dot_warps) if matrix else (1, 4)
         key = None
         if matrix:
             from olaf.search.schedule import dot_key
@@ -675,7 +654,7 @@ class _Converter:
         axis_map = self._axis_map(x.view.rank, axis, n_index)
         out = self.new_buffer(out_type, BufferKind.temp)
         shape = out_type.shape
-        tile = _elementwise_tile(shape)
+        tile = _elementwise_tile(shape, self.capability.tuning)
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
         starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]
@@ -702,7 +681,7 @@ class _Converter:
         spread, n_index = self._index_over(index, updates.shape, axis, batch_dims)
         axis_map = self._axis_map(out.view.rank, axis, n_index)
         shape = updates.shape
-        tile = _elementwise_tile(shape)
+        tile = _elementwise_tile(shape, self.capability.tuning)
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
         starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]

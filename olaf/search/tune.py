@@ -200,9 +200,8 @@ def tune(graph: Graph, capability: Capability, *, log=print) -> dict[str, DotSch
             if ms is not None and (best_ms is None or ms < best_ms):
                 best, best_ms = candidate, ms
         if best is None:
-            from olaf.tile.from_graph import MATRIX_DOT_BLOCK, MATRIX_DOT_STAGES, MATRIX_DOT_WARPS
-
-            best = DotSchedule(*MATRIX_DOT_BLOCK, MATRIX_DOT_STAGES, MATRIX_DOT_WARPS)
+            t = capability.tuning
+            best = DotSchedule(*t.matrix_dot_block, t.matrix_dot_stages, t.matrix_dot_warps)
         schedules[key] = best
         save(schedules)
         log(f"tuned {spec} {shapes}: {best} ({best_ms:.3f} ms)")
