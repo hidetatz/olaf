@@ -178,3 +178,29 @@ def test_bf16_conv_on_device_matches_eager(xs, ws, stride, padding, dilation, gr
     got, _ = CudaProgram(to_program(graph, AMPERE_RTX3060)).run([x, w])
     for a, b in zip(got, want):
         assert relative(a, b) < 1e-2
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("xs,stride", [((8, 32, 8, 8), 1), ((8, 32, 16, 16), 2)])
+def test_small_plane_weight_gradient_reads_windows_without_im2col(xs, stride):
+    # Output rows of 8: the weight gradient's reduction steps reach over n, h and w (4 x 8 or
+    # 2 x 4 x 4), so it reads the grid through window views; no im2col columns are written.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+    from olaf.graph.interp import interpret
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import lower_graph, to_program
+
+    ws = (64, xs[1], 3, 3)
+    x, w = (bf16_round(R.normal(size=s).astype(np.float32)) for s in (xs, ws))
+    spec = [olaf.TensorType(a.shape, olaf.bf16) for a in (x, w)]
+    fn = lambda x, w: olaf.conv(x, w, stride, 1, 1, 1)  # noqa: E731
+    graph = lower_graph(olaf.trace(lambda x, w: olaf.grad(lambda x, w: olaf.sum(olaf.cast(fn(x, w), olaf.f32) ** 2.0), argnums=(1,))(x, w), *spec).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    specs = {launch.task.origin[1] for launch in program.launches if launch.task.origin and launch.task.origin[0] == "contract"}
+    assert "snhwuk,snhwo->suko" in specs, specs
+    assert not any(launch.task.name == "copy" and len(launch.task.args[-1].view.shape) == 6 for launch in program.launches)
+    want, _ = interpret(graph, [x, w])
+    got, _ = CudaProgram(program).run([x, w])
+    for a, b in zip(got, want):
+        assert relative(a, b) < 1e-2

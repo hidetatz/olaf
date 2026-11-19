@@ -684,9 +684,27 @@ class _Converter:
                 extent.update(run)
         if n_inner:
             extent[n_inner] = max(least, _block(size[n_inner], bn))
+        k_tiled = [k_inner] if k_inner else []
         if k_inner:
             extent[k_inner] = max(least, _block(size[k_inner], bk))
-        en, ek = (extent[c] if c else 1 for c in (n_inner, k_inner))
+            # Likewise for a reduction whose inner label is shorter than a k step (a weight
+            # gradient over a convolution's 8 output columns, labels n, h, w): the step reaches
+            # over the labels before it (4 rows x 8 columns), where padding the 8 to a 16-wide
+            # step wasted half of every product. Both operands' copies split the k index into
+            # the labels, as for rows (backend/cuda/mma.py).
+            k_order = [c for c in ta if c in k_labels]
+            run = {k_inner: _block(size[k_inner], bk)}
+            for c in reversed(k_order[:-1]):
+                first = next(iter(run))
+                total = math.prod(run.values())
+                if not matrix or run[first] != size[first] or total * 2 > bk or not isinstance(size[c], int):
+                    break
+                run = {c: _block(size[c], bk // total), **run}
+            if len(run) > 1 and math.prod(run.values()) % least == 0:
+                k_tiled = list(run)
+                extent.update(run)
+        en = extent[n_inner] if n_inner else 1
+        ek = math.prod(extent[c] for c in k_tiled)
         em = math.prod(extent[c] for c in m_tiled)
         out_type = op.outputs[0].type
         out = self.new_buffer(out_type, BufferKind.temp)
@@ -697,18 +715,18 @@ class _Converter:
         pids = [TValue(TileType((), INDEX)) for _ in out_labels]
         out_starts = {c: p if extent[c] == 1 else b.op("mul", p, b.index(extent[c])) for c, p in zip(out_labels, pids)}
 
-        def operand(builder: TileBuilder, arg: int, term: str, ref: Ref, starts: dict[str, TValue], rows: list[str], cols: str | None) -> TValue:
+        def operand(builder: TileBuilder, arg: int, term: str, ref: Ref, starts: dict[str, TValue], rows: list[str], cols: list[str]) -> TValue:
             tile = builder.op("load", *(starts[c] for c in term), arg=arg, shape=tuple(extent[c] for c in term), dtype=ref.dtype, other=0)
             # Move the tiled labels last (rows, then cols) and drop the unit axes around them.
-            tiled = [*rows, *([cols] if cols else [])]
+            tiled = [*rows, *cols]
             order = [i for i, c in enumerate(term) if c not in tiled] + [term.index(c) for c in tiled]
             if order != list(range(len(term))):
                 tile = builder.op("permute", tile, perm=tuple(order))
-            return builder.op("reshape", tile, shape=(math.prod(extent[c] for c in rows), extent[cols] if cols else 1))
+            return builder.op("reshape", tile, shape=(math.prod(extent[c] for c in rows), math.prod(extent[c] for c in cols)))
 
         def step(builder: TileBuilder, starts: dict[str, TValue], acc: TValue) -> TValue:
-            a = operand(builder, 0, ta, ra, starts, m_tiled, k_inner)
-            bt = operand(builder, 1, tb, rb, starts, [k_inner] if k_inner else [], n_inner)
+            a = operand(builder, 0, ta, ra, starts, m_tiled, k_tiled)
+            bt = operand(builder, 1, tb, rb, starts, k_tiled, [n_inner] if n_inner else [])
             return builder.op("dot", a, bt, acc)
 
         def loop(builder: TileBuilder, depth: int, starts: dict[str, TValue], acc: TValue) -> TValue:
@@ -726,18 +744,19 @@ class _Converter:
             """All reduced labels in one loop, its step split into each label's position by
             division: nested loops would pipeline only the innermost (a convolution's 64
             channels in 32-wide steps: two iterations between the 3x3 kernel loops)."""
-            tiles = -(-size[k_inner] // ek)
-            outer = [c for c in k_labels if c != k_inner]
-            total = tiles * math.prod(size[c] for c in outer)
+            # Each label steps by its extent: 1 for the outer ones, a k step for the inner (and
+            # for every label of a step that reaches over several).
+            order = [c for c in k_labels if c != k_inner] + [k_inner]
+            counts = {c: -(-size[c] // extent[c]) for c in order}
+            total = math.prod(counts.values())
 
             def body(inner: TileBuilder, iv: TValue, carries: list[TValue]) -> list[TValue]:
                 here = dict(starts)
                 rest = iv
-                here[k_inner] = inner.op("mul", inner.op("mod", rest, inner.index(tiles)), inner.index(ek))
-                rest = inner.op("floordiv", rest, inner.index(tiles))
-                for c in reversed(outer):
-                    here[c] = inner.op("mod", rest, inner.index(size[c]))
-                    rest = inner.op("floordiv", rest, inner.index(size[c]))
+                for c in reversed(order):
+                    at = inner.op("mod", rest, inner.index(counts[c])) if counts[c] < total else rest
+                    here[c] = at if extent[c] == 1 else inner.op("mul", at, inner.index(extent[c]))
+                    rest = inner.op("floordiv", rest, inner.index(counts[c]))
                 return [step(inner, here, carries[0])]
 
             return builder.for_range(builder.index(0), builder.index(total), 1, [acc], body, stages=stages)[0]
@@ -745,7 +764,7 @@ class _Converter:
         # Only when the innermost loop is too short to pipeline: with long inner loops (a
         # weight gradient over batch x sequence, 32 steps of the sequence) nesting measured
         # faster (Llama's step: 213 ms nested, 239 flattened).
-        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels) and -(-size[k_inner] // ek) < 8
+        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels) and (len(k_tiled) > 1 or -(-size[k_inner] // ek) < 8)
         acc0 = b.full((em, en), 0, acc_dtype)
         acc = flat_loop(b, dict(out_starts), acc0) if flatten else loop(b, 0, dict(out_starts), acc0)
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
@@ -1223,6 +1242,14 @@ class _Converter:
         row = [math.prod(spread[i + 1 :]) for i in range(n)]
         plane = math.prod(spread)
         cols_bytes = C * math.prod(w.shape[2:]) * math.prod(out_spatial) * N * 2
+        # Window views whose reduction steps reach over the output rows (n, h, w; _op_contract)
+        # when the output rows are shorter than a k step: a power of two up to 32, and channels
+        # in whole 16-byte copies. They copy nothing, where im2col wrote the input KH x KW
+        # times, and they read the output gradient unmerged, so its writer can store into the
+        # next input gradient's padded grid (normalize.eliminate_pad_copies needs that).
+        width = w.shape[-1]
+        if self.capability.matrix_instructions and all(ld == 1 for ld in lhs_dilation) and stride[-1] == 1 and x.shape[0] % 8 == 0 and isinstance(width, int) and width & (width - 1) == 0 and 32 % width == 0 and width <= 16:
+            return self._conv_reduce_windows(op, inputs, spread, row, plane)
         # In the forward's terms the grid wastes plane / (its output positions, here the kernel).
         if all(ld == 1 for ld in lhs_dilation) and cols_bytes <= IM2COL_BYTES and plane / math.prod(w.shape[2:]) > IM2COL_WASTE:
             return self._conv_reduce_im2col(op, inputs, spread, row, plane)

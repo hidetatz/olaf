@@ -167,9 +167,11 @@ def lower_matrix_loop(e, op: TOp, args):
             if producer.kind == "load":
                 break
             v = producer.inputs[0]
-    # Inlined producers can leave scalar constants behind (their index arithmetic); they are pure.
+    # Inlined producers can leave scalar constants behind, and a loop over several reduced
+    # labels splits its variable into each label's position: scalar index arithmetic, pure, and
+    # evaluated again for each stage's copies (_start).
     extra = set(region.ops) - used
-    if any(o.kind not in ("full", "dim") or o.outputs[0].type.shape != () for o in extra):
+    if any(o.kind not in ("full", "dim", *_INDEX_OPS) or o.outputs[0].type.shape != () for o in extra):
         return None
     if dot.outputs[0].type.dtype is not DType.f32:
         return None
