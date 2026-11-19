@@ -156,6 +156,7 @@ class _Emitter:
     # (absolute byte offset, scratch_epoch when written).
     staged: dict = field(default_factory=dict)
     scratch_epoch: int = 0
+    _only_stores: bool | None = None
     resident: dict = field(default_factory=dict)  # load op -> byte offset of its resident copy
     streamed: dict = field(default_factory=dict)  # load op -> this iteration's buffer (scratch-relative SSA)
 
@@ -1273,6 +1274,18 @@ class _Emitter:
             zeros = [self.i32(0)] * len(view.shape)
             scalar = self.masked_load(arg, view, zeros, dtype, 0, view.fill, None)
 
+        if scalar is not None and self.stored_where_loaded(view, tuple(op.inputs), out_t):
+            # Every element this task computes goes to a store with this view's bounds at these
+            # starts, and nothing reduces or accumulates: lanes outside the view are never
+            # written, so `other` would not be seen. (The optimizer's update reads a dozen
+            # scalars per element; their compares and selects made it compute-bound.)
+            # The scalar in every slot, not a replicated value: a replicated tile is stored by
+            # thread 0 alone, as one element.
+            plain = _Value([], self.count(out_t.shape) == 1, out_t)
+            value = self.make(out_t, [scalar] * len(self.layout_of(plain)))
+            value.rebuild = lambda like, scalar=scalar: [scalar] * self.n_slots(like)
+            return value
+
         def at(like):
             if scalar is not None:
                 regs = []
@@ -1300,6 +1313,29 @@ class _Emitter:
         if index is None and not self.task.args[arg].writes:
             value.rebuild = at
         return value
+
+    def stored_where_loaded(self, view: View, starts: tuple, out_t: TileType) -> bool:
+        """Every element of a tile loaded at `starts` reaches memory only through stores
+        whose views have `view`'s shape, at the same starts and tile shape: the task has no
+        reductions, dots, loops or atomics."""
+        if self._only_stores is None:
+            kinds = set()
+
+            def walk(body):
+                for o in body.ops:
+                    kinds.add(o.kind)
+                    for r in o.regions:
+                        walk(r)
+
+            walk(self.task.body)
+            self._only_stores = not (kinds & {"reduce", "dot", "for", "atomic_add", "atomic_add_indexed", "load_indexed"})
+        if not self._only_stores:
+            return False
+        stores = [o for o in self.task.body.ops if o.kind == "store"]
+        return bool(stores) and all(
+            tuple(self.task.args[o.attr("arg")].view.shape) == tuple(view.shape) and o.inputs[0].type.shape == out_t.shape and tuple(o.inputs[1:]) == tuple(starts)
+            for o in stores
+        )
 
     def store(self, op: TOp, args: list[_Value]) -> None:
         value, *starts = args
