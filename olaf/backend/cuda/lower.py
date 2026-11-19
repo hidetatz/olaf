@@ -15,7 +15,8 @@ shuffle-based reductions. Those decisions come from the capability descriptor, n
 Numerics follow the reference interpreters: bf16 values are widened to f32 for each op and
 rounded once (round to nearest even); exp, log, tanh, erf, sin, cos and pow call libdevice, whose
 f32 results are within 2 ulp. PTX's approximate instructions (tanh.approx has about 2^-11
-relative error) would not meet the fp32 tolerance.
+relative error) would not meet the fp32 tolerance; the one exception is an exp marked approx
+by the fused attention (scalar_op), whose arguments are bounded above by zero.
 """
 
 from __future__ import annotations
@@ -150,6 +151,11 @@ class _Emitter:
     # staging, layout exchanges, reductions) address from scratch_base, which moves past the
     # operands a loop keeps resident while its body is emitted.
     scratch_base: int = 0
+    # Accumulators staged into scratch by register dots (backend/cuda/mma.py), reusable while
+    # nothing else has reserved scratch since: (registers, stored rows, row elements) ->
+    # (absolute byte offset, scratch_epoch when written).
+    staged: dict = field(default_factory=dict)
+    scratch_epoch: int = 0
     resident: dict = field(default_factory=dict)  # load op -> byte offset of its resident copy
     streamed: dict = field(default_factory=dict)  # load op -> this iteration's buffer (scratch-relative SSA)
 
@@ -225,8 +231,11 @@ class _Emitter:
         return f"%dim{self.dims[key][0]}"
 
     def reserve(self, nbytes: int) -> None:
-        """Record that scratch needs nbytes from scratch_base."""
+        """Record that scratch needs nbytes from scratch_base (every user of scratch reserves
+        before writing it, which ends the reuse of staged accumulators)."""
         self.shared_bytes = max(self.shared_bytes, self.scratch_base + nbytes)
+        if nbytes:
+            self.scratch_epoch += 1
 
     def smem_base(self) -> str:
         """Pointer to the start of scratch shared memory."""
@@ -412,6 +421,17 @@ class _Emitter:
         if dtype.is_float:
             t = _compute_type(dtype)
             xs = [self.widen(r, dtype) for r in regs]
+            if kind == "exp" and attrs.get("approx") and t == "f32":
+                # ex2.approx.ftz of x log2(e): two instructions where libdevice's expf takes
+                # about eight (in the attention backward, with 32 exps per thread per iteration,
+                # a large share of what the dK/dV loop issued beyond FlashAttention-2's). The
+                # product rounds x log2(e), so the relative error grows with |x|: about
+                # |x| 2^-24 + 2^-22, and results below 2^-126 flush to zero. Only the fused
+                # attention asks for it: its arguments are x - max <= 0, and those far below
+                # zero give probabilities that no longer matter. (The non-ftz ex2 adds a
+                # denormal rescaling per element and measured slower than expf.)
+                scaled = self.emit(f"llvm.fmul {xs[0]}, {self.const(1.4426950408889634, 'f32')} : f32")
+                return self.narrow(self.emit(f'llvm.call_intrinsic "llvm.nvvm.ex2.approx.ftz.f"({scaled}) : (f32) -> f32'), dtype)
             result = self.float_op(kind, xs, t)
             return self.narrow(result, dtype)
         return self.int_op(kind, regs, _LLVM[dtype], dtype)
@@ -1368,6 +1388,7 @@ class _Emitter:
     def emit_loop(self, op: TOp, lo, hi, step, carries) -> tuple[list[_Value], list[_Value]]:
         region = op.regions[0]
         saved_base, saved_resident, saved_streamed = self.scratch_base, dict(self.resident), dict(self.streamed)
+        self.staged = {}
         stream_plan = []
         if self.use_matrix:
             from olaf.backend.cuda.mma import make_resident, make_streamed, prefetch_streamed
@@ -1402,6 +1423,7 @@ class _Emitter:
         # Values rebuilt inside the body do not dominate the code after the loop.
         self.memo = memo
         self.scratch_base, self.resident, self.streamed = saved_base, saved_resident, saved_streamed
+        self.staged = {}
         nxt = self.emit(f"llvm.add {iv}, {step.regs[0]} : i32")
         out = [r for v in results for r in v.regs]
         self.raw(f"llvm.br {header}({', '.join([nxt, *out])} : {', '.join(['i32', *types])})")

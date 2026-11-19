@@ -529,7 +529,18 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
     offsets = {}
     cursor = 0
     ready = set()  # operands already in shared memory (resident or streamed by the loop)
-    for name, found, operand in (("a", a_found, a_op), ("b", b_found, b_op)):
+    keys, at = {}, {}
+    for name, found, operand, value in (("a", a_found, a_op, a), ("b", b_found, b_op, b)):
+        if found is None and _natural(value) is not None:
+            # An accumulator is staged in its own [row][col] order whichever way the dot reads
+            # it, so a second dot on it (the attention backward's dS, read transposed for dK
+            # and directly for dQ) finds it already there: no stores and no barriers.
+            keys[name] = (tuple(value.regs), operand.stored_rows, operand.row_elems)
+            hit = e.staged.get(keys[name])
+            if hit is not None and hit[1] == e.scratch_epoch:
+                offsets[name] = e.i32(hit[0] - e.scratch_base)
+                ready.add(name)
+                continue
         if found is not None and found[1] in e.resident:
             offsets[name] = e.i32(e.resident[found[1]] - e.scratch_base)
             ready.add(name)
@@ -541,8 +552,10 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
             ready.add(name)
         else:
             offsets[name] = e.i32(cursor)
+            at[name] = cursor
             cursor += operand.bytes
     e.reserve(cursor)
+    staged_at = {}
     if len(ready) < 2:
         e.barrier()
     copied = False
@@ -554,6 +567,7 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
             copied = True
         elif _natural(value) is not None:
             _stage_accumulator(e, operand, value, offsets[name])
+            staged_at[name] = True
         else:
             _stage(e, loop, operand, value, offsets[name])
     if copied:
@@ -563,6 +577,8 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
         e.raw("nvvm.cp.async.wait.group 0")
     if len(ready) < 2:
         e.barrier()
+    for name in staged_at:
+        e.staged[keys[name]] = (e.scratch_base + at[name], e.scratch_epoch)
     a_offsets, b_offsets = loop.fragment_offsets(lane, wm_idx, wn_idx)
     out = loop.compute(offsets["a"], acc_regs, a_offsets, b_offsets, a_registers, offsets["b"])
     e.barrier()

@@ -521,8 +521,11 @@ def _store(t: _Task, buffer: str, view: View, dtype: DType, term: str, value: TV
 _ROW_CONSTANT_OPS = frozenset({"cmp", "where", "cast", "neg", "abs", "exp", "log", "sqrt", "rsqrt", "recip", "add", "sub", "mul", "div", "max", "min"})
 
 
-def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tuple[int, ...], starts: list[TValue], target: TValue | None = None) -> TValue:
-    """Evaluate pointwise launch `index` on `tile` at `starts`, with loads of `subs` args replaced."""
+def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tuple[int, ...], starts: list[TValue], target: TValue | None = None, approx_exp: bool = False) -> TValue:
+    """Evaluate pointwise launch `index` on `tile` at `starts`, with loads of `subs` args replaced.
+
+    approx_exp: its exps lower to the approximate exp2 (backend/cuda/lower.py scalar_op): the
+    attention's probabilities, exp(X - F(m)) with X - F(m) <= 0."""
     b = t.b
     launch = p.launch(index)
     info = _pointwise(launch, p.buffers)
@@ -588,7 +591,10 @@ def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tu
         elif op.kind in ("full", "broadcast") and op.outputs[0].type.shape == p_tile and p_tile != ():
             out = b.op(op.kind, *ins, **{**dict(op.attrs), "shape": tile})
         else:
-            out = b.op(op.kind, *ins, **dict(op.attrs))
+            attrs = dict(op.attrs)
+            if approx_exp and op.kind == "exp":
+                attrs["approx"] = True
+            out = b.op(op.kind, *ins, **attrs)
         mapped[op.outputs[0]] = out
         if target is not None and op.outputs[0] is target:
             return out
@@ -721,7 +727,7 @@ class _Builder:
         every element (forward 0.46 -> 0.39 ms per layer for GPT-2 small)."""
         b = t.b
         spread = b.op("broadcast", shift_rows, shape=x.type.shape, dims=tuple(range(x.type.rank)))
-        return b.op("exp", b.op("sub", x, spread))
+        return b.op("exp", b.op("sub", x, spread), approx=True)
 
     def p_exact(self, t: _Task, x: TValue, coords, m_rows: TValue, l_rows: TValue) -> TValue:
         """P as the unfused chain computes it, from the final row statistics.
@@ -731,7 +737,7 @@ class _Builder:
         for the dK/dV task of GPT-2 small.)"""
         f, b = self.f, t.b
         tile = x.type.shape
-        e = _replay(t, self.p, f.t3, {f.x_arg_t3: x, **{a: _spread(b, m_rows, tile) for a in f.m_arg_t3}}, tile, coords)
+        e = _replay(t, self.p, f.t3, {f.x_arg_t3: x, **{a: _spread(b, m_rows, tile) for a in f.m_arg_t3}}, tile, coords, approx_exp=True)
         subs = {f.e_arg_t5: e, **{a: _spread(b, m_rows, tile) for a in f.m_arg_t5}, **{a: _spread(b, l_rows, tile) for a in f.l_arg_t5}}
         return _replay(t, self.p, f.t5, subs, tile, coords)
 
