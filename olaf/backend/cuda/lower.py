@@ -709,6 +709,10 @@ class _Emitter:
             return self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs], args[0])
         dtype = args[0].type.dtype
         n = max(len(a.regs) for a in args)
+        if kind == "exp" and attrs.get("approx") and dtype is DType.f32 and not args[0].replicated:
+            folded = self.approx_exp_of_shift(op, args[0])
+            if folded is not None:
+                return self.make(out_t, folded, like)
         if kind == "div" and dtype is DType.f32 and len(set(args[1].regs)) * 2 <= n:
             # A divisor repeated across slots (a row statistic broadcast along an accumulator's
             # columns: softmax's row sum in the attention backward) is inverted once per
@@ -725,6 +729,48 @@ class _Emitter:
             return self.make(out_t, regs, like)
         regs = [self.scalar_op(kind, [a.regs[i] if len(a.regs) > 1 else a.regs[0] for a in args], dtype, attrs) for i in range(n)]
         return self.make(out_t, regs, like)
+
+    def approx_exp_of_shift(self, op: TOp, arg: _Value) -> list[str] | None:
+        """exp(x * c - shift) marked approx (the fused attention's probabilities) as
+        ex2.approx.ftz(fma(x, c log2(e), -shift log2(e))), with shift * log2(e) once per
+        distinct register (shift is a row statistic broadcast along the columns): one FMA per
+        element where the sub, the scale and the log2(e) product were three. The argument
+        rounds once instead of three times, within the approximation's own error.
+        None when exp's input is not such a sub in arg's layout."""
+        sub = self.producers.get(op.inputs[0])
+        if sub is None or sub.kind != "sub" or any(v.type.dtype is not DType.f32 for v in sub.inputs):
+            return None
+        x, shift = (self.values.get(v) for v in sub.inputs)
+        if x is None or shift is None or x.replicated or x.coords is not arg.coords:
+            return None
+        if shift.coords is not arg.coords and not shift.replicated:
+            if shift.rebuild is None:
+                return None
+            shift = self.rebuilt(shift, arg)
+        n = len(arg.regs)
+        shifts = shift.regs * n if shift.replicated else shift.regs
+        if len(set(shifts)) * 2 > n:
+            return None
+        log2e = self.const(1.4426950408889634, "f32")
+        base, coef = x.regs, log2e
+        mul = self.producers.get(sub.inputs[0])
+        if mul is not None and mul.kind == "mul":
+            parts = [self.values.get(v) for v in mul.inputs]
+            if all(p is not None for p in parts):
+                for i in (0, 1):
+                    other, scale = parts[i], parts[1 - i]
+                    if other.coords is arg.coords and not other.replicated and len(set(scale.regs)) == 1:
+                        base, coef = other.regs, self.emit(f"llvm.fmul {scale.regs[0]}, {log2e} : f32")
+                        break
+        neg = {}
+        regs = []
+        for i in range(n):
+            r = shifts[i]
+            if r not in neg:
+                neg[r] = self.emit(f"llvm.fneg {self.emit(f'llvm.fmul {r}, {log2e} : f32')} : f32")
+            arg2 = self.emit(f"llvm.intr.fma({base[i]}, {coef}, {neg[r]}) : (f32, f32, f32) -> f32")
+            regs.append(self.emit(f'llvm.call_intrinsic "llvm.nvvm.ex2.approx.ftz.f"({arg2}) : (f32) -> f32'))
+        return regs
 
     @staticmethod
     def unit_map(src_shape, out_shape) -> list[int | None]:
