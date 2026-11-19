@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from olaf.frontend.trace import Tensor, abs, broadcast_to, cast, concat, constant, conv, conv_transpose, cos, einsum, exp, log, pad, where, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
+from olaf.frontend.trace import Tensor, max as _reduce_max, abs, broadcast_to, cast, concat, constant, conv, conv_transpose, cos, einsum, exp, log, pad, where, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
 from olaf.graph.types import DType
 
 _LETTERS = "abcdefghijklmn"
@@ -336,7 +336,21 @@ def max_pool(x: Tensor, kernel, stride=None, padding=0) -> Tensor:
     """torch.nn.functional.max_pool{1,2,3}d (padding counts as -inf). Exact in any dtype.
     Where several entries tie for the max the gradient goes to one of them; after a ReLU the
     ties are zeros, whose gradient the ReLU stops anyway."""
-    views = _windows(x, tuple(kernel), stride, padding, -math.inf)
+    kernel = tuple(kernel)
+    n = len(kernel)
+    strides = kernel if stride is None else (stride,) * n if isinstance(stride, int) else tuple(stride)
+    pads = (padding,) * n if isinstance(padding, int) else tuple(padding)
+    if strides == kernel and not any(pads) and all(isinstance(s, int) and s % k == 0 for s, k in zip(x.shape[2:], kernel)):
+        # Windows that tile the input exactly (YOLO's 2 x 2, stride 2): a max over the window
+        # axes of a reshape. The shifted strided views below would pad the input by one to
+        # reach their last window, and the backward would write each view's gradient into the
+        # padded grid and add them up (three adds over a 65 x 65 grid per 2 x 2 pool); the
+        # reduction's gradient is one elementwise pass that fuses with what precedes it. Tied
+        # maxima share the gradient equally here (the maximum chain halves it at each tie).
+        split = [d for s, k in zip(x.shape[2:], kernel) for d in (s // k, k)]
+        windows = x.reshape(*x.shape[:2], *split)
+        return _reduce_max(windows, axis=tuple(3 + 2 * i for i in range(n)))
+    views = _windows(x, kernel, stride, padding, -math.inf)
     y = views[0]
     for v in views[1:]:
         y = maximum(y, v)
