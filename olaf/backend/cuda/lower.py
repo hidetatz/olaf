@@ -689,6 +689,20 @@ class _Emitter:
             return self.make(out_t, [self.cast(r, args[0].type.dtype, out_t.dtype) for r in args[0].regs], args[0])
         dtype = args[0].type.dtype
         n = max(len(a.regs) for a in args)
+        if kind == "div" and dtype is DType.f32 and len(set(args[1].regs)) * 2 <= n:
+            # A divisor repeated across slots (a row statistic broadcast along an accumulator's
+            # columns: softmax's row sum in the attention backward) is inverted once per
+            # distinct register and multiplied: an IEEE f32 division is a dozen instructions and
+            # a branch to a slow path, and per element it was the largest cost in the dK/dV
+            # loop. x * (1/d) differs from x / d by at most an ulp more rounding; for d below
+            # 2^-126 the reciprocal overflows where the quotient might not.
+            inverse = {}
+            for r in args[1].regs:
+                if r not in inverse:
+                    inverse[r] = self.emit(f"llvm.fdiv {self.const(1.0, 'f32')}, {r} : f32")
+            pick = lambda v, i: v.regs[i] if len(v.regs) > 1 else v.regs[0]  # noqa: E731
+            regs = [self.emit(f"llvm.fmul {pick(args[0], i)}, {inverse[pick(args[1], i)]} : f32") for i in range(n)]
+            return self.make(out_t, regs, like)
         regs = [self.scalar_op(kind, [a.regs[i] if len(a.regs) > 1 else a.regs[0] for a in args], dtype, attrs) for i in range(n)]
         return self.make(out_t, regs, like)
 
@@ -1342,12 +1356,14 @@ class _Emitter:
 
     def snapshot(self):
         # Entry-block code (constants, coordinates) is pure and stays: probed layouts refer to it.
-        return (len(self.lines), dict(self.values), dict(self.memo))
+        # The shared memory the discarded code reserved goes too (the probe's carries have no
+        # layout yet, so it stages them through shared memory where the real body does not).
+        return (len(self.lines), dict(self.values), dict(self.memo), self.shared_bytes)
 
     def restore(self, saved) -> None:
-        lines, values, memo = saved
+        lines, values, memo, shared = saved
         del self.lines[lines:]
-        self.values, self.memo = values, memo
+        self.values, self.memo, self.shared_bytes = values, memo, shared
 
     def emit_loop(self, op: TOp, lo, hi, step, carries) -> tuple[list[_Value], list[_Value]]:
         region = op.regions[0]

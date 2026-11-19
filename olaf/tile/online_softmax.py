@@ -518,6 +518,9 @@ def _store(t: _Task, buffer: str, view: View, dtype: DType, term: str, value: TV
     b.emit("store", (shaped, *(starts[x] for x in term)), {"arg": t.arg(buffer, view, dtype, True)})
 
 
+_ROW_CONSTANT_OPS = frozenset({"cmp", "where", "cast", "neg", "abs", "exp", "log", "sqrt", "rsqrt", "recip", "add", "sub", "mul", "div", "max", "min"})
+
+
 def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tuple[int, ...], starts: list[TValue], target: TValue | None = None) -> TValue:
     """Evaluate pointwise launch `index` on `tile` at `starts`, with loads of `subs` args replaced."""
     b = t.b
@@ -526,10 +529,41 @@ def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tu
     task = launch.task
     p_tile = info.store.inputs[0].type.shape
     mapped: dict[TValue, TValue] = {}
+    rank = len(tile)
+
+    def spread_source(v: TValue):
+        """(source, dims) when v is a broadcast (or a tile-shaped constant), else None."""
+        for o in reversed(b.ops):
+            if v in o.outputs:
+                if o.kind == "broadcast" and len(o.attr("dims")) == o.inputs[0].type.rank:
+                    return o.inputs[0], tuple(o.attr("dims"))
+                if o.kind == "full" and v.type.shape == tile:
+                    return b.full((1,) * rank, o.attr("value"), v.type.dtype), tuple(range(rank))
+                return None
+        return None
+
     for op in task.body.ops:
         if op.kind == "store" or (op.outputs and set(op.outputs) <= info.coordinate):
             continue
         ins = [mapped.get(v, v) for v in op.inputs]
+        sources = [spread_source(v) for v in ins] if op.kind in _ROW_CONSTANT_OPS and ins and all(v.type.shape == tile for v in ins) else None
+        if sources and all(sources):
+            # Every input is a broadcast (of row statistics, of scalars): computed at the small
+            # shape, then broadcast. Per element, a row-constant chain (the masked softmax's
+            # where(l == -inf, 1, l)) leaves a divisor in distinct registers, and lowering then
+            # divides per element instead of once per row (tile/online_softmax_backward.py).
+            small = [1] * rank
+            for src, dims in sources:
+                for i, d in enumerate(dims):
+                    small[d] = max(small[d], src.type.shape[i])
+            small = tuple(small)
+            parts = [src if src.type.shape == small and dims == tuple(range(rank)) else b.op("broadcast", src, shape=small, dims=dims) for src, dims in sources]
+            value = b.op(op.kind, *parts, **dict(op.attrs))
+            out = b.op("broadcast", value, shape=tile, dims=tuple(range(rank)))
+            mapped[op.outputs[0]] = out
+            if target is not None and op.outputs[0] is target:
+                return out
+            continue
         if op.kind == "load":
             a = op.attr("arg")
             if a in subs:
@@ -538,7 +572,16 @@ def _replay(t: _Task, p: _Program, index: int, subs: dict[int, TValue], tile: tu
                     out = b.op("broadcast", out, shape=tile, dims=tuple(range(out.type.rank)) if out.type.rank == len(tile) else ())
             else:
                 arg = task.args[a]
-                out = t.load(launch.buffers[a], arg.view, arg.dtype, starts, tile, op.attr("other"))
+                if arg.view.pad is None and all(st == 0 for st in arg.view.strides):
+                    # A scalar (the attention scale) read once, without the per-element bounds
+                    # check and select of a tile-shaped load. It differs only past the tensor's
+                    # last row or column (the scalar where the load gave `other`), where the
+                    # fused tasks mask or discard every value.
+                    one = tuple([1] * len(tile))
+                    out = t.load(launch.buffers[a], arg.view, arg.dtype, [b.index(0)] * len(tile), one, op.attr("other"))
+                    out = b.op("broadcast", out, shape=tile, dims=tuple(range(len(tile))))
+                else:
+                    out = t.load(launch.buffers[a], arg.view, arg.dtype, starts, tile, op.attr("other"))
         elif op.kind == "iota":
             axis = info.starts.index(op.inputs[0])
             out = b.op("iota", starts[axis], shape=tile, axis=op.attr("axis"))
@@ -638,8 +681,13 @@ class _Builder:
         first = b.op("sub", col_start, b.index(self.causal))
         return b.op("mul", b.op("floordiv", first, b.index(self.rows)), b.index(self.rows))
 
-    def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None, k_tile: TValue | None = None) -> tuple[TValue, TValue, list[TValue]]:
-        """X tile (rank-d, 1..1 x rows x cols) for the query and key tiles at these starts."""
+    def scores(self, t: _Task, q_starts: dict, k_starts: dict, q_tile: TValue | None = None, k_tile: TValue | None = None, masked: bool = True) -> tuple[TValue, TValue, list[TValue]]:
+        """X tile (rank-d, 1..1 x rows x cols) for the query and key tiles at these starts.
+
+        masked: -inf past the last row and column, which the forward's row statistics must not
+        see. The backward zeroes the rows past the last itself and needs nothing past the last
+        column (online_softmax_backward), and there the two compares and selects per element
+        were a large part of its loop."""
         b, f, lab = t.b, self.f, self.labels
         row, col, s = lab["row"], lab["col"], lab["sum"]
         ext = {x: 1 for x in self.batch} | {row: self.rows, col: self.cols, s: self.head}
@@ -651,6 +699,8 @@ class _Builder:
         s4 = b.op("reshape", dot, shape=tile)
         coords = [starts[x] for x in f.c1.out]
         x = s4 if f.t1 is None else _replay(t, self.p, f.t1, {f.s_arg_t1: s4}, tile, coords)
+        if not masked:
+            return x, a, coords
         limits = [(self.rank - 2, self.shape[row]), (self.rank - 1, self.shape[col])]
         return _masked(t, x, coords, limits), a, coords
 

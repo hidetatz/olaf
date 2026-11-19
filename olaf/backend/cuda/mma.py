@@ -512,7 +512,9 @@ def lower_register_dot(e, dot: TOp, a, b, acc):
     a_found, b_found = _global_operand(e, a_t), _global_operand(e, b_t)
     a_op = a_found[0] if a_found else _Operand(-1, None, [], 0, 1, _natural(a) != "transposed", m, k)
     b_op = b_found[0] if b_found else _Operand(-1, None, [], 0, 1, _natural(b) != "transposed", k, n)
-    loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 1, DType.bf16)
+    # No pipeline stages: the operands' shared memory is reserved below, only for those not
+    # already there (one stage of both would reserve their bytes even when both are resident).
+    loop = _MatrixLoop(e, a_op, b_op, m, n, k, grid, 0, DType.bf16)
     lane, wm_idx, wn_idx = loop.lane_values()
     layout = loop.accumulator_layout(lane, wm_idx, wn_idx)
     structure = MmaAcc(m, n, grid[0], grid[1], 0, 1, 2)
@@ -607,7 +609,16 @@ def make_resident(e, region) -> None:
         return
     total = 0
     placed = []
+    copies = {}
     for operand, load in wanted:
+        # Shared memory holds a copy in the global layout (rows along the contiguous axis), so
+        # loads of the same tile in either orientation (the backward's k, as the scores' B and
+        # as dQ's B) share one copy; ldmatrix reads it transposed where needed.
+        key = (operand.arg, tuple(id(s) for s in operand.starts), tuple(load.attr("shape")), operand.stored_rows, operand.row_elems)
+        if key in copies:
+            e.resident[load] = e.scratch_base + copies[key]
+            continue
+        copies[key] = total
         placed.append((operand, load, total))
         total += -(-operand.bytes // 16) * 16
     e.reserve(total)

@@ -105,9 +105,9 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     d_name = p.written(back.rd)
     d_buffer = p.buffers[d_name]
 
-    def stat(t, g, name, starts):
+    def stat(t, g, name, starts, other=0.0):
         buffer = p.buffers[name]
-        return t.load(name, full_view(buffer.type.shape), buffer.type.dtype, [starts[x] for x in batch + [row]], rows_tile(g))
+        return t.load(name, full_view(buffer.type.shape), buffer.type.dtype, [starts[x] for x in batch + [row]], rows_tile(g), other)
 
     # D = rowsum(dO * O): one tile of rows per instance.
     t = _Task()
@@ -130,8 +130,10 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
 
         k_tile and v_t, when given, were loaded outside the loop (the column tile is fixed)."""
         b = t.b
-        x, q2d, coords = g.scores(t, {k: starts[k] for k in batch + [row]}, {col: starts[col]}, k_tile=k_tile)
-        m_rows, l_rows = stat(t, g, m_name, starts), stat(t, g, l_name, starts)
+        x, q2d, coords = g.scores(t, {k: starts[k] for k in batch + [row]}, {col: starts[col]}, k_tile=k_tile, masked=False)
+        # Past the last row the sum reads as 1, not 0: P there is then finite (exp(X - 0) / 1)
+        # instead of 0 / 0, and needs no mask (see widen).
+        m_rows, l_rows = stat(t, g, m_name, starts), stat(t, g, l_name, starts, 1.0)
         prob = g.p_exact(t, x, coords, m_rows, l_rows)
         local3 = _local(m3, {**starts, VALUE: b.index(0), s: b.index(0)})
         e3 = _local(m3, extents(g))
@@ -144,16 +146,23 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         subs = {back.p_arg_t9: prob, back.dp_arg_t9: dp, **{a: _spread(b, d_rows, tile) for a in back.d_arg_t9}}
         ds = _replay(t, p, back.t9, subs, tile, coords)
 
+        # Rows past the last one are zeroed: there q and dO load as zeros, but the replayed
+        # exp task's scalar constants (its -inf for masked scores) load as 0 too, and X - F(m)
+        # can be -inf - (-inf). The test is per row (row-constant: one compare per row a
+        # thread holds, then a select per element). Columns past the last one need no mask:
+        # k and v load as zeros there, so P and dS are finite (the statistics read past the
+        # last row as 0 and, for the sum, 1), dQ = dS k gets nothing from them, and those
+        # columns of dK and dV are not stored. Masking both axes per element was a sixth of
+        # the dK/dV loop's instructions.
+        rows_shape = rows_tile(g)
+        row_coord = b.op("iota", coords[rank - 2], shape=rows_shape, axis=len(rows_shape) - 1)
+        live = b.op("cmp", row_coord, b.op("broadcast", b.dim(g.shape[row]), shape=rows_shape, dims=()), fn="lt")
+        live = b.op("broadcast", live, shape=tile, dims=tuple(range(len(rows_shape))))
+
         def widen(v):
-            # Zero outside the tensor: past the last row the loaded statistics are 0, so P is
-            # 0 / 0 there, and a NaN would spread through the sums over rows into every column.
-            # The zeros go in before the widening cast, so the dots still see widened b16 values
-            # (which is what lets them use b16 matrix instructions).
-            zero = b.full(tile, 0.0, v.type.dtype)
-            for axis, size in ((rank - 2, g.shape[row]), (rank - 1, g.shape[col])):
-                coord = b.op("iota", coords[axis], shape=tile, axis=axis)
-                inside = b.op("cmp", coord, b.op("broadcast", b.dim(size), shape=tile, dims=()), fn="lt")
-                v = b.op("where", inside, v, zero)
+            # The zeros go in before the widening cast, so the dots still see widened b16
+            # values (which is what lets them use b16 matrix instructions).
+            v = b.op("where", live, v, b.full(tile, 0.0, v.type.dtype))
             v = v if v.type.dtype is DType.f32 else b.op("cast", v, dtype=DType.f32)
             return b.op("reshape", v, shape=(g.rows, g.cols))
 
@@ -164,9 +173,13 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         local = _local(mapping, starts)
         _store(t, contract.output, arg.view, arg.dtype, contract.out, value, _letter(mapping, rows_name), _letter(mapping, cols_name), local, _local(mapping, extents(g)))
 
-    # dK and dV: one tile of columns per instance, looping over rows. 64 x 64 tiles: this task
-    # holds two accumulators and four score-sized tiles per iteration.
-    g = _Builder(p, f, rows=BLOCK, cols=BLOCK)
+    # dK and dV: one tile of columns per instance, looping over rows of 64. With heads of 64,
+    # 128 columns (FlashAttention-2's tile for them): each row tile's q and dO loads, score
+    # recomputation and dQ atomics then serve twice the columns (Whisper's encoder layer:
+    # 5.6 -> 4.7 ms). Wider heads keep 64: two accumulators of 128 x 128 and the resident k
+    # and v would not fit in registers and shared memory.
+    head, value_size = _Builder(p, f).head, _Builder(p, f).value_size
+    g = _Builder(p, f, rows=BLOCK, cols=2 * BLOCK if isinstance(head, int) and isinstance(value_size, int) and max(head, value_size) <= 64 else BLOCK)
     t = _Task()
     b = t.b
     pids, starts, grid = g.pids(t, col)
