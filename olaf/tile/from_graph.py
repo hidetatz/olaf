@@ -31,6 +31,10 @@ SMALL_PLANE = 1024
 # Convolutions whose padded grid (stride included) is more than this times their outputs copy
 # their windows out instead (im2col), within a size limit for the copy.
 IM2COL_WASTE = 1.3
+# Implicit GEMM rows (n, h, w; _conv_implicit) skip the padded grid's border rows, which the
+# grid's rows compute and drop: worth it wherever the rows fit, even at 34 x 34 around 32 x 32
+# (13% of the rows; ResNet-18's contracts 25.5 -> 24.1 ms per step, YOLO's step 4.8 -> 3.5 ms).
+IMPLICIT_WASTE = 1.0
 IM2COL_BYTES = 512 << 20
 
 
@@ -988,7 +992,7 @@ class _Converter:
             )
         out_spatial = tuple(out_type.shape[2:])
         waste = plane / math.prod(out_spatial)
-        if waste > IM2COL_WASTE and self._implicit_rows(C, out_spatial, dilation):
+        if waste > IMPLICIT_WASTE and self._implicit_rows(C, out_spatial, dilation):
             return self._conv_implicit(x, w, base, op, spread, row, start)
         if waste > IM2COL_WASTE and N * math.prod(out_spatial) * math.prod(kernel) * C * 2 <= IM2COL_BYTES:
             return self._conv_im2col(x, w, base, op, spread, row, start)
