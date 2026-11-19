@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import replace
 
 from olaf.graph.dim import Dim
@@ -297,12 +299,17 @@ def _interior_map(view: View, shape) -> list[tuple[int | None, int]] | None:
 
 
 def _border_fills(into: View, read: View, buffer: str, dtype: DType) -> list[Launch]:
-    """Tasks writing read.fill to the padded slabs of `into` (one per padded side and axis;
-    the corners are written twice, with the same value)."""
+    """One task writing read.fill to the padded slabs of `into` (one per padded side and axis;
+    the corners are written twice, with the same value).
+
+    One launch for all of a grid's slabs: a task per slab was five launches of a few
+    microseconds' work per padded grid (ResNet-18's step had 125 of them). Program p writes
+    tile p of every slab; past a slab's last tile its leading coordinate leaves the slab, and
+    the store's bounds drop it."""
     from olaf.tile.builder import INDEX, TileBuilder
     from olaf.tile.ir import TileType, TValue
 
-    fills = []
+    slabs = []
     for axis, (lo, hi) in enumerate(read.pad or ()):
         for start, size in ((0, lo), (into.shape[axis] - hi, hi)):
             if size == 0:
@@ -316,13 +323,25 @@ def _border_fills(into: View, read: View, buffer: str, dtype: DType) -> list[Lau
                 budget //= tile[a]
                 if budget < 2:
                     break
-            grid = tuple(-(-d // t) for d, t in zip(shape, tile))
-            b = TileBuilder()
-            pids = [TValue(TileType((), INDEX)) for _ in shape]
-            starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]
-            b.emit("store", (b.full(tuple(tile), read.fill, dtype), *starts), {"arg": 0})
-            fills.append(Launch(Task("fill", grid, (Arg(view, dtype, True),), b.finish(pids), 4, ("fill",)), (buffer,)))
-    return fills
+            slabs.append((view, tuple(tile), tuple(-(-d // t) for d, t in zip(shape, tile))))
+    if not slabs:
+        return []
+    count = max(math.prod(grid) for _, _, grid in slabs)
+    b = TileBuilder()
+    pid = TValue(TileType((), INDEX))
+    args = []
+    for k, (view, tile, grid) in enumerate(slabs):
+        starts = [None] * len(grid)
+        rest = pid
+        for a in range(len(grid) - 1, -1, -1):
+            # The leading coordinate is not reduced: past the slab's tiles it runs past its end.
+            at = rest if a == 0 else b.op("mod", rest, b.index(grid[a]))
+            if a:
+                rest = b.op("floordiv", rest, b.index(grid[a]))
+            starts[a] = at if tile[a] == 1 else b.op("mul", at, b.index(tile[a]))
+        b.emit("store", (b.full(tile, read.fill, dtype), *starts), {"arg": k})
+        args.append(Arg(view, dtype, True))
+    return [Launch(Task("fill", (count,), tuple(args), b.finish([pid]), 4, ("fill",)), (buffer,) * len(slabs))]
 
 
 def _pure_copy(task: Task) -> bool:
