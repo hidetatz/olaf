@@ -255,6 +255,41 @@ class BatchNorm(Module):
 
 
 @dataclass(frozen=True)
+class GroupNorm(Module):
+    """torch.nn.GroupNorm over [N, C, *spatial]: each sample's channels in `groups` groups,
+    each normalized over its channels and positions (biased variance), then a per-channel
+    weight and bias. b16 inputs are normalized in f32 and the result stays f32, as
+    torch.autocast runs group_norm (its fp32 list)."""
+
+    groups: int
+    channels: int
+    eps: float = 1e-5
+
+    def init(self, rng: np.random.Generator) -> dict:
+        return {"weight": np.ones(self.channels, np.float32), "bias": np.zeros(self.channels, np.float32)}
+
+    def __call__(self, params, x: Tensor) -> Tensor:
+        h = _to(x, DType.f32) if x.dtype is DType.bf16 else x
+        n, spatial = h.shape[0], h.shape[2:]
+        grouped = h.reshape(n, self.groups, self.channels // self.groups, *spatial)
+        y = layernorm(grouped, axes=tuple(range(2, grouped.rank)), eps=self.eps).reshape(*h.shape)
+        shape = (1, self.channels, *(1,) * len(spatial))
+        weight, bias = (_to(params[k], h.dtype) for k in ("weight", "bias"))
+        return y * broadcast_to(weight.reshape(*shape), h.shape) + broadcast_to(bias.reshape(*shape), h.shape)
+
+
+def upsample_nearest(x: Tensor, factor: int = 2) -> Tensor:
+    """torch.nn.functional.interpolate(x, scale_factor=factor, mode="nearest") for x [N, C,
+    *spatial]: each element repeated factor times along every spatial axis, as a broadcast of
+    a unit axis after each spatial one and a reshape (no gather)."""
+    n, c, spatial = x.shape[0], x.shape[1], x.shape[2:]
+    split = [d for s in spatial for d in (s, 1)]
+    wide = [d for s in spatial for d in (s, factor)]
+    y = broadcast_to(x.reshape(n, c, *split), (n, c, *wide))
+    return y.reshape(n, c, *(s * factor for s in spatial))
+
+
+@dataclass(frozen=True)
 class ConvTranspose(Module):
     """torch.nn.ConvTranspose{1,2,3}d: weight [in, out/groups, *kernel], optional bias."""
 
@@ -399,4 +434,4 @@ def relu(x: Tensor) -> Tensor:
     return maximum(x, 0.0)
 
 
-__all__ = ["interpolate_bilinear", "BatchNorm", "Conv", "ConvTranspose", "binary_cross_entropy_with_logits", "leaky_relu", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]
+__all__ = ["interpolate_bilinear", "upsample_nearest", "BatchNorm", "GroupNorm", "Conv", "ConvTranspose", "binary_cross_entropy_with_logits", "leaky_relu", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]

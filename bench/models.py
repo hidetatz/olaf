@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet"]
 
 
 def timed(run, sync) -> float:
@@ -254,6 +254,25 @@ def build(name):
         tm = WhisperForConditionalGeneration(hf).cuda().train()
         step = torch_train_step(tm, lambda m: test_whisper.torch_loss(m, features, ids), [p for p in tm.parameters() if p.requires_grad])
         return "Whisper tiny (30 s audio, 128 tokens), batch 8", (traced, initial, [features, ids]), step
+    if name == "unet":
+        import test_unet
+        from olaf.examples import unet
+
+        # A latent-diffusion-sized step: 4 x 32 x 32 latents, widths 128 / 256, 77 context
+        # tokens of 256 (a text encoder's output), batch 16.
+        config = unet.Config(channels=4, widths=(128, 256), groups=32, heads=4, context_dim=256, time_dim=128)
+        test_unet.CONFIG = config
+        B, S, L = 16, 32, 77
+        model = unet.UNet(config, olaf.bf16)
+        x = rng.normal(size=(B, 4, S, S)).astype(np.float32)
+        t = rng.integers(0, 1000, B).astype(np.int32)
+        context = rng.normal(size=(B, L, config.context_dim)).astype(np.float32)
+        noise = rng.normal(size=(B, 4, S, S)).astype(np.float32)
+        specs = tuple(olaf.TensorType(a.shape, olaf.i32 if a.dtype == np.int32 else olaf.f32) for a in (x, t, context, noise))
+        traced, initial = olaf.train_step(unet.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), *specs)
+        tm = test_unet.TorchUNet(config).cuda().train()
+        step = torch_train_step(tm, lambda m: test_unet.torch_loss(m, x, t, context, noise))
+        return f"U-Net (latents 4x{S}x{S}, widths 128-256, context {L}x256), batch {B}", (traced, initial, [x, t, context, noise]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

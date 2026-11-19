@@ -1,5 +1,7 @@
 """P1.5 model 2: a small Llama (RMSNorm, rotary embeddings, SwiGLU, grouped-query attention)."""
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -119,6 +121,8 @@ def test_fusion_at_llama_shapes():
     assert not any(t.shape[-2:] == (S, S) for t in shapes.values()), "attention scores materialized"
     assert names.count("rows") >= 4, "RMSNorm forward and backward fuse into row tasks"
     forward = next(launch for launch in program.launches if launch.task.name == "attention")
-    assert any(shapes[n].shape == (1, 4, S, 128) for n in forward.buffers), "the forward reads unrepeated keys"
+    # Keys of the 4 key/value heads, in whichever memory order (rotary's concat keeps its
+    # inputs' [1, S, heads x 128]), read with a stride-0 axis for the query heads sharing them.
+    assert any(shapes[n].dtype is olaf.bf16 and math.prod(shapes[n].shape) == 4 * S * 128 for n in forward.buffers), "the forward reads unrepeated keys"
     assert not any(launch.task.name == "copy" and any(shapes[n].rank == 5 and shapes[n].dtype is olaf.bf16 for n in launch.buffers) for launch in program.launches), "keys or values copied per query head"
     assert not any(t.dtype is olaf.f32 and t.shape == (1, S, I) for t in shapes.values()), "f32 copy of an MLP activation"

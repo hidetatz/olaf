@@ -406,8 +406,9 @@ class _Converter:
         total = op.outputs[0].type.shape[axis]
         padded, ends = [], []
         start: Dim = 0
+        inputs = [self.plain(ref) for ref in inputs]
+        orders = {_physical_order(ref.view) for ref in inputs}
         for ref in inputs:
-            ref = self.plain(ref)
             stop = start + ref.shape[axis]
             pad = tuple((start, total - stop) if i == axis else (0, 0) for i in range(ref.view.rank))
             shape = tuple(total if i == axis else d for i, d in enumerate(ref.shape))
@@ -423,7 +424,17 @@ class _Converter:
                 result = b.op("where", b.op("cmp", coord, bound, fn="lt"), x, result)
             return result
 
-        return self.elementwise("concat", op.outputs[0].type, padded, compute)
+        out = None
+        if len(orders) == 1 and None not in orders:
+            # Inputs in one memory order (channels-last activations joined along the channels,
+            # a U-Net's skip connections): the result in that order too. The padded views
+            # carry no order of their own, and a logical-order result turned every later
+            # reader (group norm, the next convolution's weight gradient) into a transpose.
+            order = next(iter(orders))
+            out_type = op.outputs[0].type
+            physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
+            out = _permuted(self.new_buffer(physical, BufferKind.temp), _inverse(order))
+        return self.elementwise("concat", op.outputs[0].type, padded, compute, out=out)
 
     # -- views ----------------------------------------------------------------------------------
 
@@ -490,7 +501,22 @@ class _Converter:
         kept = [a for a in order if a not in axes]
         out_type = op.outputs[0].type
         physical = TensorType(tuple(ref.shape[a] for a in kept), out_type.dtype)
-        result = self._reduce_split(_permuted(ref, order), fn, tuple(sorted(order.index(a) for a in axes)), physical)
+        permuted = _permuted(ref, order)
+        reduced = sorted(order.index(a) for a in axes)
+        suffix = []
+        while reduced and len(suffix) < len(reduced) and reduced[len(reduced) - 1 - len(suffix)] == ref.view.rank - 1 - len(suffix):
+            suffix.insert(0, ref.view.rank - 1 - len(suffix))
+        outer = [a for a in reduced if a not in suffix]
+        if suffix and outer and fn in ("sum", "max"):
+            # Kept axes between reduced ones in memory (a channels-last group norm statistic:
+            # [N, H, W, groups, channels per group] summed over H, W and the channels): the outer
+            # reduced axes first, a column reduction over contiguous rows, then the short trailing
+            # run. As one reduction it walked 4 contiguous channels at a time (2 GB/s).
+            mid_axes = [i for i in range(ref.view.rank) if i not in outer]
+            mid = self._reduce_split(permuted, fn, tuple(outer), TensorType(tuple(permuted.shape[i] for i in mid_axes), out_type.dtype))
+            result = self._reduce_split(mid, fn, tuple(mid_axes.index(i) for i in suffix), physical)
+        else:
+            result = self._reduce_split(permuted, fn, tuple(reduced), physical)
         logical = [a for a in range(ref.view.rank) if a not in axes]
         return _permuted(result, tuple(kept.index(a) for a in logical))
 
@@ -811,10 +837,12 @@ class _Converter:
         units = self.capability.roofline.compute_units
         moved = []
         # 2 tiles per unit: 128 x 128 tiles with 3 stages fit about 2 blocks on an SM. Each part
-        # keeps at least 1024 of the reduction, so the partials' write and sum (an f32 output
-        # per part) stay small against the products.
+        # keeps at least 256 of the reduction (8 k steps), so the partials' write and sum (an
+        # f32 output per part) stay small against the products; with 1024, a U-Net attention
+        # projection's weight gradient (256 x 256 over 16 x 256 tokens: 4 tiles) was not split
+        # and ran at 3 TFLOPS (0.18 -> 0.05 ms split).
         for c in (c for c in ta if c in k_labels and c != k_inner):
-            if tiles >= 2 * units or reduced // size[c] < 1024:
+            if tiles >= 2 * units or reduced // size[c] < 256:
                 break
             moved.append(c)
             tiles *= size[c]
@@ -1199,6 +1227,16 @@ class _Converter:
         a_shape = (chunks, per, *outf, *kern[:-1], KK)
         a_strides = (per * plane * Cf, plane * Cf, *(d * r * Cf for d, r in zip(dilation, row)), *(st * r * Cf for st, r in zip(stride[:-1], row[:-1])), 1)
         a = Ref(base.buffer, View(a_shape, a_strides, start * Cf), xc.dtype)
+        if wc.view.pad is None and wc.view.strides[0] != 1:
+            # The output gradient as dot rows needs its channels contiguous (channels-last); one
+            # that arrives channels-first (from a reshape's gradient) is copied channels-last
+            # first: read in place its rows are strided along the k axis, the matrix copies
+            # cannot take it, and the product ran unpipelined (1.2 ms for a U-Net weight
+            # gradient whose copy costs 0.05).
+            order = (*range(1, wc.view.rank), 0)
+            physical = TensorType(tuple(wc.shape[a] for a in order), wc.dtype)
+            out = _permuted(self.new_buffer(physical, BufferKind.temp), _inverse(order))
+            wc = self.elementwise("copy", TensorType(wc.shape, wc.dtype), [wc], lambda b, t, s, ts: t[0], out=out)
         ds = wc.view.strides
         b = Ref(wc.buffer, View((chunks, per, *outf, Of), (per * ds[1], ds[1], *ds[2:], ds[0]), wc.view.offset), wc.dtype)
         if wc.view.pad is not None:

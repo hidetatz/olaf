@@ -87,7 +87,8 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
         target = buffers[launch.buffers[other.attr("arg")]]
         if arg.view != full_view(target.type.shape) or other.inputs[1:] != starts or other.inputs[0].type.shape != store.inputs[0].type.shape:
             return None
-    coordinate = _coordinate_values(body)
+    scalars = _scalar_constants(body)
+    coordinate = _coordinate_values(body, scalars)
     args = launch.task.args
     total = _elements(args[store.attr("arg")].view)
     # Values computed only from small broadcast operands (a batch norm's per-channel mean and
@@ -110,7 +111,7 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
             return None
         if op.kind == "broadcast" and op.attr("dims") != ():
             return None
-        if op.kind not in _FREE and op.inputs and all(v in small or v in coordinate or _is_scalar_constant(body, v) for v in op.inputs):
+        if op.kind not in _FREE and op.inputs and all(v in small or v in coordinate or v in scalars for v in op.inputs):
             small.update(op.outputs)
             if op.outputs[0].type.dtype is not DType.f64:
                 continue
@@ -146,18 +147,21 @@ def _small(view: View, total: Dim) -> bool:
     return isinstance(n, int) and isinstance(total, int) and n * 64 <= total
 
 
-def _coordinate_values(body: Body) -> frozenset[TValue]:
+def _coordinate_values(body: Body, scalars: frozenset[TValue] | None = None) -> frozenset[TValue]:
     """Program ids and the index scalars computed only from them and constants (the tile starts)."""
+    scalars = _scalar_constants(body) if scalars is None else scalars
     coordinate = set(body.params)
     for op in body.ops:
         if op.kind in ("mul", "add") and op.outputs[0].type == TileType((), INDEX) and any(v in coordinate for v in op.inputs):
-            if all(v in coordinate or _is_scalar_constant(body, v) for v in op.inputs):
+            if all(v in coordinate or v in scalars for v in op.inputs):
                 coordinate.update(op.outputs)
     return frozenset(coordinate)
 
 
-def _is_scalar_constant(body: Body, value: TValue) -> bool:
-    return any(op.kind == "full" and op.outputs[0] is value and op.outputs[0].type.shape == () for op in body.ops)
+def _scalar_constants(body: Body) -> frozenset[TValue]:
+    """The body's scalar constants. A set, built once per body: testing each value against
+    every op made fusion quadratic in a task's size (a U-Net's sibling fusion: 20 minutes)."""
+    return frozenset(op.outputs[0] for op in body.ops if op.kind == "full" and op.outputs[0].type.shape == ())
 
 
 class _Rewriter:
@@ -817,18 +821,33 @@ def fuse_siblings(program: Program, window: int = 32) -> Program:
     through the views A stores them with, so the merged body passes A's values on directly (the
     parameter update reads the moments just written).
     """
+    buffers = {b.name: b for b in program.buffers}
+    launches = list(program.launches)
+    # Each launch's analysis, kept while the launch is unchanged (keyed by identity, the launch
+    # held so its id stays its own), and after a merge the scan resumes a window before it:
+    # earlier pairs cannot have changed. Rescanning everything per merge and re-analysing every
+    # task was most of a U-Net's compile time (4 million analyses for 467 merges).
+    analyses: dict[int, tuple[Launch, _Pointwise | None]] = {}
+
+    def analysis(launch: Launch) -> _Pointwise | None:
+        hit = analyses.get(id(launch))
+        if hit is None or hit[0] is not launch:
+            hit = (launch, _pointwise(launch, buffers, multi=True) if not launch.offsets else None)
+            analyses[id(launch)] = hit
+        return hit[1]
+
+    start = 0
     changed = True
     while changed:
         changed = False
-        buffers = {b.name: b for b in program.buffers}
-        launches = list(program.launches)
-        for i, a in enumerate(launches):
-            info_a = _pointwise(a, buffers, multi=True) if not a.offsets else None
+        for i in range(start, len(launches)):
+            a = launches[i]
+            info_a = analysis(a)
             if info_a is None or len(launches) <= i + 1:
                 continue
             for j in range(i + 1, min(len(launches), i + 1 + window)):
                 b = launches[j]
-                info_b = _pointwise(b, buffers, multi=True) if not b.offsets else None
+                info_b = analysis(b)
                 if info_b is None or b.task.grid != a.task.grid or info_b.store.inputs[0].type.shape != info_a.store.inputs[0].type.shape:
                     continue
                 reads_a = {n for n, x in zip(a.buffers, a.task.args) if not x.writes}
@@ -845,11 +864,11 @@ def fuse_siblings(program: Program, window: int = 32) -> Program:
                 launches[i] = _merge(a, info_a, b, info_b)
                 del launches[j]
                 changed = True
+                start = max(0, i - window)
                 break
             if changed:
                 break
-        program = replace(program, launches=tuple(launches))
-    return program
+    return replace(program, launches=tuple(launches))
 
 
 def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Launch:
