@@ -298,10 +298,18 @@ def _match_forward_with(p: _Program, c2: _Contract, v_operand: int) -> _Forward 
         if _pointwise(p.launch(t1), p.buffers) is None:
             return None
         launch = p.launch(t1)
-        candidates = [n for n, a in zip(launch.buffers, launch.task.args) if not a.writes and any(s != 0 for s in a.view.strides)]
-        if len(candidates) != 1 or _identity_read(p, t1, candidates[0]) is None or p.only_readers(candidates[0]) != {t1}:
+        candidates = [(n, a) for n, a in zip(launch.buffers, launch.task.args) if not a.writes and any(s != 0 for s in a.view.strides)]
+        # S, a contract's output; besides it only operands broadcast along the rows or the
+        # columns (a padding mask from the data, [B, 1, 1, S] kept keys), which the fused tasks
+        # read at each tile like the replayed task does. A computed mask (causal, from iota)
+        # reads nothing.
+        scores = [n for n, a in candidates if p.writer(n) is not None and _contract(p.writer(n), p.launch(p.writer(n))) is not None]
+        others = [a for n, a in candidates if n not in scores]
+        if len(scores) != 1 or any(a.view.strides[-1] != 0 and a.view.strides[-2] != 0 for a in others):
             return None
-        s_name = candidates[0]
+        if _identity_read(p, t1, scores[0]) is None or p.only_readers(scores[0]) != {t1}:
+            return None
+        s_name = scores[0]
         s_arg = _identity_read(p, t1, s_name)
         w = p.writer(s_name)
         c1 = _contract(w, p.launch(w)) if w is not None else None

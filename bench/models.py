@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert"]
 
 
 def timed(run, sync) -> float:
@@ -273,6 +273,29 @@ def build(name):
         tm = test_unet.TorchUNet(config).cuda().train()
         step = torch_train_step(tm, lambda m: test_unet.torch_loss(m, x, t, context, noise))
         return f"U-Net (latents 4x{S}x{S}, widths 128-256, context {L}x256), batch {B}", (traced, initial, [x, t, context, noise]), step
+    if name == "bert":
+        import test_bert
+        from transformers import BertConfig, BertForMaskedLM
+        from olaf.examples import bert
+
+        # BERT-base, sequences of 128 with lengths 64..128 (padded), 20 masked positions each.
+        hf = BertConfig(hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0, max_position_embeddings=512, attn_implementation="sdpa")
+        B, S, P = 32, 128, 20
+        test_bert.HF = dict(vocab_size=hf.vocab_size)
+        model = bert.Bert(bert.Config.from_huggingface(hf), olaf.bf16)
+        lengths = rng.integers(S // 2, S + 1, B)
+        ids = rng.integers(4, hf.vocab_size, (B, S)).astype(np.int32)
+        mask = (np.arange(S)[None, :] < lengths[:, None]).astype(np.int32)
+        ids = ids * mask
+        types = ((np.arange(S)[None, :] >= lengths[:, None] // 2) & (mask == 1)).astype(np.int32)
+        positions = np.stack([np.sort(rng.choice(n, P, replace=False)) for n in lengths]).astype(np.int32)
+        labels = np.take_along_axis(ids, positions, 1).astype(np.int32)
+        inputs = [ids, types, mask, positions, labels]
+        specs = tuple(olaf.TensorType(a.shape, olaf.i32) for a in inputs)
+        traced, initial = olaf.train_step(bert.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), *specs)
+        tm = BertForMaskedLM(hf).cuda().train()
+        step = torch_train_step(tm, lambda m: test_bert.torch_loss(m, *inputs))
+        return f"BERT-base (MLM, {S} tokens, padded, {P} predicted), batch {B}", (traced, initial, inputs), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
