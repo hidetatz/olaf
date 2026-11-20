@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet"]
 
 
 def timed(run, sync) -> float:
@@ -324,6 +324,16 @@ def build(name):
         B = 128
         model = mobilenet.MobileNetV2(config, olaf.bf16)
         return f"MobileNetV2 (CIFAR, 32x32), batch {B}", *classifier(model, test_mobilenet.TorchMobileNet(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32), buffers=model.init_buffers())
+    if name == "efficientnet":
+        import test_efficientnet
+        from olaf.examples import efficientnet
+
+        # EfficientNet-B0 for 32x32 images: the stem and the second stage at stride 1.
+        config = efficientnet.Config()
+        test_efficientnet.CONFIG = config
+        B = 128
+        model = efficientnet.EfficientNet(config, olaf.bf16)
+        return f"EfficientNet-B0 (CIFAR, 32x32), batch {B}", *classifier(model, test_efficientnet.TorchEfficientNet(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32), buffers=model.init_buffers())
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

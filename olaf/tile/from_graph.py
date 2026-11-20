@@ -271,11 +271,15 @@ class _Converter:
         task = Task(name, tuple(grid), args, body, warps, origin or (name,))
         self.launches.append(Launch(task, tuple(r.buffer for r, _ in refs)))
 
-    def elementwise(self, name: str, out_type: TensorType, inputs: Sequence[Ref], compute: Callable, out: Ref | None = None, kind: BufferKind = BufferKind.temp) -> Ref:
-        """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile."""
+    def elementwise(self, name: str, out_type: TensorType, inputs: Sequence[Ref], compute: Callable, out: Ref | None = None, kind: BufferKind = BufferKind.temp, elements: int | None = None) -> Ref:
+        """One task over the output, one tile per instance. compute(b, tiles, starts, tile_shape) -> tile.
+        elements: a smaller tile than tuning.elementwise_elements (a task with many inputs)."""
         out = out or self.new_buffer(out_type, kind)
         shape = out.shape
-        tile = _elementwise_tile(shape, self.capability.tuning)
+        tuning = self.capability.tuning
+        if elements is not None and elements < tuning.elementwise_elements:
+            tuning = replace(tuning, elementwise_elements=elements, elementwise_block=min(tuning.elementwise_block, elements))
+        tile = _elementwise_tile(shape, tuning)
         grid = tuple(_ceil_div(d, t) for d, t in zip(shape, tile))
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in shape]
@@ -903,6 +907,13 @@ class _Converter:
         gs = contiguous_strides(self.buffers[grid.buffer].type.shape)  # [N, *padded, C]
         w = self.plain(w)
         ws = w.view.strides
+        if math.prod(kernel) <= 64:
+            # The weight as [*kernel, C], channels contiguous: read along the channels at each
+            # kernel position, [C, 1, *kernel] puts consecutive lanes 25 elements apart (5 x 5),
+            # and the loads, scattered over many sectors, throttled the whole task (8 ms).
+            wt = self.materialize(Ref(w.buffer, View((*kernel, C), (*ws[2:], ws[0]), w.view.offset), w.dtype))
+            w = Ref(wt.buffer, View((C, 1, *kernel), (1, 0, *(st for st in contiguous_strides((*kernel, C))[:-1])), wt.view.offset), w.dtype)
+            ws = w.view.strides
         order = (0, *range(2, 2 + n), 1)  # the output channels-last, like its input
         physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
         shape = physical.shape
@@ -921,7 +932,11 @@ class _Converter:
                 return total if acc is out_type.dtype else b.op("cast", total, dtype=out_type.dtype)
 
             out = self.new_buffer(physical, BufferKind.temp)
-            result = self.elementwise("conv", physical, refs, compute, out=out)
+            # Two elements per thread past 3 x 3: each holds every kernel position's input and
+            # weight, and with the default eight a 5 x 5 stencil needed over 255 registers (ptxas
+            # spilled 2.6 KB per thread: 8 ms where 1 was enough). 3 x 3 keeps the default tile,
+            # which measured faster there (MobileNetV2's step 50 ms against 56).
+            result = self.elementwise("conv", physical, refs, compute, out=out, elements=256 if math.prod(kernel) > 9 else None)
             return _permuted(result, _inverse(order))
         # Products [N, *kernel, *out, C] (N is 1 here: the weight gradient's batch), reduced over
         # the kernel axes. (One reduction per output position instead, for fusion to merge as
