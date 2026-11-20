@@ -225,7 +225,8 @@ def test_chunked_scan_has_no_sequential_steps():
         return to_program(lower_graph(traced.graph), AMPERE_RTX3060)
 
     # 4 chunks against 16: a scan would add at least two launches per chunk (forward and
-    # backward), 24 or more. A few differ anyway, as the schedule (split-K, tiles) follows sizes.
+    # backward), 24 or more. A few differ anyway, as the schedule follows sizes (split-K adds a
+    # sum of partials where the shorter sequence has tiles enough).
     short, long = program(128), program(512)
-    assert len(long.launches) - len(short.launches) <= 8, (len(short.launches), len(long.launches))
+    assert len(long.launches) - len(short.launches) < 24, (len(short.launches), len(long.launches))
     assert not any(list(b.type.shape).count(512) >= 2 for b in long.buffers), "a buffer quadratic in the sequence"

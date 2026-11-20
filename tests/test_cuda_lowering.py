@@ -176,7 +176,11 @@ def test_linear_layer_gradients_split_and_swap_their_products():
     graph = lower(olaf.trace(fn, *(tt(*a.shape, dtype=olaf.bf16) for a in (dy, x, w, r))).graph)
     program = to_program(graph, AMPERE_RTX3060)
     contracts = {launch.task.origin[1]: launch.task for launch in program.launches if launch.task.origin[0] == "contract"}
-    assert set(contracts) == {"abz,aby->azy", "zy,abz->aby"}, set(contracts)
+    # The weight gradient: partial products over the batch (and, with 4 tiles still too few for
+    # 28 SMs, over parts of the sequence too: 0.150 -> 0.121 ms), summed once.
+    (weight,) = [spec for spec in contracts if spec != "zy,abz->aby"]
+    partials = weight.split("->")[1][:-2]
+    assert "zy,abz->aby" in contracts and "a" in partials, set(contracts)
     assert contracts["zy,abz->aby"].args[0].view.shape == (B, S, D)
     expected, _ = interpret(graph, [dy, x, w, r])
     actual, _ = CudaProgram(program).run([dy, x, w, r])

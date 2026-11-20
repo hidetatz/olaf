@@ -371,6 +371,7 @@ def eliminate_concats(program: Program) -> Program:
             (writers if arg.writes else readers).setdefault(name, []).append(i)
     launches = list(program.launches)
     removed: set[int] = set()
+    moved: set[str] = set()
     for i, launch in enumerate(program.launches):
         casts = _select_casts(launch.task) if launch.task.origin == ("concat",) and not launch.offsets else None
         if casts is None:
@@ -388,9 +389,18 @@ def eliminate_concats(program: Program) -> Program:
         if plan is None:
             continue
         cast_of = {launch.buffers[k]: dtype for k, dtype in casts.items()}
-        if any((cast_of.get(name) or buffers[name].type.dtype) != target.type.dtype for _, name, _ in plan):
+        if any((cast_of.get(name) or buffers[name].type.dtype) != target.type.dtype for _, name, *_ in plan):
             continue  # an input the concat would cast to another type than the output's
-        for j, name, view in plan:
+        if any(name in moved for _, name, *_ in plan):
+            continue  # already stored into another concat's output
+        if any(others and cast_of.get(name, buffers[name].type.dtype) != buffers[name].type.dtype for _, name, _, others, _ in plan):
+            continue  # its other readers want it uncast, the stack holds it cast
+        for j, name, view, others, offset in plan:
+            moved.add(name)
+            for r in others:
+                reader = launches[r]
+                args = tuple(replace(a, view=replace(a.view, offset=a.view.offset + offset)) if n == name and not a.writes else a for n, a in zip(reader.buffers, reader.task.args))
+                launches[r] = Launch(replace(reader.task, args=args), tuple(out if n == name else n for n in reader.buffers), reader.offsets)
             producer = launches[j]
             args = tuple(replace(a, view=view) if n == name and a.writes else a for n, a in zip(producer.buffers, producer.task.args))
             task = producer.task
@@ -457,8 +467,10 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         if arg.writes:
             continue
         view = arg.view
-        if all(s == 0 for s in view.strides):
+        if all(s == 0 for s in view.strides) and view.pad is None:
             continue  # a constant bound
+        if all(s == 0 for s in view.strides):
+            return None  # an input broadcast from a constant: no producer would store its slice
         padded = [k for k, (lo, hi) in enumerate(view.pad or ()) if lo != 0 or hi != 0]
         if view.pad is None or len(padded) != 1 or view.offset != 0:
             return None
@@ -479,7 +491,13 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         if strides is None:
             return None
         w = writers.get(name, [])
-        if len(w) != 1 or readers.get(name) != [index] or source.kind is not BufferKind.temp or w[0] > index:
+        if len(w) != 1 or index not in readers.get(name, []) or source.kind is not BufferKind.temp or w[0] > index:
+            return None
+        # Other readers (an RNN's bf16 state, stacked for the weight gradient and read by the
+        # next step's product) read the slice instead, when it is the input as laid out, moved
+        # by an offset: their views only shift.
+        others = [r for r in readers[name] if r != index]
+        if others and (tuple(strides) != contiguous_strides(source.type.shape) or any(r < w[0] or program.launches[r].offsets for r in others)):
             return None
         producer = program.launches[w[0]]
         if producer.offsets:
@@ -493,7 +511,7 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         composed = _compose(stores[0].view, source.type.shape, strides, block.offset)
         if composed is None:
             return None
-        plan.append((w[0], name, composed))
+        plan.append((w[0], name, composed, others, block.offset))
     return plan or None
 
 

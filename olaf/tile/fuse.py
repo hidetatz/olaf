@@ -37,6 +37,8 @@ CHEAP_OPS = 3
 # reader up to this cost: reading its inputs again moves fewer bytes than writing and reading
 # its output (GPT-2's gelu tanh, shared by forward and backward after CSE: 50 MB of f32 per layer).
 RECOMPUTE_OPS = 8
+# Concats of more inputs than this take no inlined producers (_Rewriter).
+CONCAT_INLINE_INPUTS = 4
 
 _BYTES = {DType.f32: 4, DType.f64: 8, DType.bf16: 2, DType.i32: 4, DType.i64: 8, DType.u32: 4, DType.bool: 1}
 _MEMORY = frozenset({"load", "load_indexed", "store", "atomic_add", "atomic_add_indexed"})
@@ -190,6 +192,16 @@ class _Rewriter:
         # exact widening (which is what lets the dot run on b16 matrix instructions).
         consumer = _pointwise(launch, buffers)
         self.keep = consumer is not None and _widening_cast(consumer)
+        # Nothing is inlined into a concat of many inputs: tile.normalize.eliminate_concats lets
+        # its producers store into their slices, and one inlined producer makes the concat
+        # compute, so none can. An RNN stacking its 128 states (each also read by the next
+        # step) recomputed them there, every element selecting among 128 inlined steps (167 of
+        # 226 ms). A concat of a few (U-Net's skip connections, q, k and v) still takes its
+        # producers, which saves their writes when it cannot be eliminated.
+        # Casts still go in: the concat stores them through its producers (eliminate_concats'
+        # _select_casts; a scan's bf16 weight gradients stacked as f32).
+        inputs = sum(1 for a in launch.task.args if not a.writes and a.view.pad is not None)
+        self.casts_only = launch.task.origin == ("concat",) and inputs > CONCAT_INLINE_INPUTS
         self.changed = False
 
     def arg_index(self, buffer: str, arg: Arg) -> int:
@@ -206,6 +218,8 @@ class _Rewriter:
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
         view = self.launch.task.args[op.attr("arg")].view
+        if recipe is not None and self.casts_only and [o.kind for o in recipe.launch.task.body.ops if o.kind not in ("store",) and not set(o.outputs) <= recipe.coordinate] != ["load", "cast"]:
+            return None
         if recipe is not None and recipe.gathers:
             return self.gather_ok(op, recipe, name, view)
         if recipe is None or (view.source is None and not _same_layout(recipe, name, self.buffers) and _stepped(recipe, view, self.buffers[name]) is None):

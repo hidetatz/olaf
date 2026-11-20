@@ -590,3 +590,55 @@ class TestCommonSubexpressions:
         expected = traced.eager(*args)[0]
         for a, e in zip(interpret(graph, args)[0], olaf.tree_flatten(expected)[0]):
             np.testing.assert_allclose(a, e, rtol=1e-6)
+
+
+class TestMergeAccumulatedContracts:
+    def test_sum_of_step_products_becomes_one_product(self):
+        # An unrolled RNN's W_hh gradient: one bf16 [B, H] x [B, H] product per step, cast and
+        # summed in f32; merged, one product over the stacked steps (fewer roundings, within the
+        # bf16 tolerance of the chain).
+        from olaf.graph.ir import bf16_round
+        from olaf.passes.accumulate import merge_accumulated_contracts
+
+        rng = np.random.default_rng(0)
+        xs = [bf16_round(rng.normal(size=(6, 8))) for _ in range(5)]
+        ys = [bf16_round(rng.normal(size=(6, 8))) for _ in range(5)]
+
+        def fn(*vals):
+            # Computed operands (per-step states and gradients), which can be stored into stacks.
+            a, b = [olaf.neg(v) for v in vals[:5]], [olaf.neg(v) for v in vals[5:]]
+            acc = olaf.zeros((8, 8))
+            for x, y in zip(a, b):
+                acc = acc + olaf.cast(olaf.einsum("bh,bg->gh", x, y), olaf.f32)
+            return acc
+
+        graph = olaf.trace(fn, *[tt(6, 8, dtype=olaf.bf16)] * 10).graph
+        after = merge_accumulated_contracts(graph)
+        verify(after)
+        assert [op.kind for op in after.ops].count("contract") == 1
+        exact = sum(y.T.astype(np.float64) @ x.astype(np.float64) for x, y in zip(xs, ys))
+        before_err = np.linalg.norm(run_graph(graph, *xs, *ys)[0] - exact)
+        after_err = np.linalg.norm(run_graph(after, *xs, *ys)[0] - exact)
+        assert after_err / np.linalg.norm(exact) < 1e-2 and after_err <= before_err * 1.5
+
+    def test_views_of_a_stack_stay(self):
+        # Layer weights sliced from a parameter stack would be copied into a new stack.
+        from olaf.passes.accumulate import merge_accumulated_contracts
+
+        def fn(stack, x):
+            acc = olaf.zeros((6, 8))
+            for i in range(4):
+                acc = acc + olaf.einsum("bk,kd->bd", olaf.neg(x), stack[i])
+            return acc
+
+        graph = olaf.trace(fn, tt(4, 8, 8), tt(6, 8)).graph
+        assert merge_accumulated_contracts(graph) is graph
+
+    def test_short_or_mixed_chains_stay(self):
+        from olaf.passes.accumulate import merge_accumulated_contracts
+
+        def fn(a, b, c):
+            return olaf.einsum("ij,jk->ik", a, b) + olaf.einsum("ij,jk->ik", b, c)
+
+        graph = olaf.trace(fn, tt(4, 4), tt(4, 4), tt(4, 4)).graph
+        assert merge_accumulated_contracts(graph) is graph

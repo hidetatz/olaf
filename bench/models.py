@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat", "rnn"]
 
 
 def timed(run, sync) -> float:
@@ -409,6 +409,20 @@ def build(name):
         tm = test_gat.TorchGAT(config).cuda().train()
         step = torch_train_step(tm, lambda m: test_gat.torch_loss(m, x, src, dst, labels))
         return f"GAT ({N} nodes, {N * degree} edges)", (traced, initial, [x, src, dst, labels]), step
+    if name == "rnn":
+        import test_rnn
+        from olaf.examples import rnn
+
+        # A character-level language model: 2 layers of 1024, 64 sequences of 128 characters.
+        config = rnn.Config(vocab_size=256, hidden_size=1024, num_layers=2)
+        test_rnn.CONFIG = config
+        B, S = 64, 128
+        model = rnn.CharRNN(config, olaf.bf16)
+        ids = rng.integers(0, 256, (B, S)).astype(np.int32)
+        traced, initial = olaf.train_step(rnn.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-3), olaf.TensorType(ids.shape, olaf.i32))
+        tm = test_rnn.TorchCharRNN(config).cuda().train()
+        step = torch_train_step(tm, lambda m: test_rnn.torch_loss(m, ids))
+        return f"Char RNN (2 x 1024, {B} x {S})", (traced, initial, [ids]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

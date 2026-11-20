@@ -695,7 +695,7 @@ class _Converter:
             chosen = self.schedules.get(key)
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
-            split = self._contract_split(op, (ta, tb), (ra, rb), values, out_labels, k_labels, size, bm, bn)
+            split = None if getattr(self, "_partial", False) else self._contract_split(op, (ta, tb), (ra, rb), values, out_labels, k_labels, size, bm, bn)
             if split is not None:
                 return split
         extent = {c: 1 for c in size}
@@ -959,7 +959,10 @@ class _Converter:
             tiles *= size[c]
             reduced //= size[c]
         refs, values = list(refs), list(values)
-        rest = [c for c in outer if c not in moved]
+        # When the outer labels are used up, the inner one splits too (an RNN step's [64, 1024]
+        # x [1024, 1024], one reduced label: 8 tiles on 28 SMs, 40 us a step); its parts stay
+        # contiguous runs of the label.
+        rest = [c for c in outer if c not in moved] or [k_inner]
         if tiles < 2 * units and rest:
             # The next outer label in parts, when moving it whole would leave too little of the
             # reduction (a ViT weight gradient over 128 images x 65 tokens: 9 tiles, and 65
@@ -994,7 +997,12 @@ class _Converter:
         partial_type = TensorType(tuple(size[c] for c in partial_labels), acc)
         spec = f"{ta},{tb}->{partial_labels}"
         partial = Op("contract", tuple(values), (Value(partial_type),), make_attrs({"spec": spec}))
-        result = self._op_contract(partial, list(refs))
+        # The partial product is not split again: one sum of parts, not a sum of sums.
+        self._partial = True
+        try:
+            result = self._op_contract(partial, list(refs))
+        finally:
+            self._partial = False
         return self._reduce(result, "sum", tuple(range(len(moved))), op.outputs[0].type)
 
     def _op_conv(self, op: Op, inputs: list[Ref]) -> Ref:

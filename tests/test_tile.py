@@ -158,6 +158,27 @@ def test_short_rows_share_a_block():
         assert rel(run_program(program, [a])[0][0], interpret(graph, [a])[0][0]) < 1e-6
 
 
+def test_concat_inputs_with_other_readers_store_into_the_stack():
+    # Each step's state is read by the next step and stacked: the steps store into the stack and
+    # the next step reads its slice (no copy into the stack).
+    from olaf.pipeline import to_program
+
+    w = R.normal(size=(8, 8)).astype(np.float32) * 0.3
+    h0 = R.normal(size=(4, 8)).astype(np.float32)
+
+    def fn(w, h):
+        states = []
+        for _ in range(5):
+            h = olaf.tanh(olaf.einsum("bh,gh->bg", h, w))
+            states.append(olaf.reshape(h, (1, 4, 8)))
+        return olaf.concat(states, axis=0)
+
+    graph = lower(olaf.trace(fn, tt(8, 8), tt(4, 8)).graph)
+    program = to_program(graph)
+    assert not any(launch.task.origin == ("concat",) for launch in program.launches)
+    assert rel(run_program(program, [w, h0])[0][0], interpret(graph, [w, h0])[0][0]) < 1e-6
+
+
 def test_composites():
     check(lambda x: olaf.softmax(x, axis=1), X)
     check(lambda x: olaf.layernorm(x), X)
