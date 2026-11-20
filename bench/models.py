@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2"]
 
 
 def timed(run, sync) -> float:
@@ -377,6 +377,22 @@ def build(name):
         tm = test_dit.TorchDiT(config).cuda().train()
         step = torch_train_step(tm, lambda m: test_dit.torch_loss(m, x, t, y, noise))
         return f"DiT-S/2 (32x32x4 latents, 256 tokens), batch {B}", (traced, initial, [x, t, y, noise]), step
+    if name == "mamba2":
+        import test_mamba2
+        from transformers import Mamba2Config, Mamba2ForCausalLM
+        from olaf.examples import mamba2
+
+        # mamba2-130m: 24 layers of 768, 24 heads of 64, state 128; 2 x 512 tokens (chunks of 64).
+        # Larger batches do not fit: olaf needs 9.3 GB of temporaries at 4 x 1024, and Hugging
+        # Face's torch path (no mamba_ssm kernels) runs out of memory at 4 x 512.
+        hf = Mamba2Config(vocab_size=50280, hidden_size=768, state_size=128, num_hidden_layers=24, num_heads=24, head_dim=64, expand=2, n_groups=1, chunk_size=64, conv_kernel=4, tie_word_embeddings=True, use_bias=False, use_conv_bias=True)
+        B, S = 2, 512
+        model = mamba2.Mamba2(mamba2.Config.from_huggingface(hf), olaf.bf16)
+        ids = rng.integers(0, hf.vocab_size, (B, S)).astype(np.int32)
+        traced, initial = olaf.train_step(mamba2.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), olaf.TensorType(ids.shape, olaf.i32))
+        tm = Mamba2ForCausalLM(hf).cuda().train()
+        step = torch_train_step(tm, lambda m: test_mamba2.torch_loss(m, ids))
+        return f"Mamba-2 130M ({B} x {S} tokens)", (traced, initial, [ids]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
