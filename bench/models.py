@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet"]
 
 
 def timed(run, sync) -> float:
@@ -314,6 +314,16 @@ def build(name):
         tm = T5ForConditionalGeneration(hf).cuda().train()
         step = torch_train_step(tm, lambda m: test_t5.torch_loss(m, *inputs))
         return f"T5-small ({S} -> {T} tokens), batch {B}", (traced, initial, inputs), step
+    if name == "mobilenet":
+        import test_mobilenet
+        from olaf.examples import mobilenet
+
+        # MobileNetV2 (width 1.0) for 32x32 images: the stem and the second stage at stride 1.
+        config = mobilenet.Config()
+        test_mobilenet.CONFIG = config
+        B = 128
+        model = mobilenet.MobileNetV2(config, olaf.bf16)
+        return f"MobileNetV2 (CIFAR, 32x32), batch {B}", *classifier(model, test_mobilenet.TorchMobileNet(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32), buffers=model.init_buffers())
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

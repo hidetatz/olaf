@@ -867,11 +867,78 @@ class _Converter:
             return self._conv_phases(op, inputs)
         out_positions = math.prod(op.outputs[0].type.shape[2:])
         kernel_positions = math.prod(inputs[1].shape[2:])
+        x, w = inputs
+        if g > 1 and g == x.shape[1] == w.shape[0] and all(ld == 1 for ld in op.attr("lhs_dilation")) and all(lo >= 0 and hi >= 0 for lo, hi in op.attr("padding")) and all(isinstance(d, int) for d in (*x.shape, *w.shape)):
+            return self._conv_depthwise(op, inputs)
         if g == 1 and out_positions < kernel_positions:
             return self._conv_grid_reduce(op, inputs)
         if g == 1:
             return self._conv_grid_rows(op, inputs)
         return self._conv_windows(op, inputs)
+
+    def _conv_depthwise(self, op: Op, inputs: list[Ref]) -> Ref:
+        """A depthwise conv (one input and one output channel per group) without matrix
+        products: per channel it is a small stencil, nothing to multiply as matrices (as a
+        grouped product its reduction was 9 long, and it ran at a few GFLOPS).
+
+        Over the channels-last padded grid, with x at grid[n, o * stride + q * dilation, c]
+        and w at w[c, 0, q]:
+        - few kernel positions (the forward and input gradient of a 3x3 layer): one
+          elementwise task over the output summing the kernel's shifted views times the
+          weight broadcast along the positions;
+        - many kernel positions and a small output (the weight gradient, whose kernel is the
+          output gradient spanning batch x positions; frontend/autodiff): the products as one
+          pointwise task, reduced over the kernel positions (fusion makes the two one pass).
+        Products and sums in the accumulator type, rounded once to the output's.
+        """
+        x, w = inputs
+        stride, padding, dilation = op.attr("stride"), op.attr("padding"), op.attr("dilation")
+        n = len(stride)
+        N, C = x.shape[:2]
+        kernel = tuple(w.shape[2:])
+        out_type = op.outputs[0].type
+        out_spatial = tuple(out_type.shape[2:])
+        acc = accumulator_dtype(out_type.dtype)
+        grid = self._padded_grid(x, (0, *range(2, 2 + n), 1), padding, 0)
+        gs = contiguous_strides(self.buffers[grid.buffer].type.shape)  # [N, *padded, C]
+        w = self.plain(w)
+        ws = w.view.strides
+        order = (0, *range(2, 2 + n), 1)  # the output channels-last, like its input
+        physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
+        shape = physical.shape
+        if math.prod(kernel) <= 64:
+            refs = []
+            for q in np.ndindex(*kernel):
+                at = sum(qi * d * st for qi, d, st in zip(q, dilation, gs[1:-1]))
+                refs.append(Ref(grid.buffer, View(shape, (gs[0], *(s * st for s, st in zip(stride, gs[1:-1])), gs[-1]), grid.view.offset + at), x.dtype))
+                refs.append(Ref(w.buffer, View(shape, (*(0,) * (n + 1), ws[0]), w.view.offset + sum(qi * st for qi, st in zip(q, ws[2:]))), w.dtype))
+
+            def compute(b, tiles, starts, tile):
+                total = None
+                for xt, wt in zip(tiles[0::2], tiles[1::2]):
+                    term = b.op("mul", b.op("cast", xt, dtype=acc) if xt.type.dtype is not acc else xt, b.op("cast", wt, dtype=acc) if wt.type.dtype is not acc else wt)
+                    total = term if total is None else b.op("add", total, term)
+                return total if acc is out_type.dtype else b.op("cast", total, dtype=out_type.dtype)
+
+            out = self.new_buffer(physical, BufferKind.temp)
+            result = self.elementwise("conv", physical, refs, compute, out=out)
+            return _permuted(result, _inverse(order))
+        # Products [N, *kernel, *out, C] (N is 1 here: the weight gradient's batch), reduced over
+        # the kernel axes. (One reduction per output position instead, for fusion to merge as
+        # siblings, measured slower: 549 -> 722 reduction launches, none merged.)
+        pshape = (N, *kernel, *out_spatial, C)
+        xv = View(pshape, (gs[0], *(d * st for d, st in zip(dilation, gs[1:-1])), *(s * st for s, st in zip(stride, gs[1:-1])), gs[-1]), grid.view.offset)
+        wv = View(pshape, (0, *ws[2:], *(0,) * n, ws[0]), w.view.offset)
+
+        def product(b, tiles, starts, tile):
+            xt, wt = (t if t.type.dtype is acc else b.op("cast", t, dtype=acc) for t in tiles)
+            return b.op("mul", xt, wt)
+
+        products = self.elementwise("mul", TensorType(pshape, acc), [Ref(grid.buffer, xv, x.dtype), Ref(w.buffer, wv, w.dtype)], product)
+        summed = self._reduce_split(products, "sum", tuple(range(1, 1 + n)), TensorType(shape, acc))
+        if acc is not out_type.dtype:
+            summed = self.elementwise("cast", physical, [summed], lambda b, t, s, ts: b.op("cast", t[0], dtype=out_type.dtype))
+        return _permuted(summed, _inverse(order))
 
     def _conv_phases(self, op: Op, inputs: list[Ref]) -> Ref:
         """A convolution over an input dilated by s (the input gradient of a stride-s

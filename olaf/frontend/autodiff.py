@@ -502,13 +502,23 @@ def _conv(b, op, c):
     for size, k, out, st, (lo, hi), d, ld in sizes:
         lhs, rhs, outd = (size - 1) * ld + 1, (k - 1) * d + 1, (out - 1) * st + 1
         rhs_pads.append((lo, (outd - lhs) + (rhs - lo - 1)))
-    parts = []
-    for i in range(g):
-        xg = b.op("slice", x, starts=(0, i * Cg, *(0,) * n), stops=(x.type.shape[0], (i + 1) * Cg, *x.type.shape[2:])) if g > 1 else x
-        cg = b.op("slice", c, starts=(0, i * Og, *(0,) * n), stops=(c.type.shape[0], (i + 1) * Og, *c.type.shape[2:])) if g > 1 else c
-        dwt = b.op("conv", _swap01(b, xg), _swap01(b, cg), stride=tuple(dilation), padding=tuple(rhs_pads), dilation=tuple(stride), lhs_dilation=tuple(lhs_dilation), groups=1)
-        parts.append(_swap01(b, dwt))
-    dw = parts[0] if g == 1 else b.op("concat", *parts, axis=0)
+    conv_attrs = dict(stride=tuple(dilation), padding=tuple(rhs_pads), dilation=tuple(stride), lhs_dilation=tuple(lhs_dilation))
+    if g == 1:
+        dw = _swap01(b, b.op("conv", _swap01(b, x), _swap01(b, c), groups=1, **conv_attrs))
+        return [dx, dw]
+    # Grouped: one convolution with g groups, not g convolutions (a depthwise layer of 960
+    # channels was 960 convolutions and a concat). The batch becomes one more spatial axis that
+    # the kernel spans whole: input [Cg, g, N, *x] (batch Cg, channel i the group's channel ci),
+    # kernel [O, 1, N, *c] (output channel i * Og + o reads group i's channel), output
+    # [Cg, O, 1, *kernel]. Only permutes and unit axes: no reshape merges two axes, so in Tile
+    # IR every operand stays a view (merging g and N into channels was a copy).
+    N = x.type.shape[0]
+    xs, cs = x.type.shape[2:], c.type.shape[2:]
+    lhs = b.op("permute", b.op("reshape", x, shape=(N, g, Cg, *xs)), perm=(2, 1, 0, *range(3, 3 + n)))
+    rhs = b.op("reshape", b.op("permute", c, perm=(1, 0, *range(2, 2 + n))), shape=(O, 1, N, *cs))
+    batch_axis = dict(stride=(1, *conv_attrs["stride"]), padding=((0, 0), *conv_attrs["padding"]), dilation=(1, *conv_attrs["dilation"]), lhs_dilation=(1, *conv_attrs["lhs_dilation"]))
+    dwt = b.op("conv", lhs, rhs, groups=g, **batch_axis)  # [Cg, O, 1, *kernel]
+    dw = b.op("permute", b.op("reshape", dwt, shape=(Cg, O, *kernel)), perm=(1, 0, *range(2, 2 + n)))
     return [dx, dw]
 
 
