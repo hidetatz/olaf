@@ -155,6 +155,9 @@ def test_depthwise_convolutions_are_stencils():
     program = to_program(lower_graph(traced.graph), AMPERE_RTX3060)
     specs = [launch.task.origin[1] for launch in program.launches if launch.task.origin and launch.task.origin[0] == "contract"]
     assert not any("->go" in s for s in specs), specs
+    names = [launch.task.name for launch in program.launches]
+    depthwise = sum(1 for cin, _, t, _ in CONFIG.blocks())
+    assert names.count("depthwise_grad") == depthwise, "each depthwise weight gradient is one task"
     # Per-group weight gradients were a convolution per channel: 1635 launches for this model,
     # where its 7 blocks now take about 400 (every channel of every depthwise layer adds none).
     hidden = sum(cin * t for cin, _, t, _ in CONFIG.blocks())

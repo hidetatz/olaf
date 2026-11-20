@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext"]
 
 
 def timed(run, sync) -> float:
@@ -334,6 +334,16 @@ def build(name):
         B = 128
         model = efficientnet.EfficientNet(config, olaf.bf16)
         return f"EfficientNet-B0 (CIFAR, 32x32), batch {B}", *classifier(model, test_efficientnet.TorchEfficientNet(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32), buffers=model.init_buffers())
+    if name == "convnext":
+        import test_convnext
+        from olaf.examples import convnext
+
+        # ConvNeXt-T for 32x32 images: a 2x2 patchify stem (16x16 at the first stage).
+        config = convnext.Config()
+        test_convnext.CONFIG = config
+        B = 64
+        model = convnext.ConvNeXt(config, olaf.bf16)
+        return f"ConvNeXt-T (CIFAR, 32x32, patch 2), batch {B}", *classifier(model, test_convnext.TorchConvNeXt(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32))
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

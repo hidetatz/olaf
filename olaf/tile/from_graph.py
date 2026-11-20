@@ -649,6 +649,9 @@ class _Converter:
         terms, out_labels = parse_contract(op.attr("spec"))
         if len(terms) != 2:
             raise NotImplementedError(f"tile conversion of a {len(terms)}-operand contract is not implemented")
+        merged = self._merged_contract(op, inputs)
+        if merged is not None:
+            return merged
         (ta, tb), (ra, rb) = terms, inputs
         m_labels = [c for c in out_labels if c in ta and c not in tb]
         n_labels = [c for c in out_labels if c in tb and c not in ta]
@@ -819,6 +822,73 @@ class _Converter:
         self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=origin)
         return out
 
+    def _merged_contract(self, op: Op, inputs: list[Ref]) -> Ref | None:
+        """The contract with runs of row (or column) labels merged into one, where they are one
+        axis in memory: consecutive and in the same order in the output and their operand, the
+        operand's strides nesting. A ConvNeXt MLP's [N, H, W, C] activations at 4 x 4 positions
+        are 1024 contiguous rows, but as labels n, h, w the dot took rows spanning three labels
+        (copies splitting a row number per label) and ran at 3 TFLOPS. Reduced labels are left
+        alone (a weight gradient's outer reduced label is what split-K moves out).
+        None when nothing merges."""
+        from olaf.graph.builder import make_attrs
+
+        (ta, tb), out = parse_contract(op.attr("spec"))
+        terms, refs = [ta, tb], list(inputs)
+        size = {**dict(zip(ta, refs[0].shape)), **dict(zip(tb, refs[1].shape))}
+        if not all(isinstance(d, int) for d in size.values()):
+            return None
+        # Only where the rows would span labels: matrix-instruction dots whose inner row label is
+        # shorter than a tile. Elsewhere the result keeps its own shape, which later passes
+        # match views against (a concat's producers storing into its slices).
+        base = {self._matrix_dtype(v) for v in op.inputs}
+        if not (len(base) == 1 and any(i.m == 16 and i.dtype_a == next(iter(base)).value for i in self.capability.matrix_instructions)):
+            return None
+        short = self.capability.tuning.matrix_dot_block[0]
+        groups = []  # (operand, run of labels)
+        for j in (0, 1):
+            t, other = terms[j], terms[1 - j]
+            view = refs[j].view
+            if view.pad is not None:
+                continue
+            run = []
+            for c in out:
+                ok = c in t and c not in other
+                if ok and run:
+                    prev = run[-1]
+                    p, q = t.index(prev), t.index(c)
+                    ok = q == p + 1 and view.strides[p] == view.strides[q] * view.shape[q]
+                if ok and run:
+                    run.append(c)
+                    continue
+                if len(run) > 1 and size[run[-1]] < short:
+                    groups.append((j, run))
+                run = [c] if c in t and c not in other else []
+            if len(run) > 1 and size[run[-1]] < short:
+                groups.append((j, run))
+        if not groups:
+            return None
+        for j, run in groups:
+            t, ref = terms[j], refs[j]
+            v = ref.view
+            first, last = t.index(run[0]), t.index(run[-1])
+            shape = (*v.shape[:first], math.prod(v.shape[first : last + 1]), *v.shape[last + 1 :])
+            strides = (*v.strides[:first], v.strides[last], *v.strides[last + 1 :])
+            refs[j] = Ref(ref.buffer, View(shape, strides, v.offset), ref.dtype)
+            terms[j] = t[: first + 1] + t[last + 1 :]
+            start = out.index(run[0])
+            out = out[: start + 1] + out[start + len(run) :]
+            size[run[0]] = math.prod(size[c] for c in run)
+        spec = f"{terms[0]},{terms[1]}->{out}"
+        out_type = op.outputs[0].type
+        merged_type = TensorType(tuple(size[c] for c in out), out_type.dtype)
+        values = tuple(Value(TensorType(r.shape, v.type.dtype)) for r, v in zip(refs, op.inputs))
+        result = self._op_contract(Op("contract", values, (Value(merged_type),), make_attrs({"spec": spec})), refs)
+        # A contract's result is its own contiguous buffer: the merged labels read back unmerged,
+        # through a view without a source map (its axes split the buffer's; fusion follows such
+        # views by their steps, and passes rebuilding views from source maps leave it alone).
+        assert result.view == full_view(merged_type.shape), result.view
+        return replace(result, view=View(tuple(out_type.shape), contiguous_strides(out_type.shape), 0))
+
     def _contract_split(self, op: Op, terms: tuple[str, str], refs: tuple[Ref, Ref], values: list[Value], out_labels: str, k_labels: list[str], size: dict, bm: int, bn: int) -> Ref | None:
         """A product with too few output tiles for the device and a long reduction (a linear
         layer's weight gradient, 384 x 384 over batch x sequence: 9 tiles on 28 SMs) as partial
@@ -938,22 +1008,65 @@ class _Converter:
             # which measured faster there (MobileNetV2's step 50 ms against 56).
             result = self.elementwise("conv", physical, refs, compute, out=out, elements=256 if math.prod(kernel) > 9 else None)
             return _permuted(result, _inverse(order))
-        # Products [N, *kernel, *out, C] (N is 1 here: the weight gradient's batch), reduced over
-        # the kernel axes. (One reduction per output position instead, for fusion to merge as
-        # siblings, measured slower: 549 -> 722 reduction launches, none merged.)
-        pshape = (N, *kernel, *out_spatial, C)
-        xv = View(pshape, (gs[0], *(d * st for d, st in zip(dilation, gs[1:-1])), *(s * st for s, st in zip(stride, gs[1:-1])), gs[-1]), grid.view.offset)
-        wv = View(pshape, (0, *ws[2:], *(0,) * n, ws[0]), w.view.offset)
-
-        def product(b, tiles, starts, tile):
-            xt, wt = (t if t.type.dtype is acc else b.op("cast", t, dtype=acc) for t in tiles)
-            return b.op("mul", xt, wt)
-
-        products = self.elementwise("mul", TensorType(pshape, acc), [Ref(grid.buffer, xv, x.dtype), Ref(w.buffer, wv, w.dtype)], product)
-        summed = self._reduce_split(products, "sum", tuple(range(1, 1 + n)), TensorType(shape, acc))
+        summed = self._depthwise_weight_grad(grid, gs, w, ws, kernel, out_spatial, stride, dilation, C, acc)
         if acc is not out_type.dtype:
             summed = self.elementwise("cast", physical, [summed], lambda b, t, s, ts: b.op("cast", t[0], dtype=out_type.dtype))
         return _permuted(summed, _inverse(order))
+
+    def _depthwise_weight_grad(self, grid: Ref, gs, w: Ref, ws, kernel, out_spatial, stride, dilation, C: int, acc: DType) -> Ref:
+        """A depthwise weight gradient: [1, *out, C] = sum over the kernel positions q (the
+        output gradient's batch x positions; frontend/autodiff) of grid[q * dilation + o *
+        stride, c] * w[c, q], for the few output positions o (3 x 3 to 7 x 7).
+
+        Each block takes one image (the first kernel axis) and 32 channels, walks its
+        positions a tile at a time and keeps one accumulator per output position: the
+        output gradient's tile is read once and the input's at every shift, nearby addresses
+        the cache holds. Reduced as products over [*kernel, *out, C] instead, each block kept
+        one output position, and x was read from memory once per position (49 times for 7 x 7).
+        The blocks' partial sums [images, *out, C] are added up afterwards."""
+        n = len(kernel)
+        offsets = list(np.ndindex(*out_spatial))
+        cb = _block(C, 32)
+        last = min(max(1, 128 // cb), _block(kernel[-1], 128))
+        parts = kernel[0]
+        tile = (*(1,) * (n - 1), last, cb)
+        xs = [Ref(grid.buffer, View((*kernel, C), (*(d * st for d, st in zip(dilation, gs[1:-1])), gs[-1]), grid.view.offset + sum(oi * s * st for oi, s, st in zip(o, stride, gs[1:-1]))), grid.dtype) for o in offsets]
+        wv = Ref(w.buffer, View((*kernel, C), (*ws[2:], ws[0]), w.view.offset), w.dtype)
+        partial = self.new_buffer(TensorType((parts, len(offsets), C), acc), BufferKind.temp)
+        b = TileBuilder()
+        pids = [TValue(TileType((), INDEX)) for _ in range(2)]
+        c0 = b.op("mul", pids[1], b.index(cb))
+
+        def step(builder, starts, accs):
+            q = [*starts, c0]
+            wt = builder.op("load", *q, arg=len(xs), shape=tile, dtype=w.dtype, other=0)
+            wt = builder.op("reshape", wt if wt.type.dtype is acc else builder.op("cast", wt, dtype=acc), shape=(last, cb))
+            out = []
+            for k, a in enumerate(accs):
+                xt = builder.op("load", *q, arg=k, shape=tile, dtype=grid.dtype, other=0)
+                xt = builder.op("reshape", xt if xt.type.dtype is acc else builder.op("cast", xt, dtype=acc), shape=(last, cb))
+                out.append(builder.op("add", a, builder.op("mul", xt, wt)))
+            return out
+
+        def loop(builder, axis, starts, accs):
+            if axis == n:
+                return step(builder, starts, accs)
+
+            def body(inner, iv, carries):
+                return loop(inner, axis + 1, [*starts, iv], list(carries))
+
+            extent = last if axis == n - 1 else 1
+            return builder.for_range(builder.index(0), builder.dim(kernel[axis]), extent, accs, body)
+
+        accs = [b.full((last, cb), 0, acc) for _ in offsets]
+        accs = loop(b, 1, [pids[0]], accs)
+        for k, a in enumerate(accs):
+            total = b.op("reshape", b.op("reduce", a, fn="sum", axes=(0,)), shape=(1, 1, cb))
+            b.emit("store", (total, pids[0], b.index(k), c0), {"arg": len(xs) + 1})
+        refs = [*((r, False) for r in xs), (wv, False), (Ref(partial.buffer, View((parts, len(offsets), C), contiguous_strides((parts, len(offsets), C)), 0), acc), True)]
+        self.launch("depthwise_grad", (parts, _ceil_div(C, cb)), refs, b.finish(pids), 4, origin=("depthwise_grad",))
+        summed = self._reduce(partial, "sum", (0,), TensorType((len(offsets), C), acc))
+        return replace(summed, view=View((1, *out_spatial, C), contiguous_strides((1, *out_spatial, C)), summed.view.offset))
 
     def _conv_phases(self, op: Op, inputs: list[Ref]) -> Ref:
         """A convolution over an input dilated by s (the input gradient of a stride-s
