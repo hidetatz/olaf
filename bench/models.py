@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit"]
 
 
 def timed(run, sync) -> float:
@@ -359,6 +359,24 @@ def build(name):
         tm = ViTForImageClassification(hf).cuda().train()
         step = torch_train_step(tm, lambda m: test_vit.torch_loss(m, x, y))
         return f"ViT-S/4 (CIFAR, 32x32, 65 tokens), batch {B}", (traced, initial, [x, y]), step
+    if name == "dit":
+        import test_dit
+        from olaf.examples import dit
+
+        # DiT-S/2 on 32x32x4 latents: 256 tokens of 384, 12 blocks, 1000 classes.
+        config = dit.Config()
+        test_dit.CONFIG = config
+        B = 32
+        model = dit.DiT(config, olaf.bf16)
+        x = rng.normal(size=(B, 4, 32, 32)).astype(np.float32)
+        t = rng.integers(0, 1000, B).astype(np.int32)
+        y = rng.integers(0, 1000, B).astype(np.int32)
+        noise = rng.normal(size=x.shape).astype(np.float32)
+        specs = (olaf.TensorType(x.shape, olaf.f32), olaf.TensorType(t.shape, olaf.i32), olaf.TensorType(y.shape, olaf.i32), olaf.TensorType(noise.shape, olaf.f32))
+        traced, initial = olaf.train_step(dit.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), *specs)
+        tm = test_dit.TorchDiT(config).cuda().train()
+        step = torch_train_step(tm, lambda m: test_dit.torch_loss(m, x, t, y, noise))
+        return f"DiT-S/2 (32x32x4 latents, 256 tokens), batch {B}", (traced, initial, [x, t, y, noise]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
