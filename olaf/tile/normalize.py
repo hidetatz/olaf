@@ -372,7 +372,8 @@ def eliminate_concats(program: Program) -> Program:
     launches = list(program.launches)
     removed: set[int] = set()
     for i, launch in enumerate(program.launches):
-        if launch.task.origin != ("concat",) or launch.offsets or not _pure_select(launch.task):
+        casts = _select_casts(launch.task) if launch.task.origin == ("concat",) and not launch.offsets else None
+        if casts is None:
             continue
         outs = [(n, a) for n, a in zip(launch.buffers, launch.task.args) if a.writes]
         if len(outs) != 1:
@@ -386,11 +387,19 @@ def eliminate_concats(program: Program) -> Program:
         plan = _concat_plan(program, launch, target, buffers, readers, writers, i)
         if plan is None:
             continue
+        cast_of = {launch.buffers[k]: dtype for k, dtype in casts.items()}
+        if any((cast_of.get(name) or buffers[name].type.dtype) != target.type.dtype for _, name, _ in plan):
+            continue  # an input the concat would cast to another type than the output's
         for j, name, view in plan:
             producer = launches[j]
             args = tuple(replace(a, view=view) if n == name and a.writes else a for n, a in zip(producer.buffers, producer.task.args))
             task = producer.task
-            launches[j] = Launch(Task(task.name, task.grid, args, task.body, task.warps, task.origin), tuple(out if n == name else n for n in producer.buffers))
+            task = Task(task.name, task.grid, args, task.body, task.warps, task.origin)
+            if name in cast_of and cast_of[name] != buffers[name].type.dtype:
+                # The producer stores the cast value itself (a bf16 weight gradient rounded,
+                # then widened to the f32 stack, as the concat did).
+                task = _store_cast(task, next(k for k, (n, a) in enumerate(zip(producer.buffers, args)) if n == name and a.writes), cast_of[name])
+            launches[j] = Launch(task, tuple(out if n == name else n for n in producer.buffers))
         removed.add(i)
     if not removed:
         return program
@@ -404,6 +413,37 @@ def _pure_select(task: Task) -> bool:
     return {op.kind for op in task.body.ops} <= {"load", "store", "full", "mul", "add", "iota", "cmp", "where", "broadcast", "dim"} and not any(
         op.kind in ("mul", "add") and op.outputs[0].type.dtype.is_float for op in task.body.ops
     )
+
+
+def _select_casts(task: Task) -> dict[int, DType] | None:
+    """For a concat body that is a pure selection except for casts applied right to its loads
+    (fusion inlines an input's cast: an unrolled scan stacking bf16 weight gradients as f32):
+    {arg: the dtype its load is cast to}. None for any other body."""
+    loads = {op.outputs[0]: op.attr("arg") for op in task.body.ops if op.kind == "load"}
+    casts = {}
+    for op in task.body.ops:
+        if op.kind == "cast":
+            if op.inputs[0] not in loads:
+                return None
+            casts[loads[op.inputs[0]]] = op.attr("dtype")
+    rest = Task(task.name, task.grid, task.args, replace(task.body, ops=tuple(op for op in task.body.ops if op.kind != "cast")), task.warps, task.origin)
+    return casts if _pure_select(rest) else None
+
+
+def _store_cast(task: Task, arg: int, dtype: DType) -> Task:
+    """task with its stores to `arg` cast to dtype first (the cast a concat applied to it)."""
+    from olaf.tile.ir import TileType, TOp, TValue
+
+    ops = []
+    for op in task.body.ops:
+        if op.kind == "store" and op.attr("arg") == arg:
+            value = op.inputs[0]
+            cast = TValue(TileType(value.type.shape, dtype))
+            ops.append(TOp("cast", (value,), (cast,), (("dtype", dtype),)))
+            op = TOp(op.kind, (cast, *op.inputs[1:]), op.outputs, op.attrs, op.regions)
+        ops.append(op)
+    args = tuple(replace(a, dtype=dtype) if k == arg else a for k, a in enumerate(task.args))
+    return Task(task.name, task.grid, args, replace(task.body, ops=tuple(ops)), task.warps, task.origin)
 
 
 def _concat_plan(program: Program, launch: Launch, target, buffers, readers, writers, index: int):

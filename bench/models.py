@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5"]
 
 
 def timed(run, sync) -> float:
@@ -296,6 +296,24 @@ def build(name):
         tm = BertForMaskedLM(hf).cuda().train()
         step = torch_train_step(tm, lambda m: test_bert.torch_loss(m, *inputs))
         return f"BERT-base (MLM, {S} tokens, padded, {P} predicted), batch {B}", (traced, initial, inputs), step
+    if name == "t5":
+        import test_t5
+        from transformers import T5Config, T5ForConditionalGeneration
+        from olaf.examples import t5
+
+        # t5-small: 6 + 6 layers of 512, 8 heads; 256 source tokens, 64 target tokens.
+        hf = T5Config(d_model=512, d_kv=64, d_ff=2048, num_layers=6, num_heads=8, dropout_rate=0.0, feed_forward_proj="relu", tie_word_embeddings=True, decoder_start_token_id=0, pad_token_id=0)
+        B, S, T = 16, 256, 64
+        model = t5.T5(t5.Config.from_huggingface(hf), olaf.bf16)
+        ids = rng.integers(1, hf.vocab_size, (B, S)).astype(np.int32)
+        labels = rng.integers(1, hf.vocab_size, (B, T)).astype(np.int32)
+        decoder_ids = np.concatenate([np.zeros((B, 1), np.int32), labels[:, :-1]], axis=1)
+        inputs = [ids, decoder_ids, labels]
+        specs = tuple(olaf.TensorType(a.shape, olaf.i32) for a in inputs)
+        traced, initial = olaf.train_step(t5.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), *specs)
+        tm = T5ForConditionalGeneration(hf).cuda().train()
+        step = torch_train_step(tm, lambda m: test_t5.torch_loss(m, *inputs))
+        return f"T5-small ({S} -> {T} tokens), batch {B}", (traced, initial, inputs), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
