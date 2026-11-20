@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat"]
 
 
 def timed(run, sync) -> float:
@@ -393,6 +393,22 @@ def build(name):
         tm = Mamba2ForCausalLM(hf).cuda().train()
         step = torch_train_step(tm, lambda m: test_mamba2.torch_loss(m, ids))
         return f"Mamba-2 130M ({B} x {S} tokens)", (traced, initial, [ids]), step
+    if name == "gat":
+        import test_gat
+        from olaf.examples import gat
+
+        # An ogbn-arxiv-sized planted-partition graph: 32768 nodes with 16 incoming edges each,
+        # 128 features, 3 layers of 4 heads x 64, 40 classes; full-graph training.
+        config = gat.Config()
+        test_gat.CONFIG = config
+        N, degree = 32768, 16
+        model = gat.GAT(config, olaf.bf16)
+        x, src, dst, labels = test_gat.graph(rng, N, degree, config.num_classes, config.in_features)
+        specs = (olaf.TensorType(x.shape, olaf.f32), olaf.TensorType(src.shape, olaf.i32), olaf.TensorType(dst.shape, olaf.i32), olaf.TensorType(labels.shape, olaf.i32))
+        traced, initial = olaf.train_step(gat.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-3), *specs)
+        tm = test_gat.TorchGAT(config).cuda().train()
+        step = torch_train_step(tm, lambda m: test_gat.torch_loss(m, x, src, dst, labels))
+        return f"GAT ({N} nodes, {N * degree} edges)", (traced, initial, [x, src, dst, labels]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet

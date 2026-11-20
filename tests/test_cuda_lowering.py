@@ -1,5 +1,7 @@
 """CUDA lowering of Tile IR: device results must match the eager interpreter (fp32 1e-5, bf16 1e-2)."""
 
+import math
+
 import numpy as np
 import pytest
 
@@ -391,3 +393,28 @@ def test_bf16_scatter_add_rounds_once():
     exact = target.astype(np.float64)
     np.add.at(exact, index, updates.astype(np.float64))
     np.testing.assert_array_equal(got, bf16_round(exact.astype(np.float32)))
+
+
+def test_gathers_in_packed_row_reductions():
+    # GAT's attention gradient: rows of two gathers multiplied and summed over 64, evaluated in
+    # the reduction (no gathered tensor written), several rows per block; ragged 37-long rows
+    # and a row count that is not a multiple of the rows per block.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    h, g = R.normal(size=(30, 4, 64)).astype(np.float32), R.normal(size=(30, 4, 64)).astype(np.float32)
+    ragged = R.normal(size=(30, 3, 37)).astype(np.float32)
+    src, dst = R.integers(0, 30, (203,)).astype(np.int32), R.integers(0, 30, (203,)).astype(np.int32)
+
+    def fn(h, g, r, src, dst):
+        return olaf.sum(olaf.take(g, dst) * olaf.take(h, src), axis=-1), olaf.max(olaf.take(r, src) * 2.0, axis=-1)
+
+    graph = lower(olaf.trace(fn, tt(30, 4, 64), tt(30, 4, 64), tt(30, 3, 37), tt(203, dtype=olaf.i32), tt(203, dtype=olaf.i32)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert not any(launch.task.name == "gather" for launch in program.launches)
+    reduces = [l for l in program.launches if l.task.name.startswith("reduce")]
+    assert len(reduces) == 2 and all(math.prod(l.task.grid) < 203 * 3 for l in reduces), [l.task.grid for l in reduces]
+    expected, _ = interpret(graph, [h, g, ragged, src, dst])
+    actual, _ = CudaProgram(program).run([h, g, ragged, src, dst])
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-6, rel(a, e)

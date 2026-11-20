@@ -126,6 +126,38 @@ def test_gather_and_scatter_add():
     check(lambda t, i: olaf.grad(lambda t: olaf.sum(olaf.take(t, i) ** 2.0))(t), table, repeated)
 
 
+def test_gather_is_evaluated_in_its_readers():
+    # Message passing: gathered rows read by a scatter_add and by a row reduction are not
+    # materialized; each reader gathers them itself.
+    h, g = R.normal(size=(10, 3, 8)).astype(np.float32), R.normal(size=(10, 3, 8)).astype(np.float32)
+    src, dst = R.integers(0, 10, (40,)).astype(np.int32), R.integers(0, 10, (40,)).astype(np.int32)
+
+    def fn(h, g, src, dst):
+        rows = olaf.take(h, src)
+        out = olaf.scatter_add(olaf.zeros((10, 3, 8)), dst, rows * 2.0)
+        return out, olaf.sum(olaf.take(g, dst) * rows, axis=-1)
+
+    graph = lower(olaf.trace(fn, tt(10, 3, 8), tt(10, 3, 8), tt(40, dtype=olaf.i32), tt(40, dtype=olaf.i32)).graph)
+    program = fuse(to_tile(graph))
+    assert not any(launch.task.name == "gather" for launch in program.launches)
+    for a, e in zip(run_program(program, [h, g, src, dst])[0], interpret(graph, [h, g, src, dst])[0]):
+        assert rel(a, e) < 1e-6
+
+
+def test_short_rows_share_a_block():
+    # Rows of 64 (and a ragged 3 x 37 case): several rows per block after fusion, same values.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    x = R.normal(size=(50, 4, 64)).astype(np.float32)
+    for fn, a in [(lambda a: olaf.sum(a * a, axis=2), x), (lambda a: olaf.max(a, axis=2), x[:, :3, :37].copy())]:
+        graph = lower(olaf.trace(fn, tt(*a.shape)).graph)
+        program = to_program(graph, AMPERE_RTX3060)
+        (launch,) = [l for l in program.launches if l.task.name.startswith("reduce")]
+        assert math.prod(launch.task.grid) < a.shape[0] * a.shape[1], launch.task.grid
+        assert rel(run_program(program, [a])[0][0], interpret(graph, [a])[0][0]) < 1e-6
+
+
 def test_composites():
     check(lambda x: olaf.softmax(x, axis=1), X)
     check(lambda x: olaf.layernorm(x), X)

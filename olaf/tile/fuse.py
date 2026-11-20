@@ -54,6 +54,7 @@ class _Pointwise:
     store: TOp
     cost: int
     widens: bool = False  # output in a wider type than its inputs, and no fewer bytes than it reads (see _pointwise)
+    gathers: bool = False  # it reads through an index (a gather, possibly with pointwise ops after it)
 
 
 def fuse(program: Program) -> Program:
@@ -64,7 +65,7 @@ def fuse(program: Program) -> Program:
     launches: list[Launch] = []
     for launch in program.launches:
         launch = _inline_into(launch, recipes, readers, buffers)
-        info = _pointwise(launch, buffers)
+        info = _pointwise(launch, buffers, indexed=True)
         if info is not None:
             out = launch.buffers[info.store.attr("arg")]
             if buffers[out].kind is BufferKind.temp and writers[out] == 1:
@@ -73,12 +74,15 @@ def fuse(program: Program) -> Program:
     return _without_dead(program, launches)
 
 
-def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = False) -> _Pointwise | None:
+def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = False, indexed: bool = False) -> _Pointwise | None:
     """A pointwise task (see the module docstring). multi: also accept several stores (of
-    sibling fusion's merged tasks), all at the same tile; info.store is then the first."""
+    sibling fusion's merged tasks), all at the same tile; info.store is then the first.
+    indexed: also accept gathers (load_indexed at the store's tile, its index loaded there),
+    which only fuse's producer inlining knows how to move into a reader."""
     body = launch.task.body
     stores = [op for op in body.ops if op.kind == "store"]
-    if (len(stores) != 1 and not (multi and stores)) or any(op.regions or op.kind not in _POINTWISE | {"load", "store"} for op in body.ops):
+    kinds = _POINTWISE | {"load", "store"} | ({"load_indexed"} if indexed else set())
+    if (len(stores) != 1 and not (multi and stores)) or any(op.regions or op.kind not in kinds for op in body.ops):
         return None
     store = stores[0]
     starts = store.inputs[1:]
@@ -98,9 +102,14 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
     # read twice).
     small = {op.outputs[0] for op in body.ops if op.kind == "load" and _small(args[op.attr("arg")].view, total)}
     cost = 0
+    loaded = {op.outputs[0] for op in body.ops if op.kind == "load"}
     for op in body.ops:
         if op.kind == "load" and (op.inputs != starts or op.attr("shape") != store.inputs[0].type.shape):
             return None
+        if op.kind == "load_indexed" and (op.inputs[1:] != starts or op.inputs[0] not in loaded or op.attr("shape") != store.inputs[0].type.shape):
+            return None
+        if op.kind == "load_indexed":
+            continue
         if op.kind == "iota" and op.inputs[0] not in starts:
             return None
         if op.kind in ("load", "store") or set(op.outputs) <= coordinate:
@@ -129,7 +138,8 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
     # they are: duplicating them breaks up the patterns later passes match.
     reads = [_BYTES[a.dtype] for a in args if not a.writes and not _small(a.view, total)]
     out_bytes = _BYTES[store.inputs[0].type.dtype]
-    return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads))
+    gathers = any(op.kind == "load_indexed" for op in body.ops)
+    return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads), gathers)
 
 
 def _elements(view: View) -> Dim:
@@ -196,6 +206,8 @@ class _Rewriter:
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
         view = self.launch.task.args[op.attr("arg")].view
+        if recipe is not None and recipe.gathers:
+            return self.gather_ok(op, recipe, name, view)
         if recipe is None or (view.source is None and not _same_layout(recipe, name, self.buffers) and _stepped(recipe, view, self.buffers[name]) is None):
             return None
         if view.source is None and self.readers[name] > 1 and _narrows(recipe):
@@ -211,6 +223,29 @@ class _Rewriter:
             return None
         return recipe
 
+    def gather_ok(self, op: TOp, recipe: _Pointwise, name: str, view: View) -> _Pointwise | None:
+        """A gather is evaluated in its reader instead of materialized (GAT's messages: rows of
+        a [32768, 256] table at 557056 edge sources, 570 MB in f32, written once and read by a
+        scatter_add and a reduction). The reader reads it whole and as laid out (its view is the
+        output's full view), so the gather's own views and coordinates apply unchanged; what
+        it rereads is the index once per row and the table's rows, from cache when they repeat.
+        Not into a gather (indices of indices) nor into a dot (whose operand loads are staged)."""
+        if op.kind != "load" or self.into_dot or self.buffers[name].strides is not None or view != full_view(self.buffers[name].type.shape):
+            return None
+        # Only gathers that expand their table: then materializing moves more bytes than
+        # rereading the table does. A language model's embedding (fewer tokens than vocabulary
+        # rows) stays written once; inlined, it went down the residual adds into every layer's
+        # norm (Llama's RMSNorm then no longer matched row fusion).
+        tables = [recipe.launch.buffers[o.attr("arg")] for o in _walk(recipe.launch.task.body) if o.kind == "load_indexed"]
+        sizes = [_elements(full_view(self.buffers[n].type.shape)) for n in (name, *tables)]
+        if not all(isinstance(n, int) for n in sizes) or not all(sizes[0] > n for n in sizes[1:]):
+            return None  # symbolic sizes: not known to expand
+        if any(a.view.pad is not None for a in recipe.launch.task.args if not a.writes):
+            return None
+        if self.readers[name] > 1 and not (recipe.cost <= CHEAP_OPS or (recipe.widens and recipe.cost <= RECOMPUTE_OPS)):
+            return None
+        return recipe
+
     def indexed_ok(self, op: TOp) -> bool:
         """A gather may evaluate its producer at the gathered positions (GPT-2's loss reads 4096
         of 4096 x 50257 shifted logits): no iota in the producer (its coordinates come from the
@@ -218,7 +253,7 @@ class _Rewriter:
         outside the tensor, so no mask is needed."""
         name = self.launch.buffers[op.attr("arg")]
         recipe = self.recipes.get(name)
-        if recipe is None or any(o.kind == "iota" for o in recipe.launch.task.body.ops):
+        if recipe is None or recipe.gathers or any(o.kind == "iota" for o in recipe.launch.task.body.ops):
             return False
         return not (_contains(self.launch.task.body, "reduce") or _contains(self.launch.task.body, "dot"))
 
@@ -255,7 +290,15 @@ class _Rewriter:
             if op.kind == "store" or (op.outputs and set(op.outputs) <= recipe.coordinate):
                 continue
             ins = [mapped.get(v, v) for v in op.inputs]
-            if op.kind == "load":
+            if op.kind == "load_indexed":
+                arg = producer.task.args[op.attr("arg")]
+                slot = self.arg_index(producer.buffers[op.attr("arg")], arg)
+                out = b.op("load_indexed", *ins[:1], *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), axis_map=op.attr("axis_map"), other=op.attr("other"))
+            elif op.kind == "load" and recipe.gathers:
+                arg = producer.task.args[op.attr("arg")]
+                slot = self.arg_index(producer.buffers[op.attr("arg")], arg)
+                out = b.op("load", *starts, arg=slot, shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
+            elif op.kind == "load":
                 arg = producer.task.args[op.attr("arg")]
                 if consumer_view.source is not None:
                     view = _compose(arg.view, consumer_view)

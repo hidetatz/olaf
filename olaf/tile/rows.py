@@ -182,6 +182,11 @@ def _build(program: Program, buffers, readers, p_index: int, info, needed: dict,
                     mapping[op.outputs[0]] = spread(source)
                     continue
                 out = b.op("load", *ins, arg=arg_index(source, arg), shape=op.attr("shape"), dtype=op.attr("dtype"), other=op.attr("other"))
+            elif op.kind == "load_indexed":
+                # A gather fuse evaluated in the reduction (GPT-2's statistics over the summed
+                # token and position embeddings).
+                arg = launch.task.args[op.attr("arg")]
+                out = b.op("load_indexed", *ins, **{**dict(op.attrs), "arg": arg_index(launch.buffers[op.attr("arg")], arg)})
             else:
                 out = b.op(op.kind, *ins, **dict(op.attrs))
             mapping[op.outputs[0]] = out
@@ -248,3 +253,100 @@ def _build(program: Program, buffers, readers, p_index: int, info, needed: dict,
             launches.append(launch)
     used = {n for launch in launches for n in launch.buffers} | set(program.inputs) | set(program.outputs)
     return replace(program, launches=tuple(launches), buffers=tuple(bf for bf in program.buffers if bf.name in used or bf.kind is not BufferKind.temp))
+
+
+# Rows reduced whole in one tile that are shorter than this share a block (pack_short_rows).
+SHORT_ROW = 256
+
+
+def pack_short_rows(program: Program, block: int) -> Program:
+    """Reductions over short rows (tile.from_graph._reduce: one row per block) take several rows
+    per block, up to `block` elements, along the kept axes from the inner one out. One 64-long
+    row per 128-thread block (GAT's attention gradient sums [557056, 4, 64] over 64, its
+    gathers evaluated in the loop) ran 2.2M blocks at 6.3 ms, 3x torch.compile.
+
+    It runs after fusion: row fusion and the online softmax match reductions with one row per
+    block, and those it fuses are gone by then. Lanes past the tensor along a kept axis compute
+    on masked loads (gathers read index 0 there) and are dropped by the store; the reduced axis
+    is masked as before.
+    """
+    launches = [_packed(launch, block) or launch for launch in program.launches]
+    return replace(program, launches=tuple(launches))
+
+
+def _packed(launch: Launch, block: int) -> Launch | None:
+    task = launch.task
+    origin = task.origin
+    if launch.offsets or not origin or origin[0] != "reduce":
+        return None
+    body = task.body
+    rank = len(body.params) + 1
+    if origin[2] != (rank - 1,) or len(task.grid) != rank - 1 or not all(isinstance(g, int) for g in task.grid):
+        return None
+    loads = [op for op in _ops(body) if op.kind in ("load", "load_indexed")]
+    if not loads or any(op.kind in ("atomic_add", "atomic_add_indexed") for op in _ops(body)):
+        return None
+    tile = loads[0].attr("shape")
+    if len(tile) != rank or any(d != 1 for d in tile[:-1]) or tile[-1] >= SHORT_ROW or any(op.attr("shape") != tile for op in loads):
+        return None
+    for op in loads:
+        view = task.args[op.attr("arg")].view
+        if view.rank != rank or not isinstance(view.shape[-1], int) or view.shape[-1] > tile[-1]:
+            return None  # one step covers the row
+    for op in _ops(body):
+        if op.kind == "store" and tuple(task.args[op.attr("arg")].view.shape) != tuple(task.grid):
+            return None  # one row per block: the grid is the output
+    extent, budget = [1] * (rank - 1), block // tile[-1]
+    for a in reversed(range(rank - 1)):
+        if budget < 2:
+            break
+        extent[a] = min(1 << max(task.grid[a] - 1, 0).bit_length(), budget)
+        budget //= extent[a]
+        if extent[a] < task.grid[a]:
+            break
+    if all(e == 1 for e in extent):
+        return None
+    new_tile = (*extent, tile[-1])
+    shapes = {tile: new_tile, tuple(tile[:-1]): tuple(extent), (): ()}
+    try:
+        b = TileBuilder()
+        pids = [TValue(TileType((), INDEX)) for _ in extent]
+        starts = [p if e == 1 else b.op("mul", p, b.index(e)) for p, e in zip(pids, extent)]
+        rebuilt = _retiled(body, dict(zip(body.params, starts)), shapes)
+    except _Unpackable:
+        return None
+    b.ops.extend(rebuilt.ops)
+    grid = tuple(-(-g // e) for g, e in zip(task.grid, extent))
+    return replace(launch, task=replace(task, grid=grid, body=b.finish(pids)))
+
+
+class _Unpackable(Exception):
+    pass
+
+
+def _ops(body: Body):
+    for op in body.ops:
+        yield op
+        for region in op.regions:
+            yield from _ops(region)
+
+
+def _retiled(body: Body, subst: dict, shapes: dict) -> Body:
+    def value(v: TValue) -> TValue:
+        if v.type.shape not in shapes:
+            raise _Unpackable
+        return TValue(TileType(shapes[v.type.shape], v.type.dtype))
+
+    params = tuple(subst.setdefault(p, value(p)) for p in body.params)
+    ops = []
+    for op in body.ops:
+        regions = tuple(_retiled(r, subst, shapes) for r in op.regions)
+        outputs = tuple(value(v) for v in op.outputs)
+        subst.update(zip(op.outputs, outputs))
+        attrs = dict(op.attrs)
+        if "shape" in attrs:
+            if tuple(attrs["shape"]) not in shapes:
+                raise _Unpackable
+            attrs["shape"] = shapes[tuple(attrs["shape"])]
+        ops.append(TOp(op.kind, tuple(subst.get(v, v) for v in op.inputs), outputs, tuple(attrs.items()), regions))
+    return Body(params, tuple(ops), tuple(subst.get(v, v) for v in body.results))

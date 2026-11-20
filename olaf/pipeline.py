@@ -13,7 +13,7 @@ from olaf.tile.fuse import fuse, fuse_epilogues, fuse_row_epilogues, fuse_siblin
 from olaf.tile.ir import Program
 from olaf.tile.normalize import align_rows, eliminate_concats, eliminate_copies, eliminate_pad_copies, hoist_offsets
 from olaf.tile.online_softmax import fuse_online_softmax
-from olaf.tile.rows import fuse_rows
+from olaf.tile.rows import fuse_rows, pack_short_rows
 
 
 def lower_graph(graph: Graph) -> Graph:
@@ -29,4 +29,5 @@ def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True
         # would otherwise be duplicated into each of them, each materializing its own copy.
         program = fuse_epilogues(program, shared_cheap_only=True)
         program = fuse_sibling_reductions(fuse_siblings(eliminate_concats(eliminate_copies(fuse_epilogues(fuse_row_epilogues(fuse_rows(fuse_online_softmax(fuse(eliminate_pad_copies(program))))))))))
+        program = pack_short_rows(program, capability.tuning.row_reduce_block)
     return hoist_offsets(align_rows(program))
