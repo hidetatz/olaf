@@ -844,6 +844,12 @@ class _Converter:
         if not (len(base) == 1 and any(i.m == 16 and i.dtype_a == next(iter(base)).value for i in self.capability.matrix_instructions)):
             return None
         short = self.capability.tuning.matrix_dot_block[0]
+        # Not over rows that normalize.align_rows will pad to 16 bytes (the 51865-wide logits):
+        # the merged views carry no source map, which leaves a buffer unpadded, and its dots
+        # then miss the matrix instructions' aligned copies (Whisper's vocabulary gradient
+        # 1.8 -> 6.5 ms).
+        if any(r.view.strides[i] == 1 and isinstance(r.view.shape[i], int) and r.view.shape[i] % 8 for r in refs for i in range(r.view.rank)):
+            return None
         groups = []  # (operand, run of labels)
         for j in (0, 1):
             t, other = terms[j], terms[1 - j]
@@ -865,9 +871,39 @@ class _Converter:
                 run = [c] if c in t and c not in other else []
             if len(run) > 1 and size[run[-1]] < short:
                 groups.append((j, run))
+        # Reduced labels too, once the product has tiles enough not to be split (split-K moves
+        # an outer reduced label out, so they stay apart until then): a split ViT weight
+        # gradient's 16 images x 65 tokens as one 1040-long reduction, not 65 in 32-wide steps
+        # (a third of them padding) per image.
+        bm, bn = self.capability.tuning.matrix_dot_block[:2]
+        m = math.prod(size[c] for c in out if c in ta and c not in tb)
+        n_ = math.prod(size[c] for c in out if c in tb and c not in ta)
+        batch = math.prod(size[c] for c in out if c in ta and c in tb)
+        if -(-m // bm) * -(-n_ // bn) * batch >= 2 * self.capability.roofline.compute_units:
+            reduced = [c for c in ta if c in tb and c not in out]
+            run = []
+            for c in reduced + [None]:
+                if c is not None and run:
+                    prev = run[-1]
+                    ok = all(t.index(c) == t.index(prev) + 1 and r.view.pad is None and r.view.strides[t.index(prev)] == r.view.strides[t.index(c)] * r.view.shape[t.index(c)] for t, r in zip(terms, refs))
+                    if ok:
+                        run.append(c)
+                        continue
+                if len(run) > 1:
+                    groups.append((None, run))
+                run = [c] if c is not None else []
         if not groups:
             return None
         for j, run in groups:
+            if j is None:
+                # A reduced run: merged in both operands; the output does not have it.
+                for k in (0, 1):
+                    t, v = terms[k], refs[k].view
+                    first, last = t.index(run[0]), t.index(run[-1])
+                    refs[k] = Ref(refs[k].buffer, View((*v.shape[:first], math.prod(v.shape[first : last + 1]), *v.shape[last + 1 :]), (*v.strides[:first], v.strides[last], *v.strides[last + 1 :]), v.offset), refs[k].dtype)
+                    terms[k] = t[: first + 1] + t[last + 1 :]
+                size[run[0]] = math.prod(size[c] for c in run)
+                continue
             t, ref = terms[j], refs[j]
             v = ref.view
             first, last = t.index(run[0]), t.index(run[-1])
@@ -915,12 +951,40 @@ class _Converter:
         # f32 output per part) stay small against the products; with 1024, a U-Net attention
         # projection's weight gradient (256 x 256 over 16 x 256 tokens: 4 tiles) was not split
         # and ran at 3 TFLOPS (0.18 -> 0.05 ms split).
-        for c in (c for c in ta if c in k_labels and c != k_inner):
+        outer = [c for c in ta if c in k_labels and c != k_inner]
+        for c in outer:
             if tiles >= 2 * units or reduced // size[c] < 256:
                 break
             moved.append(c)
             tiles *= size[c]
             reduced //= size[c]
+        refs, values = list(refs), list(values)
+        rest = [c for c in outer if c not in moved]
+        if tiles < 2 * units and rest:
+            # The next outer label in parts, when moving it whole would leave too little of the
+            # reduction (a ViT weight gradient over 128 images x 65 tokens: 9 tiles, and 65
+            # left per image): [P, size / P] as two labels, the P parts moved out.
+            c = rest[0]
+            parts = 1
+            while tiles * parts < 2 * units and size[c] % (parts * 2) == 0 and reduced // (parts * 2) >= 256:
+                parts *= 2
+            if parts > 1:
+                letter = next(x for x in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" if x not in ta + tb + out_labels)
+                terms = [ta, tb]
+                for j in (0, 1):
+                    if c not in terms[j]:
+                        continue
+                    i = terms[j].index(c)
+                    v = refs[j].view
+                    shape = (*v.shape[:i], parts, size[c] // parts, *v.shape[i + 1 :])
+                    strides = (*v.strides[:i], v.strides[i] * (size[c] // parts), v.strides[i], *v.strides[i + 1 :])
+                    refs[j] = Ref(refs[j].buffer, View(shape, strides, v.offset), refs[j].dtype)
+                    values[j] = Value(TensorType(shape, values[j].type.dtype))
+                    terms[j] = terms[j][:i] + letter + terms[j][i:]
+                ta, tb = terms
+                size[letter], size[c] = parts, size[c] // parts
+                moved.append(letter)
+                tiles *= parts
         if not moved:
             return None
         from olaf.graph.builder import make_attrs

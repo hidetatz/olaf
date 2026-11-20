@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit"]
 
 
 def timed(run, sync) -> float:
@@ -344,6 +344,21 @@ def build(name):
         B = 64
         model = convnext.ConvNeXt(config, olaf.bf16)
         return f"ConvNeXt-T (CIFAR, 32x32, patch 2), batch {B}", *classifier(model, test_convnext.TorchConvNeXt(config).cuda(), rng.normal(size=(B, 3, 32, 32)).astype(np.float32), rng.integers(0, 10, B).astype(np.int32))
+    if name == "vit":
+        import test_vit
+        from transformers import ViTConfig, ViTForImageClassification
+        from olaf.examples import vit
+
+        # ViT-S/4 for 32x32 images: 64 patches and the class token, 65 tokens of 384.
+        hf = ViTConfig(image_size=32, patch_size=4, hidden_size=384, num_hidden_layers=12, num_attention_heads=6, intermediate_size=1536, hidden_dropout_prob=0.0, attention_probs_dropout_prob=0.0, num_labels=10, attn_implementation="sdpa")
+        B = 128
+        model = vit.ViT(vit.Config.from_huggingface(hf, 10), olaf.bf16)
+        x = rng.normal(size=(B, 3, 32, 32)).astype(np.float32)
+        y = rng.integers(0, 10, B).astype(np.int32)
+        traced, initial = olaf.train_step(test_vit.olaf_loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-4), olaf.TensorType(x.shape, olaf.f32), olaf.TensorType(y.shape, olaf.i32))
+        tm = ViTForImageClassification(hf).cuda().train()
+        step = torch_train_step(tm, lambda m: test_vit.torch_loss(m, x, y))
+        return f"ViT-S/4 (CIFAR, 32x32, 65 tokens), batch {B}", (traced, initial, [x, y]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
