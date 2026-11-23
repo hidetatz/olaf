@@ -32,7 +32,7 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
-MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat", "rnn"]
+MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat", "rnn", "lstm"]
 
 
 def timed(run, sync) -> float:
@@ -423,6 +423,20 @@ def build(name):
         tm = test_rnn.TorchCharRNN(config).cuda().train()
         step = torch_train_step(tm, lambda m: test_rnn.torch_loss(m, ids))
         return f"Char RNN (2 x 1024, {B} x {S})", (traced, initial, [ids]), step
+    if name == "lstm":
+        import test_lstm
+        from olaf.examples import lstm
+
+        # A character-level language model: 2 LSTM layers of 1024, 64 sequences of 128 characters.
+        config = lstm.Config(vocab_size=256, hidden_size=1024, num_layers=2)
+        test_lstm.CONFIG = config
+        B, S = 64, 128
+        model = lstm.CharLSTM(config, olaf.bf16)
+        ids = rng.integers(0, 256, (B, S)).astype(np.int32)
+        traced, initial = olaf.train_step(lstm.loss(model), model.init(rng), lambda p: olaf.AdamW(p, lr=1e-3), olaf.TensorType(ids.shape, olaf.i32))
+        tm = test_lstm.TorchCharLSTM(config).cuda().train()
+        step = torch_train_step(tm, lambda m: test_lstm.torch_loss(m, ids))
+        return f"Char LSTM (2 x 1024, {B} x {S})", (traced, initial, [ids]), step
     if name == "gradcam":
         import test_resnet
         from olaf.examples import resnet
