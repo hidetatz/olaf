@@ -275,6 +275,14 @@ class _Ragged:
     count_axes: tuple[int, ...]
 
 
+def matrix_dots(graph: Graph, capability: Capability, schedules=None) -> dict[str, tuple[str, list, str]]:
+    """Schedule key -> (spec, operand shapes, b16 dtype) of the dots met converting `graph`: the
+    products as written, and the parts of those split along the reduction under `schedules`."""
+    converter = _Converter(graph, capability, schedules or {})
+    converter.run()
+    return converter.dots
+
+
 def to_tile(graph: Graph, capability: Capability = CPU, schedules=None) -> Program:
     """Default tile shapes come from the capability: matrix instructions change the dot tiles.
 
@@ -293,6 +301,8 @@ class _Converter:
         self.launches: list[Launch] = []
         self.refs: dict[Value, Ref] = {}
         self.states: dict[str, Ref] = {}
+        # Every matrix-instruction dot by its schedule key, those lowered as split-K parts included.
+        self.dots: dict[str, tuple[str, list, str]] = {}
         self._scattered = False  # lowering a convolution phase (_conv_phases)
         self._grids: dict[tuple, Ref] = {}
         self._plain: dict[tuple, Ref] = {}  # one copy per padded view (a pooling's windows share it)
@@ -792,6 +802,7 @@ class _Converter:
             from olaf.search.schedule import dot_key
 
             key = dot_key(op.attr("spec"), [v.type.shape for v in op.inputs], next(iter(base)).value, self.capability.digest())
+            self.dots[key] = (op.attr("spec"), [list(v.type.shape) for v in op.inputs], next(iter(base)).value)
             chosen = self.schedules.get(key)
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps

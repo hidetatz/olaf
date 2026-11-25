@@ -1326,3 +1326,30 @@ def test_sibling_fusion_stores_into_the_interior_of_a_grid():
         assert rel(a, e) < 1e-5
     views = [[a.view for a in launch.task.args if a.writes] for launch in program.launches]
     assert any(len(vs) == 2 and any(not v.is_contiguous for v in vs) for vs in views)
+
+
+def test_schedule_search_sees_split_products_whole_and_in_parts():
+    # Whether a product splits along its reduction follows from its tile: the search must choose
+    # the whole product's schedule, and the parts' too.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.search.schedule import DotSchedule
+    from olaf.search.tune import candidates, dots
+
+    graph = lower(olaf.trace(lambda a, b: olaf.einsum("ki,kj->ij", a, b), tt(4096, 384, dtype=olaf.bf16), tt(4096, 384, dtype=olaf.bf16)).graph)
+    found = dots(graph, AMPERE_RTX3060)
+    specs = {spec for spec, _, _ in found.values()}
+    assert "ki,kj->ij" in specs and len(specs) == 2  # 9 tiles of 128 x 128: split by default
+    whole = next(key for key, (spec, _, _) in found.items() if spec == "ki,kj->ij")
+    part = next(key for key in found if key != whole)
+    assert part in dots(graph, AMPERE_RTX3060, {whole: DotSchedule(128, 128, 32, 3, 8)})
+    assert any((c.bm, c.bn) == (64, 64) for c in candidates(AMPERE_RTX3060))
+
+
+@pytest.mark.gpu
+def test_schedule_measurement_is_not_the_launch_time():
+    # A 64 x 64 x 64 product takes a few microseconds; launching one takes the host about 100.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.search.schedule import DotSchedule
+    from olaf.search.tune import measure
+
+    assert measure("ik,kj->ij", [[64, 64], [64, 64]], "bf16", AMPERE_RTX3060, DotSchedule(64, 64, 32, 3, 4)) < 0.05
