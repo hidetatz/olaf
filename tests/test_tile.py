@@ -429,6 +429,50 @@ def test_online_softmax_fusion_without_a_mask(sq, sk):
         assert rel(a, e) < 1e-2, rel(a, e)
 
 
+def test_column_reduction_rows_fit():
+    rng = np.random.default_rng(9)
+    # 65 rows, 16 at a time, are 80.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    x = rng.normal(size=(32, 65, 128)).astype(np.float32)
+    graph = lower(olaf.trace(lambda a: olaf.sum(a, axis=(0, 1)), tt(*x.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    first = next(launch for launch in program.launches if launch.task.origin[0] == "reduce")
+    assert next(op for op in _walk_ops(first) if op.kind == "load").attr("shape")[-2:] == (4, 128)
+    assert rel(run_program(program, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-5
+
+
+def test_split_reduction_keeps_the_batch_apart_when_one_axis_is_not_enough():
+    rng = np.random.default_rng(9)
+    # 1500 splits into 4 parts only: 4 x 3 blocks for 28 SMs. With the batch, 8 x 4 x 3.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    x = rng.normal(size=(8, 1500, 384)).astype(np.float32)
+    graph = lower(olaf.trace(lambda a: olaf.sum(a, axis=(0, 1)), tt(*x.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    assert [launch.task.grid for launch in program.launches] == [(8, 4, 3), (3,)]
+    assert rel(run_program(program, [x])[0][0], interpret(graph, [x])[0][0]) < 1e-5
+
+
+@pytest.mark.parametrize("tiles,wanted,size,expected", [(36, 56, 32, True), (9, 56, 8, False), (9, 56, 32, True), (36, 56, 3, False)])
+def test_split_k_takes_no_more_parts_than_needed(tiles, wanted, size, expected):
+    from olaf.tile.from_graph import _fewer_parts
+
+    assert _fewer_parts(tiles, wanted, size) is expected
+
+
+def test_weight_gradient_splits_into_the_parts_needed():
+    rng = np.random.default_rng(9)
+    # 384 x 1536 is 36 tiles: 2 parts reach two per SM, not one per image.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    g, x = rng.normal(size=(8, 256, 384)).astype(np.float32), rng.normal(size=(8, 256, 1536)).astype(np.float32)
+    graph = lower(olaf.trace(lambda a, b: olaf.einsum("bsi,bsj->ij", olaf.cast(a, olaf.bf16), olaf.cast(b, olaf.bf16)), tt(*g.shape), tt(*x.shape)).graph)
+    program = fuse(to_tile(graph, AMPERE_RTX3060))
+    partial = next(a for l in program.launches if l.task.origin[0] == "contract" for a in l.task.args if a.writes)
+    assert partial.view.shape == (2, 384, 1536)
+
+
 def test_online_softmax_skips_masked_tiles_of_a_causal_mask():
     from olaf.backend.capability import AMPERE_RTX3060
     from olaf.tile.online_softmax import _causal_offset, _match_forward, _Program, _split_shared_exp, fuse_online_softmax
@@ -762,6 +806,63 @@ def test_widened_sum_with_per_channel_terms_is_recomputed_in_each_reader():
     assert rel(got[1].astype(np.float32), want[1].astype(np.float32)) < 1e-2
 
 
+def test_strided_conv_backward_copies_each_value_into_one_grid():
+    # A stride-2 3x3 layer's input gradient pads every phase like the most padded one, and its
+    # weight gradient reads the forward's grid of the input: one padded grid per value.
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    x, w = R.normal(size=(8, 16, 16, 16)).astype(np.float32), R.normal(size=(32, 16, 3, 3)).astype(np.float32)
+
+    def fn(x, w):
+        loss = lambda x, w: olaf.sum(olaf.conv(x, w, 2, 1) ** 2.0)  # noqa: E731
+        return olaf.value_and_grad(loss, argnums=(0, 1))(x, w)
+
+    graph = lower(olaf.trace(fn, tt(8, 16, 16, 16), tt(32, 16, 3, 3)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    sources = [launch.buffers[0] for launch in program.launches if launch.task.origin == ("copy",) and launch.task.args[0].view.pad is not None]
+    assert len(sources) == len(set(sources)), sources
+    got, want = run_program(program, [x, w])[0], interpret(graph, [x, w])[0]
+    for a, e in zip(olaf.tree_flatten(got)[0], olaf.tree_flatten(want)[0]):
+        assert rel(a, e) < 1e-5
+
+
+@pytest.mark.parametrize("kernel,pad", [(3, 1), (4, 1), (5, 2), (1, 0)])
+def test_strided_conv_input_gradient_phases(kernel, pad):
+    # The phases of a stride-2 layer's input gradient store to the output's strided positions
+    # themselves (a phase without taps is filled).
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    x, w = R.normal(size=(8, 16, 16, 16)).astype(np.float32), R.normal(size=(32, 16, kernel, kernel)).astype(np.float32)
+
+    def fn(x, w):
+        return olaf.grad(lambda x: olaf.sum(olaf.conv(x, w, 2, pad) ** 2.0))(x)
+
+    graph = lower(olaf.trace(fn, tt(*x.shape), tt(*w.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    writes = [(name, launch.task.origin[0]) for launch in program.launches for name, arg in zip(launch.buffers, launch.task.args) if arg.writes]
+    assembled = {name for name, _ in writes if [n for n, _ in writes].count(name) == 4}
+    assert len(assembled) == 1
+    copies = sum(name in assembled and kind == "copy" for name, kind in writes)
+    assert copies == 0, writes
+    for p in (program, to_program(graph, AMPERE_RTX3060)):
+        assert rel(run_program(p, [x, w])[0][0], interpret(graph, [x, w])[0][0]) < 1e-5
+
+
+@pytest.mark.parametrize("channels,columns", [(64, 64), (96, 32), (144, 16), (192, 64), (40, 16), (5, 8)])
+def test_column_reduction_tiles_fit_the_channels(channels, columns):
+    from olaf.backend.capability import AMPERE_RTX3060
+
+    x = R.normal(size=(32, 8, 8, channels)).astype(np.float32)
+    graph = lower(olaf.trace(lambda a: olaf.sum(a, axis=(0, 1, 2)), tt(*x.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    first = next(launch for launch in program.launches if launch.task.origin[0] == "reduce")
+    tile = next(op for op in _walk_ops(first) if op.kind == "load").attr("shape")
+    assert tile[-1] == columns
+    (got,), (want,) = (olaf.tree_flatten(f(g, [x])[0])[0] for f, g in ((run_program, program), (interpret, graph)))
+    assert rel(got, want) < 1e-5
+
+
 def _walk_ops(launch):
     from olaf.tile.fuse import _walk
 
@@ -790,3 +891,29 @@ def test_products_of_ragged_operands_stop_at_the_count():
     program = check(ragged_products, x, w, dy, RAGGED_COUNTS)
     contracts = [launch.task for launch in program.launches if launch.task.origin[:1] == ("contract",)]
     assert len(contracts) == 2 and all(t.args[3].dtype is DType.i32 for t in contracts)
+
+
+def test_concat_of_channels_last_inputs_is_tiled_in_memory_order():
+    # A skip connection joins channels-last activations along the channels, the innermost axis in
+    # memory; a tile along the last logical axis (W) walked it one channel at a time.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import lower_graph, to_program
+
+    rng = np.random.default_rng(11)
+    x, w, v = rng.normal(size=(2, 4, 6, 6)), rng.normal(size=(16, 4, 3, 3)), rng.normal(size=(8, 4, 3, 3))
+    x, w, v = (a.astype(np.float32) for a in (x, w, v))
+
+    def joined(x, w, v):
+        a, b = olaf.conv(x, w, 1, 1), olaf.conv(x, v, 1, 1)
+        return olaf.sum(olaf.exp(olaf.concat([a, b], axis=1)) * olaf.concat([a * 2.0, b + 1.0], axis=1), axis=(2, 3))
+
+    graph = lower_graph(olaf.trace(joined, tt(*x.shape), tt(*w.shape), tt(*v.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    concats = [launch for launch in program.launches if launch.task.name == "concat"]
+    assert len(concats) == 2
+    for launch in concats:
+        (out,) = [a for a in launch.task.args if a.writes]
+        assert out.view.is_contiguous and out.view.shape[-1] == 24
+    expected = interpret(graph, [x, w, v])[0][0]
+    for p in (program, fuse(program), to_program(graph, AMPERE_RTX3060)):
+        assert rel(run_program(p, [x, w, v])[0][0], expected) < 1e-5

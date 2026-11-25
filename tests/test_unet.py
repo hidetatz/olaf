@@ -191,4 +191,4 @@ def test_fusion_at_latent_diffusion_shapes():
     # The skip concatenations stay channels-last, like their inputs: a channels-first result
     # made every reader (group norm statistics, weight gradients) a transpose.
     concats = [launch for launch in program.launches if launch.task.name == "concat"]
-    assert concats and all(launch.task.args[-1].view.strides[1] == 1 for launch in concats if launch.task.args[-1].writes)
+    assert concats and all(launch.task.args[-1].view.strides[-1] == 1 for launch in concats if launch.task.args[-1].writes)
