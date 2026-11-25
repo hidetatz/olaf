@@ -11,6 +11,7 @@ Tile sizes here are defaults, not tuned choices: the schedule search replaces th
 from __future__ import annotations
 
 import math
+from collections import Counter
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -360,6 +361,7 @@ class _Converter:
             self.refs[p] = self.new_buffer(p.type, BufferKind.input)
             inputs.append(self.refs[p].buffer)
         self.producers = {v: op for op in self.graph.ops for v in op.outputs}
+        self.uses = Counter([v for op in self.graph.ops for v in op.inputs] + list(self.graph.results))
         for op in self.graph.ops:
             if OPS[op.kind].composite:
                 raise ValueError(f"composite op {op.kind} must be decomposed before tile conversion")
@@ -1967,7 +1969,10 @@ class _Converter:
             wide = TensorType(result_type.shape, DType.f32)
             target = self.elementwise("cast", wide, [target], lambda b, tiles, *_: b.op("cast", tiles[0], dtype=DType.f32))
             updates = self.elementwise("cast", TensorType(updates.shape, DType.f32), [updates], lambda b, tiles, *_: b.op("cast", tiles[0], dtype=DType.f32))
-        out = self.materialize(target)
+        # Onto another scatter_add's result that nothing else reads: added in place, not to a copy.
+        base = self.producers.get(op.inputs[0])
+        in_place = not narrow and base is not None and base.kind == "scatter_add" and self.uses[op.inputs[0]] == 1
+        out = target if in_place else self.materialize(target)
         spread, n_index = self._index_over(index, updates.shape, axis, batch_dims)
         axis_map = self._axis_map(out.view.rank, axis, n_index)
         shape = updates.shape

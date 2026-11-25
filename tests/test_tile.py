@@ -1219,3 +1219,30 @@ def test_row_task_takes_the_residual_sum_it_normalizes(early_reader):
     assert {"exp", "tanh"} <= {op.kind for op in rows.task.body.ops} and sum(a.writes for a in rows.task.args) == 2
     for a, e in zip(run_program(after, [x, y])[0], interpret(graph, [x, y])[0]):
         assert rel(a, e) < 1e-5
+
+
+def test_tied_embedding_gradient_is_scattered_into_the_product():
+    # Two lookups of the table and the output product: one buffer for the gradient, no zeros.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import lower_graph, to_program
+
+    rng = np.random.default_rng(17)
+    table = rng.normal(size=(50, 16)).astype(np.float32)
+    i, j = rng.integers(0, 50, (2, 6)).astype(np.int32), rng.integers(0, 50, (2, 6)).astype(np.int32)
+
+    def loss(table, i, j):
+        h = olaf.tanh(olaf.take(table, i)) * olaf.take(table, j)
+        logits = olaf.einsum("bsd,vd->bsv", olaf.cast(h, olaf.bf16), olaf.cast(table, olaf.bf16))
+        return olaf.cross_entropy(olaf.cast(logits, F32), j)
+
+    traced = olaf.trace(lambda t, i, j: olaf.value_and_grad(loss)(t, i, j), tt(50, 16), TensorType((2, 6), olaf.i32), TensorType((2, 6), olaf.i32))
+    graph = lower_graph(traced.graph)
+    scatters = [op for op in graph.ops if op.kind == "scatter_add" and op.outputs[0].type.shape == (50, 16)]
+    assert len(scatters) == 2 and scatters[1].inputs[0] is scatters[0].outputs[0]
+    program = to_program(graph, AMPERE_RTX3060)
+    targets = {n for launch in program.launches if launch.task.name == "scatter_add" for n, a in zip(launch.buffers, launch.task.args) if a.writes}
+    assert len(targets) == 1 and not any(launch.task.name in ("copy", "cast") and targets & set(launch.buffers) for launch in program.launches)
+    for a, e in zip(run_program(program, [table, i, j])[0], interpret(graph, [table, i, j])[0]):
+        assert rel(a, e) < 1e-2
+    wide = olaf.trace(lambda t, i, j: olaf.grad(lambda t: olaf.sum(olaf.einsum("bsd,vd->bsv", olaf.take(t, i), t) ** 2.0))(t), tt(50, 16), TensorType((2, 6), olaf.i32), TensorType((2, 6), olaf.i32))
+    assert rel(interpret(lower_graph(wide.graph), [table, i, j])[0][0], wide.eager(table, i, j)[0]) < 1e-5

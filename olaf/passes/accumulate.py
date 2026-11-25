@@ -29,6 +29,7 @@ import numpy as np
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import parse_contract
+from olaf.graph.types import DType
 
 # Fewer terms leave too little to gain to pay for the stacking.
 MIN_TERMS = 3
@@ -167,3 +168,59 @@ def _emit(b: GraphBuilder, chain: _Chain, subst: dict) -> Value:
     if chain.base is not None:
         value = b.op("add", subst.get(chain.base, chain.base), value)
     return value
+
+
+def scatter_into_sums(graph: Graph) -> Graph:
+    """x + scatter_add(zeros, i, u) is scatter_add(x, i, u), x a product (or such a sum itself).
+
+    A tied embedding's gradient is the output product's dense gradient plus one scatter_add per
+    use of the table (T5: the encoder's and the decoder's tokens). As separate terms, each
+    scatter is a zero fill of the table's size and one more operand of the optimizer's update (66
+    MB each of T5-small's 32128 x 512); scattered into the product's output, they touch the rows
+    of the batch's tokens alone. Only when the scatter is used nowhere else, and in f32 or f64: a
+    bf16 scatter_add is the exact sum rounded once, so it does not accumulate onto a bf16 x.
+    """
+    uses: dict[Value, int] = {}
+    for op in graph.ops:
+        for v in op.inputs:
+            uses[v] = uses.get(v, 0) + 1
+    for v in graph.results:
+        uses[v] = uses.get(v, 0) + 1
+    producer: dict[Value, Op] = {}
+
+    def scatters(v: Value) -> list[Op] | None:
+        """The scatter_adds (inner first) that make v from zeros, each used once."""
+        chain: list[Op] = []
+        while (op := producer.get(v)) is not None and op.kind == "scatter_add" and uses.get(v) == 1:
+            chain.insert(0, op)
+            v = op.inputs[0]
+        return chain if chain and _zero(v, producer) else None
+
+    def product(v: Value) -> bool:
+        while (op := producer.get(v)) is not None and uses.get(v) == 1 and op.kind in ("cast", "scatter_add"):
+            v = op.inputs[0]
+        return op is not None and op.kind == "contract" and uses.get(v) == 1
+
+    ops: list[Op] = []
+
+    def emit(op: Op) -> None:
+        ops.append(op)
+        producer.update((v, op) for v in op.outputs)
+
+    changed = False
+    for op in graph.ops:
+        pick = None
+        if op.kind == "add" and op.outputs[0].type.dtype in (DType.f32, DType.f64):
+            a, b = op.inputs
+            pick = next(((x, chain) for x, y in ((a, b), (b, a)) if x is not y and (chain := scatters(y)) is not None and product(x)), None)
+        if pick is None:
+            emit(op)
+            continue
+        value, chain = pick
+        for k, s in enumerate(chain):
+            out = op.outputs[0] if k == len(chain) - 1 else Value(s.outputs[0].type)
+            uses.setdefault(out, 1)
+            emit(Op("scatter_add", (value, *s.inputs[1:]), (out,), s.attrs))
+            value = out
+        changed = True
+    return dead_code_elimination(Graph(graph.params, tuple(ops), graph.results)) if changed else graph
