@@ -10,7 +10,9 @@ the decays exp(segment sums of dt A); across chunks, each chunk's final state, d
 every later chunk (a product over chunk pairs, not a recurrence). Segment sums are differences
 of cumulative sums, and cumulative sums are products with a triangular matrix.
 
-SSD runs in f32 for b16 inputs (Hugging Face casts to float), in the inputs' type otherwise.
+SSD runs in f32 for b16 inputs (Hugging Face casts to float), in the inputs' type otherwise, but
+for its products: the einsums run in the compute type, as torch.autocast runs them (the cumulative
+sums, written as products here, stay f32: torch.cumsum is not on its bf16 list).
 """
 
 from __future__ import annotations
@@ -76,9 +78,13 @@ def softplus(x):
     return olaf.where(x > 20.0, x, olaf.log(1.0 + olaf.exp(olaf.minimum(x, 20.0))))
 
 
-def ssd(x, dt, A, B, C, D, chunk: int):
+def ssd(x, dt, A, B, C, D, chunk: int, compute: DType | None = None):
     """y [b, s, h, p] from x [b, s, h, p], dt [b, s, h] (after softplus), A [h], B and C
-    [b, s, n], D [h]; s a multiple of chunk."""
+    [b, s, n], D [h]; s a multiple of chunk. Products run in compute (None: the inputs' type)."""
+
+    def einsum(spec, u, v):
+        return olaf.einsum(spec, _to(u, compute), _to(v, compute))
+
     b, s, h, p = x.shape
     n = B.shape[-1]
     c = s // chunk
@@ -96,14 +102,14 @@ def ssd(x, dt, A, B, C, D, chunk: int):
     causal = olaf.constant(np.tril(np.ones((chunk, chunk), bool)))
     seg = olaf.broadcast_to(cum.reshape(b, h, c, chunk, 1), (b, h, c, chunk, chunk)) - olaf.broadcast_to(cum.reshape(b, h, c, 1, chunk), (b, h, c, chunk, chunk))
     L = olaf.exp(olaf.where(olaf.broadcast_to(causal, seg.shape), seg, float("-inf")))  # [b, h, c, l, s]
-    G = olaf.einsum("bcln,bcsn->bcls", Cs, Bs)
+    G = _to(einsum("bcln,bcsn->bcls", Cs, Bs), dtype)
     M = olaf.broadcast_to(G.reshape(b, 1, c, chunk, chunk), L.shape) * L
-    y_diag = olaf.einsum("bhcls,bcshp->bclhp", M, xs)
+    y_diag = einsum("bhcls,bcshp->bclhp", M, xs)
     # 2. Each chunk's final state: inputs decayed to the chunk's end.
     last = cum[:, :, :, chunk - 1 :]
     decay = olaf.exp(olaf.broadcast_to(last, cum.shape) - cum)  # [b, h, c, l]
     decayed = xs * olaf.broadcast_to(olaf.permute(decay, (0, 2, 3, 1)).reshape(b, c, chunk, h, 1), xs.shape)
-    states = olaf.einsum("bcln,bclhp->bchpn", Bs, decayed)
+    states = einsum("bcln,bclhp->bchpn", Bs, decayed)
     # 3. The state entering chunk k: chunk j's final state decayed through chunks j+1 .. k-1,
     # summed over j < k (exp of the boundary sums' segment sums, -inf where j >= k).
     ends = cum[:, :, :, chunk - 1]  # [b, h, c]
@@ -113,12 +119,12 @@ def ssd(x, dt, A, B, C, D, chunk: int):
     gap = olaf.broadcast_to(into.reshape(b, h, c, 1), (b, h, c, c)) - olaf.broadcast_to(total.reshape(b, h, 1, c), (b, h, c, c))
     earlier = olaf.constant(np.tril(np.ones((c, c), bool), k=-1))  # [k, j]: j < k
     carry = olaf.exp(olaf.where(olaf.broadcast_to(earlier, gap.shape), gap, float("-inf")))  # [b, h, k, j]
-    entering = olaf.einsum("bhkj,bjhpn->bkhpn", carry, states)
+    entering = einsum("bhkj,bjhpn->bkhpn", carry, states)
     # 4. Their contribution: decayed from the chunk's start to each position, through C.
     start_decay = olaf.exp(cum)  # [b, h, c, l]
-    y_off = olaf.einsum("bcln,bchpn->bclhp", Cs, entering)
+    y_off = _to(einsum("bcln,bchpn->bclhp", Cs, entering), dtype)
     y_off = y_off * olaf.broadcast_to(olaf.permute(start_decay, (0, 2, 3, 1)).reshape(b, c, chunk, h, 1), y_off.shape)
-    y = (y_diag + y_off).reshape(b, s, h, p)
+    y = (_to(y_diag, dtype) + y_off).reshape(b, s, h, p)
     return y + D_residual
 
 
@@ -157,7 +163,7 @@ class Mixer(nn.Module):
         work = DType.f32 if x.dtype is DType.bf16 else x.dtype
         dt = softplus(_to(dt, work) + olaf.broadcast_to(_to(p["dt_bias"], work).reshape(1, 1, H), dt.shape))
         A = -olaf.exp(_to(p["A_log"], work))
-        y = ssd(_to(xs, work).reshape(B_, S, H, P), dt, A, _to(Bm, work), _to(Cm, work), _to(p["D"], work), c.chunk_size)
+        y = ssd(_to(xs, work).reshape(B_, S, H, P), dt, A, _to(Bm, work), _to(Cm, work), _to(p["D"], work), c.chunk_size, self.compute)
         y = rms_norm(p["norm"]["weight"], y.reshape(B_, S, I), c.layer_norm_epsilon, gate)
         return L["out_proj"](p["out_proj"], _to(y, x.dtype))
 
