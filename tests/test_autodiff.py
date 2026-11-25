@@ -91,6 +91,9 @@ Q_ = np.abs(Y) + 0.5
         (lambda x: olaf.sum(olaf.gelu(x, "tanh") ** 2.0), [X]),
         (lambda x, w, b: olaf.sum(olaf.layernorm(x, w, b) ** 2.0), [X, Y[0], R.normal(size=4)]),
         (lambda x: olaf.sum(olaf.layernorm(x, axes=(0, 1)) ** 3.0), [X]),
+        (lambda x, w, b: olaf.sum(olaf.batchnorm(x, w, b, axes=0) ** 3.0), [X, Y[0], R.normal(size=4)]),
+        # Its own generator: the shared stream feeds the tests that follow.
+        (lambda x, w, b: olaf.sum(olaf.groupnorm(x, w, b, 2) ** 3.0), [np.random.default_rng(3).normal(size=s) for s in ((2, 4, 3), (4,), (4,))]),
     ],
 )
 def test_matches_finite_difference(fn, args):

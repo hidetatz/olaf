@@ -447,19 +447,51 @@ def _infer_layernorm(inputs, attrs, regions):
     return [x]
 
 
+@_register("batchnorm", composite=True)
+def _infer_batchnorm(inputs, attrs, regions):
+    # Inputs are x, weight, bias; x is normalized over `axes` and weight and bias run along the
+    # other axes (the channels), unlike layernorm's, which run along the normalized ones.
+    _check(len(inputs) == 3, f"batchnorm takes 3 inputs: {len(inputs)}")
+    x, axes = inputs[0], attrs["axes"]
+    _check(x.dtype.is_float and _axes_ok(axes, x.rank), f"invalid batchnorm input: {x}, axes={axes}")
+    expected = TensorType(tuple(x.shape[i] for i in range(x.rank) if i not in axes), x.dtype)
+    for t in inputs[1:]:
+        _check(t == expected, f"wrong batchnorm weight/bias type: {t} / {expected}")
+    return [x]
+
+
+@_register("groupnorm", composite=True)
+def _infer_groupnorm(inputs, attrs, regions):
+    # Inputs are x [N, C, *spatial], weight [C], bias [C]; each sample's channels are normalized
+    # in `groups` groups, over a group's channels and all positions.
+    _check(len(inputs) == 3, f"groupnorm takes 3 inputs: {len(inputs)}")
+    x, groups = inputs[0], attrs["groups"]
+    _check(x.dtype.is_float and x.rank >= 3 and isinstance(x.shape[1], int) and groups >= 1 and x.shape[1] % groups == 0, f"invalid groupnorm input: {x}, groups={groups}")
+    expected = TensorType((x.shape[1],), x.dtype)
+    for t in inputs[1:]:
+        _check(t == expected, f"wrong groupnorm weight/bias type: {t} / {expected}")
+    return [x]
+
+
 @_register("attention", composite=True)
 def _infer_attention(inputs, attrs, regions):
-    # Inputs are q[...,Tq,D], k[...,Tk,D], v[...,Tk,E] and an optional mask bool[...,Tq,Tk].
-    _check(len(inputs) in (3, 4), f"attention takes 3 or 4 inputs: {len(inputs)}")
+    # Inputs are q[...,Tq,D], k[...,Tk,D], v[...,Tk,E], an optional mask bool[...,Tq,Tk] and,
+    # with the attribute bias=True, a float bias[...,Tq,Tk] added to the scaled scores (T5's
+    # relative positions). The attribute scale (default 1/sqrt(D)) multiplies q k^T.
+    biased = attrs.get("bias", False)
+    _check(len(inputs) - biased in (3, 4), f"attention takes 3 to 5 inputs: {len(inputs)}")
     q, k, v = inputs[:3]
     _check(q.rank >= 2 and q.rank == k.rank == v.rank, f"invalid attention ranks: {q}, {k}, {v}")
     _check(q.dtype == k.dtype == v.dtype and q.dtype.is_float, f"invalid attention dtypes: {q}, {k}, {v}")
     batch = q.shape[:-2]
     _check(k.shape == (*batch, k.shape[-2], q.shape[-1]), f"attention q and k do not match: {q}, {k}")
     _check(v.shape[:-1] == k.shape[:-1], f"attention k and v do not match: {k}, {v}")
-    if len(inputs) == 4:
+    if len(inputs) - biased == 4:
         expected = TensorType((*batch, q.shape[-2], k.shape[-2]), DType.bool)
         _check(inputs[3] == expected, f"wrong attention mask type: {inputs[3]} / {expected}")
+    if biased:
+        bias = inputs[-1]
+        _check(bias.shape == (*batch, q.shape[-2], k.shape[-2]) and bias.dtype.is_float, f"wrong attention bias type: {bias}")
     return [v.with_shape((*batch, q.shape[-2], v.shape[-1]))]
 
 

@@ -19,7 +19,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from olaf.graph.builder import GraphBuilder, dead_code_elimination
-from olaf.graph.composite import attention_probabilities, attention_scores, round_probabilities, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, sigmoid, widen_bf16
+from olaf.graph.composite import attention_inputs, attention_probabilities, batchnorm_normalized, batchnorm_scale, groupnorm_normalized, over_group, per_channel, attention_scores, round_probabilities, element_count, gelu_tanh_argument, keep_axes, layernorm_stats, narrow_like, reduced_mean, sigmoid, widen_bf16
 from olaf.graph.ir import Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 from olaf.graph.types import DType
@@ -648,16 +648,54 @@ def _layernorm(b, op, c):
     return [dx, over_kept(b.op("mul", c, xhat)), over_kept(c)]
 
 
+@_rule("batchnorm")
+def _batchnorm(b, op, c):
+    # The standard (cuDNN) form: dx = weight * rstd * (c - mean(c) - xhat * mean(c * xhat)), and
+    # the two sums are also the bias and weight gradients. Differentiating the decomposition
+    # instead goes through the variance's mean and adds a third sum (of x - mean, which is
+    # zero): one more pass over the activation per layer in the backward.
+    x, weight, _ = op.inputs
+    axes = op.attr("axes")
+    centered, rstd, denominator = batchnorm_normalized(b, x, axes, op.attr("eps"))
+    xhat = b.op("mul", centered, keep_axes(b, rstd, x, axes))
+    sum_c = b.op("reduce", c, fn="sum", axes=axes)
+    sum_cx = b.op("reduce", b.op("mul", c, xhat), fn="sum", axes=axes)
+    mean_c, mean_cx = (keep_axes(b, b.op("div", s, denominator), x, axes) for s in (sum_c, sum_cx))
+    dx = b.op("mul", keep_axes(b, batchnorm_scale(b, rstd, weight), x, axes), b.op("sub", b.op("sub", c, mean_c), b.op("mul", xhat, mean_cx)))
+    return [dx, sum_cx, sum_c]
+
+
+@_rule("groupnorm")
+def _groupnorm(b, op, c):
+    # batchnorm's form with per-group means: dx = rstd * (g - mean(g) - xhat * mean(g * xhat)),
+    # g = c * weight. Every sum comes from two over the positions ([N, C]: of c and c * xhat, one
+    # pass over the activation): summed over the samples they are the bias and weight gradients,
+    # and times the weight, over a group's channels, the two means.
+    x, weight, _ = op.inputs
+    groups = op.attr("groups")
+    spatial = tuple(range(2, x.type.rank))
+    centered, rstd, denominator = groupnorm_normalized(b, x, groups, op.attr("eps"))
+    xhat = b.op("mul", centered, keep_axes(b, rstd, x, spatial))
+    sum_c = b.op("reduce", c, fn="sum", axes=spatial)
+    sum_cx = b.op("reduce", b.op("mul", c, xhat), fn="sum", axes=spatial)
+    w = b.op("broadcast", weight, shape=sum_c.type.shape, dims=(1,))
+    # The outer factor is rstd alone, so the means are taken of g, and the weight goes into c.
+    mean_g, mean_gx = (per_channel(b, b.op("div", over_group(b, b.op("mul", w, s), groups), denominator), x.type.shape[1]) for s in (sum_c, sum_cx))
+    g = b.op("mul", c, keep_axes(b, w, x, spatial))
+    inner = b.op("sub", b.op("sub", g, keep_axes(b, mean_g, x, spatial)), b.op("mul", xhat, keep_axes(b, mean_gx, x, spatial)))
+    dx = b.op("mul", keep_axes(b, rstd, x, spatial), inner)
+    return [dx, b.op("reduce", sum_cx, fn="sum", axes=(0,)), b.op("reduce", sum_c, fn="sum", axes=(0,))]
+
+
 @_rule("attention")
 def _attention(b, op, c):
     # Saves q, k, v (and the mask) and recomputes the probabilities: they are [..., Tq, Tk] while the
     # inputs are [..., T, D]. Unlike FlashAttention, which also saves the per-row log-sum-exp and so
     # rebuilds P in one pass, this recomputes the row max and sum too, because a composite's VJP sees
     # only its inputs. Exposing the LSE as an auxiliary output is a P1 question (docs/design.md).
-    q, k, v = op.inputs[:3]
-    mask = op.inputs[3] if len(op.inputs) == 4 else None
+    q, k, v, mask, bias = attention_inputs(op.inputs, op.attr_dict)
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
-    scores, scale = attention_scores(b, q, k, mask)
+    scores, scale = attention_scores(b, q, k, mask, bias, op.attr("scale", None))
     # Not the softmax composite: the probabilities must match the forward decomposition, which gives
     # rows with every key masked p = 0 instead of NaN.
     # Rounded as in the forward (graph.composite.round_probabilities), as PyTorch's backward
@@ -667,13 +705,21 @@ def _attention(b, op, c):
     dp = b.op("contract", c, v, spec=f"{batch}xz,{batch}yz->{batch}xy")
     # Masked positions have p = 0, so their score gradient is 0 without another where. A fully
     # masked row has p = 0 everywhere, so dq for it and its share of dk and dv are 0 too.
-    ds = b.op("mul", _softmax_backward(b, p, dp, scores.type.rank - 1), scale)
+    ds = _softmax_backward(b, p, dp, scores.type.rank - 1)
+    ds = b.op("mul", ds, scale) if scale is not None else ds
     # dS is rounded like the probabilities before it multiplies q and k, as in PyTorch's bf16
     # backward and FlashAttention's: those two products then run on bf16 matrix instructions.
     ds = round_probabilities(b, ds, op.attr("source_dtype", None))
     dq = b.op("contract", ds, k, spec=f"{batch}xy,{batch}yz->{batch}xz")
     dk = b.op("contract", ds, q, spec=f"{batch}xy,{batch}xz->{batch}yz")
-    return [dq, dk, dv] + ([None] if mask is not None else [])
+    # The bias gradient is the score gradient before the scale, taken from the rounded dS (so
+    # bf16 rounded, as PyTorch's bf16 score gradient is) rather than from the unrounded one: a
+    # second value of dS would be a third reader of P, dP and D, which the fused attention
+    # backward (tile.online_softmax) does not take. The fused backward then also stores dS.
+    dbias = None
+    if bias is not None:
+        dbias = ds if scale is None else b.op("div", ds, scale)
+    return [dq, dk, dv] + ([None] if mask is not None else []) + ([dbias] if bias is not None else [])
 
 
 @_rule("cross_entropy")

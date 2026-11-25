@@ -380,6 +380,23 @@ class TestCompositesAgainstTorch:
         ref = F.layer_norm(torch.from_numpy(X), (4,), torch.from_numpy(w), torch.from_numpy(b), 1e-5)
         assert rel(out, ref.numpy()) < 1e-5
 
+    def test_batchnorm(self):
+        x = R.normal(size=(5, 3, 2, 4)).astype(np.float32)
+        w, b = R.normal(size=3).astype(np.float32), R.normal(size=3).astype(np.float32)
+        out = self._run(lambda a, u, v: olaf.batchnorm(a, u, v, axes=(0, 2, 3)), x, w, b)
+        ref = F.batch_norm(torch.from_numpy(x), None, None, torch.from_numpy(w), torch.from_numpy(b), training=True, eps=1e-5)
+        assert rel(out, ref.numpy()) < 1e-5
+
+    @pytest.mark.parametrize("groups", [1, 2, 6])
+    def test_groupnorm(self, groups):
+        rng = np.random.default_rng(5)
+        # A mean large against the spread: the one-pass variance cancels without its shift.
+        x = (100 + rng.normal(size=(5, 6, 3, 4))).astype(np.float32)
+        w, b = rng.normal(size=6).astype(np.float32), rng.normal(size=6).astype(np.float32)
+        out = self._run(lambda a, u, v: olaf.groupnorm(a, u, v, groups), x, w, b)
+        ref = F.group_norm(torch.from_numpy(x).double(), groups, torch.from_numpy(w).double(), torch.from_numpy(b).double(), 1e-5)
+        assert rel(out, ref.numpy()) < 1e-5
+
     def test_layernorm_symbolic_dims(self):
         B, D = olaf.sym("B"), olaf.sym("D")
         out = olaf.trace(lambda a: olaf.layernorm(a), tt(B, D)).eager(X)[0]
@@ -642,3 +659,87 @@ class TestMergeAccumulatedContracts:
 
         graph = olaf.trace(fn, tt(4, 4), tt(4, 4), tt(4, 4)).graph
         assert merge_accumulated_contracts(graph) is graph
+
+
+class TestMasksFromSelections:
+    def test_relu_backward_reads_the_output_not_the_input(self):
+        from olaf.passes.cse import eliminate_common_subexpressions
+        from olaf.passes.select_mask import masks_from_selections
+
+        def fn(x, y):
+            return olaf.value_and_grad(lambda x: olaf.sum(olaf.nn.relu(x * y) ** 2.0))(x)
+
+        graph = eliminate_common_subexpressions(canonicalize(decompose(olaf.trace(fn, tt(4, 8), tt(4, 8)).graph)))
+        after = masks_from_selections(graph)
+        verify(after)
+        (pre,) = [op.outputs[0] for op in after.ops if op.kind == "mul" and set(op.inputs) == set(after.params)]
+        (select,) = [op for op in after.ops if op.kind == "where" and op.inputs[1] is pre]
+        # The pre-activation feeds only the forward mask and select; the backward mask compares
+        # the select's output.
+        assert sorted(op.kind for op in after.ops if pre in op.inputs) == ["cmp", "where"]
+        assert any(op.kind == "cmp" and select.outputs[0] in op.inputs for op in after.ops)
+        x = R.normal(size=(4, 8)).astype(np.float32)
+        x[0, :3] = 0.0  # ties: no gradient, as in torch.relu
+        y = R.normal(size=(4, 8)).astype(np.float32)
+        for a, b in zip(olaf.tree_flatten(interpret(after, [x, y])[0])[0], olaf.tree_flatten(interpret(graph, [x, y])[0])[0]):
+            np.testing.assert_array_equal(a, b)
+        t = torch.tensor(x, requires_grad=True)
+        (torch.relu(t * torch.tensor(y)) ** 2).sum().backward()
+        np.testing.assert_allclose(olaf.tree_flatten(interpret(after, [x, y])[0])[0][1], t.grad.numpy(), rtol=1e-5, atol=1e-6)
+
+    @pytest.mark.parametrize("dtype", [olaf.f32, olaf.bf16])
+    def test_relu6_backward_reads_only_the_output(self, dtype):
+        from olaf.passes.cse import eliminate_common_subexpressions
+        from olaf.passes.select_mask import masks_from_selections
+
+        def fn(x, w):
+            return olaf.value_and_grad(lambda x: olaf.sum(olaf.cast(olaf.nn.relu6(x) * w, F32)))(x)
+
+        specs = (tt(40, dtype=dtype), tt(40, dtype=dtype))
+        graph = eliminate_common_subexpressions(canonicalize(decompose(olaf.trace(fn, *specs).graph)))
+        after = masks_from_selections(graph)
+        verify(after)
+        x, w = (R.normal(size=40).astype(np.float32) * 6 for _ in range(2))
+        x[:4] = [0.0, 6.0, np.nan, np.inf]
+        if dtype is olaf.bf16:
+            x, w = bf16_round(x), bf16_round(w)
+        for a, b in zip(olaf.tree_flatten(interpret(after, [x, w])[0])[0], olaf.tree_flatten(interpret(graph, [x, w])[0])[0]):
+            np.testing.assert_array_equal(a, b)
+        selects = [op for op in after.ops if op.kind == "where"]
+        clipped = selects[1].outputs[0]
+        compared = [v for op in after.ops[after.ops.index(selects[1]) + 1 :] if op.kind == "cmp" for v in op.inputs if v in (selects[0].outputs[0], after.params[0], clipped)]
+        assert compared and all(v is clipped for v in compared)
+
+    def test_clip_with_crossed_bounds(self):
+        from olaf.passes.select_mask import masks_from_selections
+
+        def fn(x):  # lo = 6 > hi = 0: lo < z does not stand for lo < y
+            m = 6.0 < x
+            y = olaf.where(m, x, 6.0)
+            z = olaf.where(y < 0.0, y, 0.0)
+            return z, olaf.where(m, x, 1.0)
+
+        graph = olaf.trace(fn, tt(16)).graph
+        x = R.normal(size=16).astype(np.float32) * 12
+        for a, b in zip(interpret(masks_from_selections(graph), [x])[0], interpret(graph, [x])[0]):
+            np.testing.assert_array_equal(a, b)
+
+    def test_min_select_and_non_strict_masks(self):
+        from olaf.passes.select_mask import masks_from_selections
+
+        def fn(u, v):
+            m = u < v
+            lo = olaf.where(m, u, v)  # min: the mask is lo < v
+            le = u <= v
+            hi = olaf.where(le, v, u)  # not strict: left alone
+            return lo, olaf.where(m, u * 2.0, v), hi, olaf.where(le, u, v * 3.0)
+
+        graph = olaf.trace(fn, tt(16), tt(16)).graph
+        after = masks_from_selections(graph)
+        verify(after)
+        u = R.normal(size=16).astype(np.float32)
+        v = np.where(np.arange(16) % 3 == 0, u, R.normal(size=16)).astype(np.float32)  # ties
+        u[1], v[2] = np.nan, np.nan
+        for a, b in zip(interpret(after, [u, v])[0], interpret(graph, [u, v])[0]):
+            np.testing.assert_array_equal(a, b)
+        assert sum(op.kind == "cmp" for op in after.ops) == sum(op.kind == "cmp" for op in graph.ops) + 1

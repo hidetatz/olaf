@@ -8,6 +8,7 @@ from olaf.passes.accumulate import merge_accumulated_contracts
 from olaf.passes.canonicalize import canonicalize
 from olaf.passes.cse import eliminate_common_subexpressions
 from olaf.passes.decompose import decompose
+from olaf.passes.select_mask import masks_from_selections
 from olaf.passes.unroll import unroll_scans
 from olaf.tile.from_graph import to_tile
 from olaf.tile.fuse import fuse, fuse_epilogues, fuse_row_epilogues, fuse_sibling_reductions, fuse_siblings
@@ -19,8 +20,9 @@ from olaf.tile.rows import fuse_rows, pack_short_rows
 
 def lower_graph(graph: Graph) -> Graph:
     """Graph IR passes: composites to core ops, scans unrolled, views folded, common ops merged,
-    sums of products over the unrolled steps made one product."""
-    return merge_accumulated_contracts(eliminate_common_subexpressions(canonicalize(unroll_scans(decompose(graph)))))
+    sums of products over the unrolled steps made one product, masks of selections read back from
+    the selected values."""
+    return masks_from_selections(merge_accumulated_contracts(eliminate_common_subexpressions(canonicalize(unroll_scans(decompose(graph))))))
 
 
 def to_program(graph: Graph, capability: Capability = CPU, *, fused: bool = True, schedules=None) -> Program:

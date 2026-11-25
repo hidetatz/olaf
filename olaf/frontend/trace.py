@@ -16,7 +16,7 @@ import numpy as np
 
 from olaf.frontend.autodiff import grad as graph_grad
 from olaf.graph.builder import GraphBuilder, inline, verify
-from olaf.graph.composite import element_count
+from olaf.graph.composite import batchnorm_stats, element_count
 from olaf.graph.dim import Dim
 from olaf.graph.interp import interpret
 from olaf.graph.ir import Graph, Value
@@ -454,8 +454,28 @@ def layernorm(x: Tensor, weight: Tensor | None = None, bias: Tensor | None = Non
     return _emit("layernorm", *inputs, axes=_axes(x, axes), eps=float(eps))
 
 
-def attention(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
-    return _emit("attention", *((q, k, v) if mask is None else (q, k, v, mask)))
+def batchnorm(x: Tensor, weight: Tensor, bias: Tensor, axes, eps: float = 1e-5) -> Tensor:
+    """Normalizes over `axes` (biased variance); weight and bias run along the other axes."""
+    return _emit("batchnorm", x, weight, bias, axes=_axes(x, axes), eps=float(eps))
+
+
+def groupnorm(x: Tensor, weight: Tensor, bias: Tensor, groups: int, eps: float = 1e-5) -> Tensor:
+    """torch.nn.functional.group_norm of x [N, C, *spatial]; weight and bias are [C]."""
+    return _emit("groupnorm", x, weight, bias, groups=groups, eps=float(eps))
+
+
+def batchnorm_statistics(x: Tensor, axes) -> tuple[Tensor, Tensor]:
+    """(mean, biased variance) over `axes` as the batchnorm composite computes them, op for op,
+    so CSE merges the two when both are taken (nn.BatchNorm's running statistics)."""
+    mean, variance, _ = batchnorm_stats(_current().builder, _resolve(x), _axes(x, axes))
+    return _wrap(mean), _wrap(variance)
+
+
+def attention(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None, bias: Tensor | None = None, scale: float | None = None) -> Tensor:
+    """softmax(q k^T * scale + bias, masked) v; scale defaults to 1/sqrt(head size)."""
+    inputs = [q, k, v] + ([mask] if mask is not None else []) + ([broadcast_to(bias, (*q.shape[:-1], k.shape[-2]))] if bias is not None else [])
+    attrs = ({"bias": True} if bias is not None else {}) | ({"scale": float(scale)} if scale is not None else {})
+    return _emit("attention", *inputs, **attrs)
 
 
 def cross_entropy(logits: Tensor, labels: Tensor) -> Tensor:

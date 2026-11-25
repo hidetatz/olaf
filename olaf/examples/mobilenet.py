@@ -36,7 +36,7 @@ class Config:
 
 
 def relu6(x: olaf.Tensor) -> olaf.Tensor:
-    return olaf.minimum(olaf.maximum(x, 0.0), 6.0)
+    return olaf.nn.relu6(x)
 
 
 @dataclass(frozen=True)

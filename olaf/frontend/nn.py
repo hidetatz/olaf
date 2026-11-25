@@ -19,7 +19,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from olaf.frontend.trace import Tensor, max as _reduce_max, abs, broadcast_to, cast, concat, constant, conv, conv_transpose, cos, einsum, exp, log, pad, where, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
+from olaf.frontend.trace import Tensor, max as _reduce_max, abs, batchnorm, batchnorm_statistics, broadcast_to, cast, concat, constant, conv, conv_transpose, cos, einsum, exp, groupnorm, log, pad, where, iota, layernorm, maximum, mean, neg, repeat, rsqrt, sin, take, tree_flatten, tree_map, tree_unflatten
 from olaf.graph.types import DType
 
 _LETTERS = "abcdefghijklmn"
@@ -237,15 +237,19 @@ class BatchNorm(Module):
         axes = (0, *range(2, h.rank))
         shape = (1, self.channels, *(1,) * (h.rank - 2))
         if training:
+            # The normalization is the batchnorm composite rather than primitive ops: its VJP
+            # is the standard two-sum form, where differentiating a two-pass variance adds a
+            # third sum (of x - mean, which is zero) and one more backward pass per layer. The
+            # statistics for the running buffers are the composite's own (CSE merges them with
+            # its decomposition); the buffers take no gradient.
             count = int(np.prod([h.shape[a] for a in axes]))
-            mu = mean(h, axis=axes)
-            centered = h - broadcast_to(mu.reshape(*shape), h.shape)
-            var = mean(centered * centered, axis=axes)
+            mu, var = batchnorm_statistics(h, axes)
             m = self.momentum
             new = {
                 "running_mean": buffers["running_mean"] * (1.0 - m) + mu * m,
                 "running_var": buffers["running_var"] * (1.0 - m) + var * (m * count / max(count - 1, 1)),
             }
+            return _to(batchnorm(h, params["weight"], params["bias"], axes, self.eps), x.dtype), new
         else:
             mu, var, new = buffers["running_mean"], buffers["running_var"], buffers
             centered = h - broadcast_to(mu.reshape(*shape), h.shape)
@@ -270,12 +274,7 @@ class GroupNorm(Module):
 
     def __call__(self, params, x: Tensor) -> Tensor:
         h = _to(x, DType.f32) if x.dtype is DType.bf16 else x
-        n, spatial = h.shape[0], h.shape[2:]
-        grouped = h.reshape(n, self.groups, self.channels // self.groups, *spatial)
-        y = layernorm(grouped, axes=tuple(range(2, grouped.rank)), eps=self.eps).reshape(*h.shape)
-        shape = (1, self.channels, *(1,) * len(spatial))
-        weight, bias = (_to(params[k], h.dtype) for k in ("weight", "bias"))
-        return y * broadcast_to(weight.reshape(*shape), h.shape) + broadcast_to(bias.reshape(*shape), h.shape)
+        return groupnorm(h, _to(params["weight"], h.dtype), _to(params["bias"], h.dtype), self.groups, self.eps)
 
 
 def upsample_nearest(x: Tensor, factor: int = 2) -> Tensor:
@@ -430,8 +429,16 @@ def interpolate_bilinear(x: Tensor, size: tuple[int, int]) -> Tensor:
     return x
 
 
+def relu6(x: Tensor) -> Tensor:
+    # Selects, as relu; no gradient at 0 and 6 exactly, as in torch.nn.ReLU6.
+    y = relu(x)
+    return where(y < 6.0, y, 6.0)
+
+
 def relu(x: Tensor) -> Tensor:
-    return maximum(x, 0.0)
+    # A select, not maximum(x, 0): its gradient mask is read back from the output
+    # (passes.select_mask), so x is not saved next to it; ties get no gradient, as in torch.relu.
+    return where(x > 0.0, x, 0.0)
 
 
-__all__ = ["interpolate_bilinear", "upsample_nearest", "BatchNorm", "GroupNorm", "Conv", "ConvTranspose", "binary_cross_entropy_with_logits", "leaky_relu", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "rotary_tables", "rotate"]
+__all__ = ["interpolate_bilinear", "upsample_nearest", "BatchNorm", "GroupNorm", "Conv", "ConvTranspose", "binary_cross_entropy_with_logits", "leaky_relu", "Embedding", "LayerNorm", "Linear", "Module", "RMSNorm", "Repeat", "Sequential", "avg_pool", "flatten", "max_pool", "relu", "relu6", "rotary_tables", "rotate"]

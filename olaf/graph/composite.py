@@ -150,16 +150,135 @@ def _layernorm(b, inputs, attrs):
     return [y]
 
 
-def attention_scores(b: GraphBuilder, q: Value, k: Value, mask: Value | None) -> tuple[Value, Value]:
-    """Return (masked, scaled scores, the scale broadcast to the scores' shape)."""
+def batchnorm_stats(b: GraphBuilder, x: Value, axes: tuple[int, ...]) -> tuple[Value, Value, Value]:
+    """Return (mean, biased variance, element count), all of the kept shape, in one pass over x.
+
+    The two-pass form (layernorm_stats) reads the activation once for the mean and again for
+    the variance, and a batch norm runs over every activation of a CNN. Here both sums are of
+    d = x - k for a per-channel shift k (the channel's first element), so they read the same
+    input and sibling fusion makes them one pass: mean = k + E[d], var = E[d^2] - E[d]^2.
+    Without the shift, E[x^2] - E[x]^2 cancels catastrophically in f32 once the mean is large
+    against the spread (a channel at mean 100 and deviation 1 keeps about 3 digits); with k a
+    value of the channel, E[d] is a few deviations at most and the cancellation costs about
+    one digit. The max with 0 covers the rounding when every value is (nearly) equal.
+    """
+    rank = x.type.rank
+    kept = tuple(i for i in range(rank) if i not in axes)
+    reduced_shape = tuple(x.type.shape[i] for i in kept)
+    count = element_count(b, [x.type.shape[a] for a in axes], x.type.dtype)
+    denominator = b.op("broadcast", count, shape=reduced_shape, dims=()) if reduced_shape else count
+    first = b.op("slice", x, starts=(0,) * rank, stops=tuple(1 if a in axes else d for a, d in enumerate(x.type.shape)))
+    shift = b.op("reshape", first, shape=reduced_shape)
+    d = b.op("sub", x, keep_axes(b, shift, x, axes))
+    mean_d = reduced_mean(b, d, axes, denominator)
+    mean_d2 = reduced_mean(b, b.op("mul", d, d), axes, denominator)
+    variance = b.op("max", b.op("sub", mean_d2, b.op("mul", mean_d, mean_d)), b.full(reduced_shape, 0.0, x.type.dtype))
+    return b.op("add", shift, mean_d), variance, denominator
+
+
+def batchnorm_normalized(b: GraphBuilder, x: Value, axes: tuple[int, ...], eps: float) -> tuple[Value, Value, Value]:
+    """Return (x - mean, rstd, element count), as layernorm_stats but from batchnorm_stats."""
+    mean, variance, denominator = batchnorm_stats(b, x, axes)
+    rstd = b.op("rsqrt", b.op("add", variance, b.full(variance.type.shape, eps, x.type.dtype)))
+    return b.op("sub", x, keep_axes(b, mean, x, axes)), rstd, denominator
+
+
+def batchnorm_scale(b: GraphBuilder, rstd: Value, weight: Value) -> Value:
+    """weight * rstd per channel. Taken before broadcasting so the normalization costs one
+    multiply and one add per element: with a third (xhat * weight), it no longer counts as
+    cheap enough to be duplicated into the ReLU that follows (tile.fuse.CHEAP_OPS) and is
+    written out in an extra pass instead."""
+    return b.op("mul", rstd, weight)
+
+
+@_rule("batchnorm")
+def _batchnorm(b, inputs, attrs):
+    x, weight, bias = inputs
+    axes = attrs["axes"]
+    centered, rstd, _ = batchnorm_normalized(b, x, axes, attrs["eps"])
+    y = b.op("mul", centered, keep_axes(b, batchnorm_scale(b, rstd, weight), x, axes))
+    return [b.op("add", y, keep_axes(b, bias, x, axes))]
+
+
+def per_channel(b: GraphBuilder, grouped: Value, channels: int) -> Value:
+    """[N, G] -> [N, C], each group's value repeated over its C / G channels."""
+    n, g = grouped.type.shape
+    wide = b.op("broadcast", grouped, shape=(n, g, channels // g), dims=(0, 1))
+    return b.op("reshape", wide, shape=(n, channels))
+
+
+def over_group(b: GraphBuilder, channels: Value, groups: int) -> Value:
+    """[N, C] -> [N, G], each group's channels summed."""
+    n, c = channels.type.shape
+    return b.op("reduce", b.op("reshape", channels, shape=(n, groups, c // groups)), fn="sum", axes=(2,))
+
+
+def groupnorm_normalized(b: GraphBuilder, x: Value, groups: int, eps: float) -> tuple[Value, Value, Value]:
+    """Return (x - mean [N, C, *spatial], rstd [N, C], elements per group [N, G]).
+
+    One pass over x, as batchnorm_stats (whose shift it uses too: the first element, here of
+    each group). The pass sums each channel over the positions, and the channels of a group
+    are summed on the [N, C] results: reducing [N, G, C/G, H, W] over (C/G, H, W) instead
+    straddles the kept group axis in channels-last memory. The statistics are repeated to [N, C]
+    for the same reason: in terms of the groups the normalized tensor has an axis more than its
+    readers (the activation, the convolution), no view of [N, G] reads "channel // (C/G)", and
+    nothing would be fused across (an f32 copy of the activation per norm and per SiLU).
+    """
+    n, channels = x.type.shape[:2]
+    spatial = tuple(range(2, x.type.rank))
+    size = channels // groups
+    count = element_count(b, [size, *(x.type.shape[a] for a in spatial)], x.type.dtype)
+    denominator = b.op("broadcast", count, shape=(n, groups), dims=())
+    grouped = b.op("reshape", x, shape=(n, groups, size, *x.type.shape[2:]))
+    first = b.op("slice", grouped, starts=(0,) * grouped.type.rank, stops=(n, groups, *(1,) * (grouped.type.rank - 2)))
+    shift = b.op("reshape", first, shape=(n, groups))
+    d = b.op("sub", x, keep_axes(b, per_channel(b, shift, channels), x, spatial))
+    sum_d, sum_d2 = (b.op("reduce", v, fn="sum", axes=spatial) for v in (d, b.op("mul", d, d)))
+    mean_d, mean_d2 = (b.op("div", over_group(b, s, groups), denominator) for s in (sum_d, sum_d2))
+    variance = b.op("max", b.op("sub", mean_d2, b.op("mul", mean_d, mean_d)), b.full((n, groups), 0.0, x.type.dtype))
+    rstd = b.op("rsqrt", b.op("add", variance, b.full((n, groups), eps, x.type.dtype)))
+    mean = per_channel(b, b.op("add", shift, mean_d), channels)
+    return b.op("sub", x, keep_axes(b, mean, x, spatial)), per_channel(b, rstd, channels), denominator
+
+
+def groupnorm_scale(b: GraphBuilder, rstd: Value, weight: Value) -> Value:
+    """rstd * weight [N, C], taken before broadcasting for batchnorm_scale's reason."""
+    return b.op("mul", rstd, b.op("broadcast", weight, shape=rstd.type.shape, dims=(1,)))
+
+
+@_rule("groupnorm")
+def _groupnorm(b, inputs, attrs):
+    x, weight, bias = inputs
+    centered, rstd, _ = groupnorm_normalized(b, x, attrs["groups"], attrs["eps"])
+    spatial = tuple(range(2, x.type.rank))
+    y = b.op("mul", centered, keep_axes(b, groupnorm_scale(b, rstd, weight), x, spatial))
+    return [b.op("add", y, b.op("broadcast", bias, shape=x.type.shape, dims=(1,)))]
+
+
+def attention_inputs(inputs: Sequence[Value], attrs: dict) -> tuple[Value, Value, Value, Value | None, Value | None]:
+    """(q, k, v, mask or None, bias or None) of an attention op."""
+    biased = attrs.get("bias", False)
+    masked = len(inputs) - biased == 4
+    return (*inputs[:3], inputs[3] if masked else None, inputs[-1] if biased else None)
+
+
+def attention_scores(b: GraphBuilder, q: Value, k: Value, mask: Value | None, bias: Value | None = None, scale: float | None = None) -> tuple[Value, Value | None]:
+    """Return (masked, scaled, biased scores; the scale broadcast to the scores' shape, None for
+    a scale of 1, which is not multiplied: T5's unscaled scores)."""
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
     scores = b.op("contract", q, k, spec=f"{batch}xz,{batch}yz->{batch}xy")
-    scale = b.op("rsqrt", element_count(b, [q.type.shape[-1]], q.type.dtype))
-    scale = b.op("broadcast", scale, shape=scores.type.shape, dims=())
-    scores = b.op("mul", scores, scale)
+    if scale is None:
+        factor = b.op("rsqrt", element_count(b, [q.type.shape[-1]], q.type.dtype))
+    elif scale != 1.0:
+        factor = b.constant(scale, q.type.dtype)
+    factor = b.op("broadcast", factor, shape=scores.type.shape, dims=()) if scale != 1.0 else None
+    if factor is not None:
+        scores = b.op("mul", scores, factor)
+    if bias is not None:
+        scores = b.op("add", scores, bias)
     if mask is not None:
         scores = b.op("where", mask, scores, b.full_like(scores, -math.inf))
-    return scores, scale
+    return scores, factor
 
 
 def attention_probabilities(b: GraphBuilder, scores: Value, masked: bool) -> Value:
@@ -202,11 +321,10 @@ def round_probabilities(b: GraphBuilder, p: Value, source: DType | None) -> Valu
 
 @_rule("attention")
 def _attention(b, inputs, attrs):
-    q, k, v = inputs[:3]
+    q, k, v, mask, bias = attention_inputs(inputs, attrs)
     batch = "abcdefghijklmnopqrstuvw"[: q.type.rank - 2]
-    masked = len(inputs) == 4
-    scores, _ = attention_scores(b, q, k, inputs[3] if masked else None)
-    weights = round_probabilities(b, attention_probabilities(b, scores, masked), attrs.get("source_dtype"))
+    scores, _ = attention_scores(b, q, k, mask, bias, attrs.get("scale"))
+    weights = round_probabilities(b, attention_probabilities(b, scores, mask is not None), attrs.get("source_dtype"))
     return [b.op("contract", weights, v, spec=f"{batch}xy,{batch}yz->{batch}xz")]
 
 
