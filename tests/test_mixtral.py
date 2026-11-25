@@ -89,3 +89,17 @@ def test_training_gates(compute):
     assert ratio <= MULTIPLIER, (ratio, details)
     worst, ratios = one_step_median(lambda seed: case(compute, seed + 1), lambda seed: data(1, seed=seed + 7)[0])
     assert worst <= MULTIPLIER, ratios
+
+
+def test_expert_products_skip_tokens_past_each_count():
+    # Each layer's six expert products (forward, input and weight gradients of both
+    # projections) read the per-expert token count: they skip the empty rows of the buffers.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import lower_graph, to_program
+
+    c = case(olaf.bf16)
+    traced, _ = olaf.train_step(c.olaf_loss, c.params, lambda t: olaf.AdamW(t), *SPECS)
+    program = to_program(lower_graph(traced.graph), AMPERE_RTX3060)
+    experts = [launch.task for launch in program.launches if launch.task.origin[:1] == ("contract",) and launch.task.origin[1].startswith("e")]
+    ragged = [t for t in experts if any(a.dtype is olaf.i32 and not a.writes for a in t.args)]
+    assert len(experts) == len(ragged) == 6 * CONFIG.n_layer, [t.origin[1] for t in experts if t not in ragged]

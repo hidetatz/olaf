@@ -760,3 +760,33 @@ def test_widened_sum_with_per_channel_terms_is_recomputed_in_each_reader():
     want = interpret(graph, [a, b, m, s])[0]
     assert rel(got[0], want[0]) < 1e-5
     assert rel(got[1].astype(np.float32), want[1].astype(np.float32)) < 1e-2
+
+
+def _walk_ops(launch):
+    from olaf.tile.fuse import _walk
+
+    return list(_walk(launch.task.body))
+
+
+def ragged_products(x, w, dy, n):
+    """A mixture of experts' products over token buffers zero past each expert's count (as in
+    examples/mixtral.py): rows past the count, and a sum over the tokens."""
+    E, T = x.shape[:2]
+    live = olaf.iota((E, T), axis=1) < n.reshape(E, 1)
+
+    def used(v):
+        return olaf.where(live.reshape(E, T, 1), v, 0.0)
+
+    xm = used(x)
+    return olaf.einsum("ecd,efd->ecf", xm, w), olaf.einsum("ecd,ecf->efd", xm, used(dy))
+
+
+RAGGED_COUNTS = np.array([0, 256, 37, 133], np.int32)  # none, all, inside one tile, past one
+
+
+def test_products_of_ragged_operands_stop_at_the_count():
+    E, T, D, F = 4, 256, 64, 96
+    x, w, dy = (R.normal(size=s).astype(np.float32) for s in ((E, T, D), (E, F, D), (E, T, F)))
+    program = check(ragged_products, x, w, dy, RAGGED_COUNTS)
+    contracts = [launch.task for launch in program.launches if launch.task.origin[:1] == ("contract",)]
+    assert len(contracts) == 2 and all(t.args[3].dtype is DType.i32 for t in contracts)

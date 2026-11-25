@@ -422,3 +422,22 @@ def test_gathers_in_packed_row_reductions():
     actual, _ = CudaProgram(program).run([h, g, ragged, src, dst])
     for a, e in zip(actual, expected):
         assert rel(a, e) < 1e-6, rel(a, e)
+
+
+def test_products_of_ragged_operands_on_device():
+    """Matrix-instruction products whose instances past a data-dependent count run no reduction
+    steps (rows) or stop early (the reduced token axis); the result is unchanged."""
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+    from test_tile import RAGGED_COUNTS, ragged_products
+
+    E, T, D, F = 4, 256, 64, 96
+    arrays = [bf16_round(R.normal(size=s)) for s in ((E, T, D), (E, F, D), (E, T, F))] + [RAGGED_COUNTS]
+    specs = [tt(*a.shape, dtype=olaf.bf16) for a in arrays[:3]] + [tt(E, dtype=olaf.i32)]
+    graph = lower(olaf.trace(ragged_products, *specs).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert sum(launch.task.origin[:1] == ("contract",) and len(launch.task.args) > 3 for launch in program.launches) == 2
+    expected, _ = interpret(graph, arrays)
+    actual, _ = CudaProgram(program).run(arrays)
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-2, rel(a, e)

@@ -19,7 +19,7 @@ import numpy as np
 
 from olaf.backend.capability import CPU, Capability
 from olaf.graph.dim import Dim, product
-from olaf.graph.ir import Graph, Op, Value
+from olaf.graph.ir import ConstantData, Graph, Op, Value
 from olaf.graph.ops import OPS, parse_contract
 from olaf.graph.types import DType, TensorType
 from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
@@ -238,6 +238,22 @@ def _inverse(perm) -> tuple[int, ...]:
     return tuple(perm.index(i) for i in range(len(perm)))
 
 
+def _zero_constant(value: ConstantData) -> bool:
+    bits = value.array
+    return bool(np.all((bits & 0x7FFF) == 0)) if value.dtype is DType.bf16 else bool(np.all(bits == 0))
+
+
+@dataclass(frozen=True)
+class _Ragged:
+    """An operand known to be zero from a data-dependent count on along one axis:
+    where(iota(axis) < broadcast(count), x, 0). `axis` is the counted axis of the operand,
+    `count_axes` the operand axis each axis of `count` lies along."""
+
+    count: Value
+    axis: int
+    count_axes: tuple[int, ...]
+
+
 def to_tile(graph: Graph, capability: Capability = CPU, schedules=None) -> Program:
     """Default tile shapes come from the capability: matrix instructions change the dot tiles.
 
@@ -256,6 +272,7 @@ class _Converter:
         self.launches: list[Launch] = []
         self.refs: dict[Value, Ref] = {}
         self.states: dict[str, Ref] = {}
+        self._scattered = False  # lowering a convolution phase (_conv_phases)
         self._grids: dict[tuple, Ref] = {}
         self._plain: dict[tuple, Ref] = {}  # one copy per padded view (a pooling's windows share it)
 
@@ -645,11 +662,48 @@ class _Converter:
         self.launch(f"reduce_{fn}", grid, [(ref, False), (out, True)], b.finish(pids), warps, origin=("reduce", fn, tuple(axes)))
         return out
 
+    def _ragged(self, value: Value) -> _Ragged | None:
+        """The count mask a value is written through, if any (see _Ragged). A mixture of
+        experts' token buffers hold each expert's tokens first and zeros after them, and say
+        so with this mask (examples/mixtral.py): a product reading them skips the zero rows."""
+        op = self.producers.get(value)
+        if op is None or op.kind != "where":
+            return None
+        cond, _, zero = op.inputs
+        z = self.producers.get(zero)
+        while z is not None and z.kind == "broadcast":
+            z = self.producers.get(z.inputs[0])
+        if z is None or z.kind != "constant" or not _zero_constant(z.attr("value")):
+            return None
+        # The comparison's axis j lies along the where's axis dims[j].
+        c = self.producers.get(cond)
+        dims = tuple(range(value.type.rank))
+        if c is not None and c.kind == "broadcast":
+            dims = c.attr("dims")
+            c = self.producers.get(c.inputs[0])
+        if c is None or c.kind != "cmp" or c.attr("fn") != "lt":
+            return None
+        iota, bound = (self.producers.get(v) for v in c.inputs)
+        if iota is None or iota.kind != "iota" or bound is None:
+            return None
+        axis = iota.attr("axis")
+        count, count_dims = bound.outputs[0], tuple(range(bound.outputs[0].type.rank))
+        if bound.kind == "broadcast":
+            count, count_dims = bound.inputs[0], bound.attr("dims")
+        if axis in count_dims or count.type.dtype is not INDEX or value.type.shape[dims[axis]] != c.inputs[0].type.shape[axis]:
+            return None
+        # The count must index the operand at whole coordinates: each of its axes lies along
+        # an operand axis of the same length (not broadcast from 1 into it).
+        if any(count.type.shape[i] != c.inputs[0].type.shape[d] for i, d in enumerate(count_dims)):
+            return None
+        return _Ragged(count, dims[axis], tuple(dims[d] for d in count_dims))
+
     def _op_contract(self, op: Op, inputs: list[Ref]) -> Ref:
         terms, out_labels = parse_contract(op.attr("spec"))
         if len(terms) != 2:
             raise NotImplementedError(f"tile conversion of a {len(terms)}-operand contract is not implemented")
-        merged = self._merged_contract(op, inputs)
+        ragged_inputs = any(self._ragged(v) is not None for v in op.inputs)
+        merged = None if ragged_inputs or self._scattered else self._merged_contract(op, inputs)
         if merged is not None:
             return merged
         (ta, tb), (ra, rb) = terms, inputs
@@ -695,7 +749,8 @@ class _Converter:
             chosen = self.schedules.get(key)
             if chosen is not None:
                 bm, bn, bk, stages, warps = chosen.bm, chosen.bn, chosen.bk, chosen.stages, chosen.warps
-            split = None if getattr(self, "_partial", False) else self._contract_split(op, (ta, tb), (ra, rb), values, out_labels, k_labels, size, bm, bn)
+            # Not with a ragged operand: its count would have to follow the split labels.
+            split = None if getattr(self, "_partial", False) or ragged_inputs else self._contract_split(op, (ta, tb), (ra, rb), values, out_labels, k_labels, size, bm, bn)
             if split is not None:
                 return split
         extent = {c: 1 for c in size}
@@ -740,6 +795,22 @@ class _Converter:
             if len(run) > 1 and math.prod(run.values()) % least == 0:
                 k_tiled = list(run)
                 extent.update(run)
+        # Ragged operands (_ragged): the count is read at the instance's coordinates, so it may
+        # only vary along output labels one instance covers one of. Rows or columns past the
+        # count make the product zero there: those instances run no reduction steps (the
+        # product of a token buffer past its expert's tokens). A reduced label past the count
+        # adds zeros: the loop over it stops at the count (a weight gradient over the tokens).
+        ragged = None
+        for term, v in zip((ta, tb), values):
+            r = self._ragged(v)
+            if r is None or (ragged is not None and r.count is not ragged[2]):
+                continue
+            label, count_labels = term[r.axis], [term[a] for a in r.count_axes]
+            if any(c not in out_labels or extent[c] != 1 for c in count_labels) or label in count_labels or not k_labels:
+                continue
+            if ragged is None:
+                ragged = (set(), count_labels, r.count)
+            ragged[0].add(label)
         en = extent[n_inner] if n_inner else 1
         ek = math.prod(extent[c] for c in k_tiled)
         em = math.prod(extent[c] for c in m_tiled)
@@ -751,6 +822,19 @@ class _Converter:
         b = TileBuilder()
         pids = [TValue(TileType((), INDEX)) for _ in out_labels]
         out_starts = {c: p if extent[c] == 1 else b.op("mul", p, b.index(extent[c])) for c, p in zip(out_labels, pids)}
+        bounds: dict[str, TValue] = {}
+        live = None
+        if ragged is not None:
+            labels, count_labels, count_value = ragged
+            rank = len(count_labels)
+            count = b.op("load", *(out_starts[c] for c in count_labels), arg=3, shape=(1,) * rank, dtype=INDEX, other=0)
+            count = b.op("reshape", count, shape=()) if rank else count
+            for label in labels:
+                if label in k_labels:
+                    bounds[label] = b.op("min", count, b.dim(size[label]))
+                else:
+                    held = b.op("cmp", out_starts[label], count, fn="lt")
+                    live = held if live is None else b.op("where", live, held, live)
 
         def operand(builder: TileBuilder, arg: int, term: str, ref: Ref, starts: dict[str, TValue], rows: list[str], cols: list[str]) -> TValue:
             tile = builder.op("load", *(starts[c] for c in term), arg=arg, shape=tuple(extent[c] for c in term), dtype=ref.dtype, other=0)
@@ -775,7 +859,10 @@ class _Converter:
                 return [loop(inner, depth + 1, {**starts, label: iv}, carries[0])]
 
             pipelined = stages if label == k_inner else 1
-            return builder.for_range(builder.index(0), builder.dim(size[label]), extent[label], [acc], body, stages=pipelined)[0]
+            hi = bounds.get(label) or builder.dim(size[label])
+            if depth == 0 and live is not None:
+                hi = builder.op("where", live, hi, builder.index(0))
+            return builder.for_range(builder.index(0), hi, extent[label], [acc], body, stages=pipelined)[0]
 
         def flat_loop(builder: TileBuilder, starts: dict[str, TValue], acc: TValue) -> TValue:
             """All reduced labels in one loop, its step split into each label's position by
@@ -801,7 +888,7 @@ class _Converter:
         # Only when the innermost loop is too short to pipeline: with long inner loops (a
         # weight gradient over batch x sequence, 32 steps of the sequence) nesting measured
         # faster (Llama's step: 213 ms nested, 239 flattened).
-        flatten = len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels) and (len(k_tiled) > 1 or -(-size[k_inner] // ek) < 8)
+        flatten = ragged is None and len(k_labels) > 1 and k_inner is not None and all(isinstance(size[c], int) for c in k_labels) and (len(k_tiled) > 1 or -(-size[k_inner] // ek) < 8)
         acc0 = b.full((em, en), 0, acc_dtype)
         acc = flat_loop(b, dict(out_starts), acc0) if flatten else loop(b, 0, dict(out_starts), acc0)
         result = acc if acc_dtype is out_type.dtype else b.op("cast", acc, dtype=out_type.dtype)
@@ -819,7 +906,8 @@ class _Converter:
         b.emit("store", (result, *(out_starts[c] for c in out_labels)), {"arg": 2})
         # The schedule key is recorded so the search can find this dot's launches in a whole program.
         origin = ("contract", op.attr("spec")) + ((key,) if key else ())
-        self.launch("contract", grid, [(ra, False), (rb, False), (out, True)], b.finish(pids), warps, origin=origin)
+        refs = [(ra, False), (rb, False), (out, True)] + ([(self.refs[ragged[2]], False)] if ragged is not None else [])
+        self.launch("contract", grid, refs, b.finish(pids), warps, origin=origin)
         return out
 
     def _merged_contract(self, op: Op, inputs: list[Ref]) -> Ref | None:

@@ -5,7 +5,8 @@ Routing is data dependent and the step graph has static shapes, so tokens move w
 scatter_add: each expert gets a buffer of `capacity` token slots, a token's slot is the number
 of earlier tokens routed to the same expert (a prefix count), and the experts run as one
 batched product over their buffers. With capacity = number of tokens no token is ever dropped,
-which is what Hugging Face computes; it costs as much as running every expert on every token.
+which is what Hugging Face computes; the rows past each expert's count are masked so that the
+products skip them (SparseMoE).
 A smaller capacity (Switch Transformer's capacity factor) drops the overflow and changes the
 result, so it is not the default.
 """
@@ -97,15 +98,26 @@ class SparseMoE(nn.Module):
         before = olaf.einsum("ts,se->te", earlier, routed)  # exact: counts below 2^24
         slots = [i * T + olaf.cast(olaf.sum(m * before, axis=1), DType.i32) for i, m in zip(indices, chosen)]
 
+        # Tokens per expert. Every buffer row from this count on is zero: the masks below say so
+        # in the graph (their values are unchanged), and a product reading a masked operand
+        # skips those rows (tile.from_graph, _ragged), the forward and the input gradients by
+        # row tiles, the weight gradients by bounding the sum over slots. Without them the
+        # experts' products would cost as much as every expert on every token.
+        counts = olaf.cast(olaf.sum(routed, axis=0), DType.i32)  # exact: counts below 2^24
+
+        def used(x):
+            live = olaf.iota((E, T), axis=1) < counts.reshape(E, 1)
+            return olaf.where(live.reshape(E, T, 1), x, 0.0)
+
         dtype = self.compute or h.dtype
         buffers = olaf.zeros((E * T, D), dtype)
         for slot in slots:
             buffers = olaf.scatter_add(buffers, slot, _to(flat, dtype))
-        x = buffers.reshape(E, T, D)
+        x = used(buffers.reshape(E, T, D))
         w = p["experts"]
-        gate_up = olaf.einsum("ecd,efd->ecf", x, _to(w["gate_up_proj"], dtype))
-        act = olaf.silu(gate_up[..., :I]) * gate_up[..., I:]
-        y = olaf.einsum("eci,edi->ecd", act, _to(w["down_proj"], dtype)).reshape(E * T, D)
+        gate_up = used(olaf.einsum("ecd,efd->ecf", x, _to(w["gate_up_proj"], dtype)))
+        act = used(olaf.silu(gate_up[..., :I]) * gate_up[..., I:])
+        y = used(olaf.einsum("eci,edi->ecd", act, _to(w["down_proj"], dtype))).reshape(E * T, D)
         out = None
         for slot, weight in zip(slots, weights):
             # Hugging Face: expert output (bf16 under autocast) times the f32 routing weight.
