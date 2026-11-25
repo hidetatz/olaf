@@ -288,6 +288,33 @@ def test_online_softmax_fusion_on_device(backward):
         assert rel(a, e) < 1e-2, rel(a, e)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_online_softmax_fusion_with_a_bias_on_device(causal):
+    from test_tile import _biased_attention_case
+
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    graph, args = _biased_attention_case(causal)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert "attention_dkv" in {launch.task.name for launch in program.launches}
+    for a, e in zip(CudaProgram(program).run(args)[0], interpret(graph, args)[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
+@pytest.mark.parametrize("s", [65, 150])
+def test_attention_gradients_stored_merged_on_device(s):
+    from test_tile import _projected_attention_case
+
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.backend.cuda.runtime import CudaProgram
+
+    graph, args = _projected_attention_case(s)
+    program = to_program(graph, AMPERE_RTX3060)
+    for a, e in zip(CudaProgram(program).run(args)[0], interpret(graph, args)[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
 def test_short_row_reduction_result_is_used_by_every_thread():
     # Rows of 5 reduce with a butterfly in groups of 8 lanes; the single result is then
     # broadcast back over the row, so every thread must hold it, not only thread 0.

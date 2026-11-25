@@ -389,6 +389,58 @@ def _pure_copy(task: Task) -> bool:
     return len(stores) == 1 and len(loads) == 1 and stores[0].inputs[0] in loads and loads[stores[0].inputs[0]].attr("arg") == 0
 
 
+def copy_scattered_operands(program: Program) -> Program:
+    """Give attention tasks a contiguous copy of a small operand whose rows are scattered.
+
+    T5's position bias is gathered as [S, S, H] and read as [H, S, S]: a row's elements lie H
+    apart, so each 32-byte sector read holds one wanted value, in every layer, for every batch
+    element. The bias is 2 MB, the scores it is added to 16 times that: one copy of it, made once,
+    halves T5's attention. Only where the copy is read back at least 4 times as many elements as
+    it holds, and only a temp with one writer (a parameter is updated in place).
+    """
+    buffers = {b.name: b for b in program.buffers}
+    writers: dict[str, list[int]] = {}
+    for i, launch in enumerate(program.launches):
+        for name, arg in zip(launch.buffers, launch.task.args):
+            if arg.writes:
+                writers.setdefault(name, []).append(i)
+    copies: dict[tuple[str, View], str] = {}
+    after: dict[int, list[Launch]] = {}
+    added = []
+    launches = list(program.launches)
+    for i, launch in enumerate(launches):
+        if not launch.task.origin or not launch.task.origin[0].startswith("attention") or launch.offsets:
+            continue
+        names, args = list(launch.buffers), list(launch.task.args)
+        for k, (name, arg) in enumerate(zip(names, args)):
+            view, w = arg.view, writers.get(name, [])
+            if arg.writes or view.pad is not None or len(w) != 1 or w[0] >= i or buffers[name].kind is not BufferKind.temp or buffers[name].strides is not None:
+                continue
+            axes = [a for a, st in enumerate(view.strides) if st != 0]
+            if len(axes) < 2 or not all(isinstance(d, int) for d in (*view.shape, *view.strides, view.offset)) or view.strides[axes[-1]] == 1:
+                continue
+            shape = tuple(view.shape[a] for a in axes)
+            if math.prod(view.shape) < 4 * math.prod(shape):
+                continue
+            source = View(shape, tuple(view.strides[a] for a in axes), view.offset)
+            key = (name, source)
+            if key not in copies:
+                copies[key] = f"{name}_rows{len(copies)}"
+                added.append(Buffer(copies[key], TensorType(shape, arg.dtype), BufferKind.temp))
+                into = View(shape, contiguous_strides(shape))
+                after.setdefault(w[0], []).append(Launch(_copy_task(source, arg.dtype, into, arg.dtype), (name, copies[key])))
+            strides = [0] * view.rank
+            for a, st in zip(axes, contiguous_strides(shape)):
+                strides[a] = st
+            names[k], args[k] = copies[key], replace(arg, view=View(view.shape, tuple(strides)))
+        if tuple(names) != launch.buffers:
+            launches[i] = replace(launch, task=replace(launch.task, args=tuple(args)), buffers=tuple(names))
+    if not added:
+        return program
+    out = [l for i, launch in enumerate(launches) for l in (launch, *after.get(i, ()))]
+    return replace(program, buffers=(*program.buffers, *added), launches=tuple(out))
+
+
 def eliminate_concats(program: Program) -> Program:
     """Let the producers of a concat's inputs store into their slices of its output.
 

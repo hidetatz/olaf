@@ -8,9 +8,11 @@ dS have C1's output axes, Q and K C1's operand axes, V C2's V axes and dO C3's d
 
 from __future__ import annotations
 
-from olaf.graph.types import DType
+import math
+
+from olaf.graph.types import DType, TensorType
 from olaf.tile.builder import TileBuilder
-from olaf.tile.ir import Launch, full_view
+from olaf.tile.ir import Buffer, BufferKind, Launch, View, contiguous_strides, full_view
 
 VALUE = "@value"
 
@@ -104,6 +106,7 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     m_name, l_name = p.written(f.rmax), p.written(f.rsum)
     d_name = p.written(back.rd)
     d_buffer = p.buffers[d_name]
+    ds_name = p.written(back.t9)
 
     def stat(t, g, name, starts, other=0.0):
         buffer = p.buffers[name]
@@ -194,7 +197,17 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     v_t = _operand(t, c3, 1 - back.do_operand_c3, _local(m3, {**fixed, VALUE: b.index(0)}), _local(m3, extents(g)), _letter(m3, VALUE), _letter(m3, col))
 
     dq_arg = back.dq.launch.task.args[back.dq.out_arg]
-    dq_atomic = dq_arg.dtype is DType.f32
+    # One column tile holds every key: each row tile's dQ is whole, and is stored once.
+    dq_whole = isinstance(g.shape[col], int) and g.shape[col] <= g.cols and g.causal is None
+    # Two: each column tile stores its part of dQ, and a task adds the parts. Atomics read and
+    # write what plain stores only write, need zeros stored first, and leave dQ in f32 for another
+    # task to round; with more tiles the parts outgrow that (memory, and reading them back).
+    sizes = [g.shape[x] for x in batch + [row]] + [head]
+    dq_parts = not dq_whole and g.causal is None and dq_arg.dtype is DType.f32 and all(isinstance(d, int) for d in (g.shape[col], *sizes)) and g.shape[col] <= 2 * g.cols
+    parts_name = f"{back.dq.output}_parts"
+    if dq_parts:
+        p.buffers[parts_name] = Buffer(parts_name, TensorType((2, *sizes), DType.f32), BufferKind.temp)
+    dq_atomic = not dq_whole and not dq_parts and dq_arg.dtype is DType.f32
 
     def kv_body(inner: TileBuilder, r0, carries):
         t.b = inner
@@ -202,6 +215,17 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
         prob, ds, d_o, q2d = inner_step(t, g, {**starts, row: r0}, k_tile, v_t)
         dv = inner.op("dot", inner.op("permute", prob, perm=(1, 0)), d_o, dv)
         dk = inner.op("dot", inner.op("permute", ds, perm=(1, 0)), q2d, dk)
+        if back.keep_ds:
+            ds_buffer = p.buffers[ds_name]
+            _store(t, ds_name, full_view(ds_buffer.type.shape), ds_buffer.type.dtype, f.c1.out, ds, row, col, {**starts, row: r0}, extents(g))
+        if dq_whole:
+            part = inner.op("dot", ds, k_rows, inner.full((g.rows, g.head), 0.0, DType.f32))
+            store(t, g, back.dq, maps["dq"], part, row, s, {**starts, row: r0, s: inner.index(0)})
+        if dq_parts:
+            part = inner.op("dot", ds, k_rows, inner.full((g.rows, g.head), 0.0, DType.f32))
+            shaped = inner.op("reshape", part, shape=(1, *[1] * len(batch), g.rows, g.head))
+            slot = t.arg(parts_name, full_view((2, *sizes)), DType.f32, True)
+            inner.emit("store", (shaped, pids[-1], *(starts[x] for x in batch), r0, inner.index(0)), {"arg": slot})
         if dq_atomic:
             # This tile's share of dQ = dS K, added atomically: every column tile contributes to
             # the same rows (FlashAttention-2), which saves recomputing S, P, dP and dS in a
@@ -227,7 +251,9 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
 
     # Streamed q and dO: measured 2.34 -> 2.11 ms per layer for GPT-2 small on the RTX 3060.
     # (The forward is not streamed: with its larger shared memory it ran 0.61 -> 0.96 ms.)
-    dk, dv = b.for_range(g.row_begin(b, starts[col]), b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body, stream=True)
+    # A stored dS is written everywhere: the row tiles a causal mask skips hold zeros there.
+    first_row = b.index(0) if back.keep_ds else g.row_begin(b, starts[col])
+    dk, dv = b.for_range(first_row, b.dim(g.shape[row]), g.rows, [zeros_k, zeros_v], kv_body, stream=True)
     t.b = b
     store(t, g, back.dk, maps["dk"], dk, col, s, starts)
     store(t, g, back.dv, maps["dv"], dv, col, VALUE, starts)
@@ -236,6 +262,21 @@ def backward_tasks(p, f, back, g) -> list[Launch]:
     # stacked along rows (its dots take operands from memory or staged accumulators).
     kv_task = t.finish("attention_dkv", grid, pids, ("attention_dkv",), warps=8)
 
+    if dq_whole:
+        return [d_task, kv_task]
+    if dq_parts:
+        t = _Task()
+        b = t.b
+        gs = _Builder(p, f, rows=BLOCK, cols=BLOCK)
+        pids, starts, grid = gs.pids(t, row)
+        starts[s] = b.index(0)
+        at = [starts[x] for x in batch + [row, s]]
+        tile = (*[1] * len(batch), gs.rows, gs.head)
+        half = math.prod(sizes)
+        parts = [t.load(parts_name, View(tuple(sizes), contiguous_strides(sizes), k * half), DType.f32, at, tile) for k in range(2)]
+        total = b.op("reshape", b.op("add", *parts), shape=(gs.rows, gs.head))
+        store(t, gs, back.dq, maps["dq"], total, row, s, starts)
+        return [d_task, kv_task, t.finish("attention_dq_sum", grid, pids, ("attention_dq_sum",))]
     if dq_atomic:
         # dQ starts at zero; the dK/dV task adds into it.
         t = _Task()

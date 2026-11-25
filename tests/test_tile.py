@@ -403,7 +403,40 @@ def test_online_softmax_fusion(backward):
         assert rel(a, e) < 1e-2, rel(a, e)
 
 
-@pytest.mark.parametrize("sq,sk", [(100, 100), (64, 150)])
+def _biased_attention_case(causal: bool, s: int = 100, d: int = 64):
+    """T5's attention: unscaled scores plus a position bias [1, H, S, S] broadcast over the batch,
+    with its gradient (a sum of dS over the batch)."""
+    from olaf.graph.ir import bf16_round
+
+    rng = np.random.default_rng(5)
+    q, k, v = (bf16_round(rng.normal(size=(2, 2, s, d)) * 0.2) for _ in range(3))
+    bias = rng.normal(size=(1, 2, s, s)).astype(np.float32)
+
+    def loss(q, k, v, bias):
+        mask = olaf.broadcast_to(olaf.iota((s, s), axis=0) >= olaf.iota((s, s), axis=1), (2, 2, s, s)) if causal else None
+        return olaf.sum(olaf.cast(olaf.attention(q, k, v, mask, bias, scale=1.0), F32) * olaf.cast(v, F32))
+
+    fn = lambda *a: olaf.value_and_grad(loss, (0, 1, 2, 3))(*a)  # noqa: E731
+    graph = lower(olaf.trace(fn, *[tt(2, 2, s, d, dtype=olaf.bf16)] * 3, tt(1, 2, s, s)).graph)
+    return graph, [q, k, v, bias]
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_online_softmax_fusion_with_a_bias(causal):
+    # The bias is read per tile like a mask; its gradient reads the dS that the fused dK/dV
+    # task stores (every tile of it, the ones a causal mask skips included).
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    graph, args = _biased_attention_case(causal)
+    program = to_program(graph, AMPERE_RTX3060)
+    names = {launch.task.name for launch in program.launches}
+    assert "attention" in names and "attention_dkv" in names
+    for a, e in zip(olaf.tree_flatten(run_program(program, args)[0])[0], olaf.tree_flatten(interpret(graph, args)[0])[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
+@pytest.mark.parametrize("sq,sk", [(100, 100), (64, 150), (64, 300)])
 def test_online_softmax_fusion_without_a_mask(sq, sk):
     # Without a mask the numerator exp(S - max) is cheap, and fusion copies it into both of
     # its readers (the row sum and the normalization); the pass splits it out again to match.
@@ -425,7 +458,42 @@ def test_online_softmax_fusion_without_a_mask(sq, sk):
     after = fuse_online_softmax(before)
     names = {launch.task.name for launch in after.launches}
     assert "attention" in names and "attention_dkv" in names
+    # A single key tile stores dQ, two store a part each, more add into it atomically.
+    assert ("attention_dq_zero" in names) == (sk > 256) and ("attention_dq_sum" in names) == (128 < sk <= 256)
     for a, e in zip(olaf.tree_flatten(run_program(after, [q, k, v])[0])[0], olaf.tree_flatten(interpret(graph, [q, k, v])[0])[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
+
+
+def _projected_attention_case(s: int, heads: int = 2, d: int = 64):
+    """Heads split from, and gradients merged back into, projections [B, S, H * D]."""
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(2, s, heads * d)).astype(np.float32)
+    w = [(rng.normal(size=(heads * d, heads * d)) / 8).astype(np.float32) for _ in range(3)]
+
+    def loss(wq, wk, wv, x):
+        def split(m):
+            h = olaf.einsum("bsi,io->bso", olaf.cast(x, olaf.bf16), olaf.cast(m, olaf.bf16))
+            return olaf.transpose(h.reshape(2, s, heads, d), 1, 2)
+
+        return olaf.sum(olaf.cast(olaf.attention(split(wq), split(wk), split(wv)), F32) ** 2.0)
+
+    graph = lower(olaf.trace(lambda *a: olaf.value_and_grad(loss, (0, 1, 2))(*a), *[tt(heads * d, heads * d)] * 3, tt(2, s, heads * d)).graph)
+    return graph, [*w, x]
+
+
+@pytest.mark.parametrize("s", [65, 150])
+def test_attention_gradients_are_stored_merged(s):
+    # dK and dV (and dQ, stored by the loop over row tiles when one key tile holds every key)
+    # are cast into the heads-merged layout the weight gradients read, without a pass each.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    graph, args = _projected_attention_case(s)
+    program = to_program(graph, AMPERE_RTX3060)
+    (dkv,) = [l for l in program.launches if l.task.name == "attention_dkv"]
+    merged = [a.dtype for a in dkv.task.args if a.writes]
+    assert merged.count(olaf.bf16) == (3 if s <= 128 else 2)
+    for a, e in zip(olaf.tree_flatten(run_program(program, args)[0])[0], olaf.tree_flatten(interpret(graph, args)[0])[0]):
         assert rel(a, e) < 1e-2, rel(a, e)
 
 
@@ -471,6 +539,34 @@ def test_weight_gradient_splits_into_the_parts_needed():
     program = fuse(to_tile(graph, AMPERE_RTX3060))
     partial = next(a for l in program.launches if l.task.origin[0] == "contract" for a in l.task.args if a.writes)
     assert partial.view.shape == (2, 384, 1536)
+
+
+@pytest.mark.parametrize("s", [40, 150, 300])
+def test_qkv_gradient_is_stored_into_its_slices(s):
+    # dK and dV go straight to the rows the qkv products read; dQ, added up with atomics (three
+    # key tiles), is copied there, or stored there by the sum of two parts or the loop over row tiles. No concat, no
+    # permuting copy of it.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    heads, d = 2, 64
+    rng = np.random.default_rng(7)
+    x, w = rng.normal(size=(2, s, heads * d)).astype(np.float32), (rng.normal(size=(heads * d, 3 * heads * d)) / 8).astype(np.float32)
+
+    def loss(w, x):
+        qkv = olaf.einsum("bsi,io->bso", olaf.cast(x, olaf.bf16), olaf.cast(w, olaf.bf16)).reshape(2, s, 3, heads, d)
+        q, k, v = (olaf.transpose(qkv[:, :, i, :, :], 1, 2) for i in range(3))
+        return olaf.sum(olaf.cast(olaf.attention(q, k, v), F32) ** 2.0)
+
+    graph = lower(olaf.trace(lambda w, x: olaf.value_and_grad(loss)(w, x), tt(*w.shape), tt(*x.shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    names = [launch.task.name for launch in program.launches]
+    assert ("attention_dq_zero" in names) == (s > 256) and "concat" not in names and names.count("copy") == (1 if s > 256 else 0)
+    for launch in program.launches:
+        for op in _walk_ops(launch):
+            assert op.kind != "store" or op.inputs[0].type.dtype is launch.task.args[op.attr("arg")].dtype
+    for a, e in zip(olaf.tree_flatten(run_program(program, [w, x])[0])[0], olaf.tree_flatten(interpret(graph, [w, x])[0])[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
 
 
 def test_online_softmax_skips_masked_tiles_of_a_causal_mask():
@@ -674,6 +770,31 @@ def test_sibling_fusion_sinks_a_task_below_what_the_other_waits_for():
     _, want = interpret(graph, [a, b], state)
     for name in state:
         assert rel(got[name], want[name]) < 1e-5
+
+
+def test_attention_bias_is_copied_into_rows():
+    # A bias gathered as [S, S, H] and read as [H, S, S]: each attention task would read one wanted
+    # value per 8. All of them read one copy.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import to_program
+
+    s, heads = 48, 8
+    rng = np.random.default_rng(8)
+    q, k, v = (bf16_round(rng.normal(size=(4, heads, s, 64)) * 0.2) for _ in range(3))
+    table = rng.normal(size=(32, heads)).astype(np.float32)
+    ids = rng.integers(0, 32, (s, s)).astype(np.int32)
+
+    def fn(q, k, v, table, ids):
+        bias = olaf.reshape(olaf.transpose(olaf.transpose(olaf.take(table, ids), 1, 2), 0, 1), (1, heads, s, s))
+        return olaf.value_and_grad(lambda q, k, v: olaf.sum(olaf.cast(olaf.attention(q, k, v, None, bias, scale=1.0), F32) * olaf.cast(v, F32)), (0, 1, 2))(q, k, v)
+
+    graph = lower(olaf.trace(fn, *[tt(4, heads, s, 64, dtype=olaf.bf16)] * 3, tt(32, heads), tt(s, s, dtype=olaf.i32)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    reads = [a.view for l in program.launches if l.task.name in ("attention", "attention_dkv") for a in l.task.args if not a.writes and a.view.shape == (4, heads, s, s) and any(a.view.strides)]
+    assert reads and all(v.strides == (0, s * s, s, 1) for v in reads)
+    for a, e in zip(olaf.tree_flatten(run_program(program, [q, k, v, table, ids])[0])[0], olaf.tree_flatten(interpret(graph, [q, k, v, table, ids])[0])[0]):
+        assert rel(a, e) < 1e-2, rel(a, e)
 
 
 def test_scan_gradient_stacks_are_written_in_place():

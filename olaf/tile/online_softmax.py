@@ -299,13 +299,14 @@ def _match_forward_with(p: _Program, c2: _Contract, v_operand: int) -> _Forward 
             return None
         launch = p.launch(t1)
         candidates = [(n, a) for n, a in zip(launch.buffers, launch.task.args) if not a.writes and any(s != 0 for s in a.view.strides)]
-        # S, a contract's output; besides it only operands broadcast along the rows or the
-        # columns (a padding mask from the data, [B, 1, 1, S] kept keys), which the fused tasks
-        # read at each tile like the replayed task does. A computed mask (causal, from iota)
-        # reads nothing.
+        # S, a contract's output; besides it only operands broadcast along some axis (a
+        # padding mask from the data, [B, 1, 1, S] kept keys; T5's position bias, [1, H, S, S]),
+        # which the fused tasks read at each tile like the replayed task does. One of the
+        # scores' size would cost the reads the fusion saves. A computed mask (causal, from
+        # iota) reads nothing.
         scores = [n for n, a in candidates if p.writer(n) is not None and _contract(p.writer(n), p.launch(p.writer(n))) is not None]
         others = [a for n, a in candidates if n not in scores]
-        if len(scores) != 1 or any(a.view.strides[-1] != 0 and a.view.strides[-2] != 0 for a in others):
+        if len(scores) != 1 or any(all(st != 0 for st in a.view.strides) for a in others):
             return None
         if _identity_read(p, t1, scores[0]) is None or p.only_readers(scores[0]) != {t1}:
             return None
@@ -374,6 +375,9 @@ class _Backward:
     ds_operand_dq: int
     ds_operand_dk: int
     p_operand_dv: int
+    # dS has readers besides dQ and dK (the bias gradient: T5's position bias): the dK/dV task
+    # also stores it.
+    keep_ds: bool = False
 
 
 def _is_product(launch: Launch, args: list[int]) -> bool:
@@ -436,7 +440,8 @@ def _match_backward(p: _Program, f: _Forward) -> _Backward | None:
     d_name = p.written(rd)
     if p.writer(d_name) != rd or p.only_readers(d_name) != {t9}:
         return None
-    # dS = T9(P, dP, D), read by exactly the dQ and dK contracts.
+    # dS = T9(P, dP, D), read by the dQ and dK contracts and possibly by pointwise or reduce
+    # tasks (a bias gradient), which then read the dS the fused backward stores.
     p_arg = _identity_read(p, t9, p_name)
     dp_arg = _identity_read(p, t9, dp_name)
     d_args = _row_reads(p, t9, d_name, rank)
@@ -448,10 +453,11 @@ def _match_backward(p: _Program, f: _Forward) -> _Backward | None:
             return None
     ds_name = p.written(t9)
     ds_readers = p.only_readers(ds_name)
-    if len(ds_readers) != 2:
+    ds_contracts = [c for c in (_contract(i, p.launch(i)) for i in ds_readers) if c is not None]
+    keep_ds = len(ds_readers) > 2
+    if len(ds_contracts) != 2:
         return None
-    ds_contracts = [_contract(i, p.launch(i)) for i in ds_readers]
-    if None in ds_contracts:
+    if keep_ds and not _stores_whole(t9_launch, ds_name, p.buffers[ds_name]):
         return None
     a_name, a_view = f.c1.buffer(0), f.c1.view(0)
     b_name, b_view = f.c1.buffer(1), f.c1.view(1)
@@ -472,7 +478,12 @@ def _match_backward(p: _Program, f: _Forward) -> _Backward | None:
     p_dv = [o for o in (0, 1) if dv.buffer(o) == p_name]
     if len(p_dv) != 1 or dv.buffer(1 - p_dv[0]) != do_name or dv.view(1 - p_dv[0]) != do_view:
         return None
-    return _Backward(c3, rd, t9, dq, dk, dv, do_operand, p_arg, dp_arg, d_args, ds_dq, ds_dk, p_dv[0])
+    return _Backward(c3, rd, t9, dq, dk, dv, do_operand, p_arg, dp_arg, d_args, ds_dq, ds_dk, p_dv[0], keep_ds)
+
+
+def _stores_whole(launch: Launch, name: str, buffer: Buffer) -> bool:
+    """The task writes `name` through its full logical view (C1's output axes in order)."""
+    return any(n == name and a.writes and a.view == full_view(buffer.type.shape) for n, a in zip(launch.buffers, launch.task.args))
 
 
 # -- building the fused tasks ------------------------------------------------------------------
@@ -1144,8 +1155,8 @@ def _fuse_online_softmax(program: Program) -> Program:
             continue
         backward_tasks = {back.c3.index, back.rd, back.t9, back.dq.index, back.dk.index, back.dv.index}
         last = max(backward_tasks)
-        outputs = {back.dq.output, back.dk.output, back.dv.output}
-        if any(r < last for name in outputs for r in p.only_readers(name)):
+        outputs = {back.dq.output, back.dk.output, back.dv.output} | ({p.written(back.t9)} if back.keep_ds else set())
+        if any(r < last and r not in backward_tasks for name in outputs for r in p.only_readers(name)):
             continue
         from olaf.tile.online_softmax_backward import backward_tasks as build_backward
 
@@ -1161,5 +1172,6 @@ def _fuse_online_softmax(program: Program) -> Program:
         elif i not in removed:
             launches.append(launch)
     used = {n for launch in launches for n in launch.buffers} | set(program.inputs) | set(program.outputs)
-    buffers = tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp)
+    # p's: the backward may have added a buffer (parts of dQ).
+    buffers = tuple(b for b in p.buffers.values() if b.name in used or b.kind is not BufferKind.temp)
     return replace(program, buffers=buffers, launches=tuple(launches))

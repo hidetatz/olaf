@@ -100,8 +100,8 @@ class Attention(nn.Module):
     def init(self, rng):
         return {name: layer.init(rng) for name, layer in self._layers().items()}
 
-    def __call__(self, p, x, kv, bias):
-        """bias: [heads, Sq, Sk] (the position bias, with -inf at masked pairs) or None."""
+    def __call__(self, p, x, kv, bias, causal=False):
+        """bias: [heads, Sq, Sk] (the position bias) or None."""
         L, c = self._layers(), self.config
         B, Sq, _ = x.shape
         Sk = kv.shape[1]
@@ -111,16 +111,14 @@ class Attention(nn.Module):
             return olaf.transpose(L[name](p[name], t).reshape(B, n, H, D), 1, 2)
 
         q, k, v = heads("q", x, Sq), heads("k", kv, Sk), heads("v", kv, Sk)
-        scores = olaf.einsum("bhqd,bhkd->bhqk", q, k)  # T5 does not scale the scores
-        if bias is not None:
-            # Added in place in Hugging Face (scores += position_bias): the sum keeps the scores'
-            # type, so under autocast the f32 bias is added in f32 and rounded back to bf16.
-            spread = olaf.broadcast_to(bias.reshape(1, H, Sq, Sk), (B, H, Sq, Sk))
-            total = _to(scores, spread.dtype) + spread if scores.dtype is not spread.dtype else scores + spread
-            scores = _to(total, scores.dtype)
-        # Softmax in f32, then in the scores' type (Hugging Face: softmax(scores.float()).type_as).
-        weights = _to(olaf.softmax(_to(scores, DType.f32) if scores.dtype is DType.bf16 else scores), scores.dtype)
-        out = olaf.einsum("bhqk,bhkd->bhqd", _to(weights, self.compute), _to(v, self.compute) if self.compute else v)
+        mask = None
+        if causal:
+            mask = olaf.broadcast_to((olaf.iota((Sq, Sk), axis=0) >= olaf.iota((Sq, Sk), axis=1)).reshape(1, 1, Sq, Sk), (B, H, Sq, Sk))
+        spread = None if bias is None else bias.reshape(1, H, Sq, Sk)
+        # T5 does not scale the scores. Hugging Face adds the f32 bias to bf16 scores in place
+        # (rounding the sum to bf16) and takes the softmax in f32; the composite keeps the
+        # scores in f32, one rounding fewer, and rounds the probabilities to bf16 as HF does.
+        out = olaf.attention(q, k, v, mask, spread, scale=1.0)
         return L["o"](p["o"], olaf.transpose(out, 1, 2).reshape(B, Sq, H * D))
 
 
@@ -180,7 +178,7 @@ class DecoderBlock(nn.Module):
     def __call__(self, p, x, encoded, bias):
         L, P = self._layers()["layer"], p["layer"]
         h = L["0"]["layer_norm"](P["0"]["layer_norm"], x)
-        x = _residual(x, L["0"]["SelfAttention"](P["0"]["SelfAttention"], h, h, bias))
+        x = _residual(x, L["0"]["SelfAttention"](P["0"]["SelfAttention"], h, h, bias, causal=True))
         h = L["1"]["layer_norm"](P["1"]["layer_norm"], x)
         x = _residual(x, L["1"]["EncDecAttention"](P["1"]["EncDecAttention"], h, encoded, None))
         f, pf = L["2"]["DenseReluDense"], P["2"]["DenseReluDense"]
@@ -225,9 +223,7 @@ class T5(nn.Module):
         x = stacks["encoder"]["block"](enc["block"], x, bias)
         encoded = stacks["encoder"]["final_layer_norm"](enc["final_layer_norm"], x)
         y = olaf.take(emb, decoder_ids)
-        causal = olaf.iota((T, T), axis=0) >= olaf.iota((T, T), axis=1)
         bias = self._position_bias(dec["relative_attention_bias"], T, T, False)
-        bias = olaf.where(olaf.broadcast_to(causal.reshape(1, T, T), bias.shape), bias, float("-inf"))
         y = stacks["decoder"]["block"](dec["block"], y, encoded, bias)
         y = stacks["decoder"]["final_layer_norm"](dec["final_layer_norm"], y)
         # Tied embeddings: the decoder output is rescaled by d_model^-0.5 before the projection.
