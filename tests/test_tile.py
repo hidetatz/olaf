@@ -1112,7 +1112,7 @@ def test_later_inlining_rounds_leave_small_tiled_producers():
     from olaf.tile.fuse import _inline_into, _pointwise
 
     x, w = R.normal(size=(8, 32, 16, 16)).astype(np.float32), R.normal(size=(32, 1, 5, 5)).astype(np.float32)
-    graph = lower(olaf.trace(lambda x, w: olaf.exp(olaf.conv(x, w, 1, 2, groups=32)), tt(*x.shape), tt(*w.shape)).graph)
+    graph = lower(olaf.trace(lambda x, w: olaf.exp(olaf.conv(x, w, 2, 2, groups=32)), tt(*x.shape), tt(*w.shape)).graph)
     program = to_tile(graph, AMPERE_RTX3060)
     buffers = {b.name: b for b in program.buffers}
     (stencil,) = [launch for launch in program.launches if sum(op.kind == "load" for op in _walk_ops(launch)) >= 25]
@@ -1246,3 +1246,83 @@ def test_tied_embedding_gradient_is_scattered_into_the_product():
         assert rel(a, e) < 1e-2
     wide = olaf.trace(lambda t, i, j: olaf.grad(lambda t: olaf.sum(olaf.einsum("bsd,vd->bsv", olaf.take(t, i), t) ** 2.0))(t), tt(50, 16), TensorType((2, 6), olaf.i32), TensorType((2, 6), olaf.i32))
     assert rel(interpret(lower_graph(wide.graph), [table, i, j])[0][0], wide.eager(table, i, j)[0]) < 1e-5
+
+
+@pytest.mark.parametrize("kernel,plane", [(7, (4, 4)), (7, (2, 2)), (7, (4, 8)), (5, (3, 3)), (3, (2, 2))])
+def test_depthwise_stencil_over_a_small_plane_reads_only_its_inputs(kernel, plane):
+    # Where the plane is smaller than the kernel, the stencil steps over the input's positions: one
+    # product per (output, input) pair, not one per tap (the others read padding), and no padded grid.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(5, 40, *plane)).astype(np.float32)
+    w = rng.normal(size=(40, 1, kernel, kernel)).astype(np.float32)
+
+    def fn(x, w):
+        return olaf.value_and_grad(lambda x, w: olaf.sum(olaf.conv(x, w, 1, kernel // 2, groups=40) ** 3.0), (0, 1))(x, w)
+
+    graph = lower(olaf.trace(fn, tt(*x.shape), tt(*w.shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    for a, e in zip(olaf.tree_flatten(run_program(program, [x, w])[0])[0], olaf.tree_flatten(interpret(graph, [x, w])[0])[0]):
+        assert rel(a, e) < 1e-5, rel(a, e)
+    forward = to_program(lower(olaf.trace(lambda x, w: olaf.conv(x, w, 1, kernel // 2, groups=40), tt(*x.shape), tt(*w.shape)).graph), AMPERE_RTX3060)
+    pairs = int(np.prod([d if d <= kernel // 2 + 1 else kernel for d in plane]))  # every pair has a tap
+    assert max(sum(op.kind == "load" for op in _walk_ops(launch)) for launch in forward.launches) == 2 * pairs
+
+
+@pytest.mark.parametrize("kernel,plane", [(7, (8, 8)), (5, (6, 10))])
+def test_depthwise_stencil_walks_the_rows(kernel, plane):
+    # Each input row is read once, at the kernel's width of shifts, and the residual sum that
+    # follows is stored by the same task.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(3, 40, *plane)).astype(np.float32)
+    w = rng.normal(size=(40, 1, kernel, kernel)).astype(np.float32)
+    graph = lower(olaf.trace(lambda x, w: olaf.conv(x, w, 1, kernel // 2, groups=40) + x, tt(*x.shape), tt(*w.shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert rel(run_program(program, [x, w])[0], interpret(graph, [x, w])[0]) < 1e-5
+    stencil = [launch for launch in program.launches if launch.task.origin == ("depthwise_rows",)]
+    assert len(stencil) == 1 and not any(launch.task.name == "add" for launch in program.launches)
+
+
+@pytest.mark.parametrize("kernel,stride,plane", [(3, 1, (8, 8)), (7, 1, (8, 10)), (3, 2, (18, 20)), (5, 2, (17, 20)), (2, 2, (18, 20))])
+def test_depthwise_weight_gradient_walks_the_rows(kernel, stride, plane):
+    # Each step loads only the input rows the step before it did not hold (none shared at 2 x 2, stride 2).
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(3, 40, *plane)).astype(np.float32)
+    w = rng.normal(size=(40, 1, kernel, kernel)).astype(np.float32)
+    loss = lambda x, w: olaf.sum(olaf.conv(x, w, stride, (kernel - 1) // 2, groups=40) ** 3.0)  # noqa: E731
+    graph = lower(olaf.trace(lambda x, w: olaf.grad(loss, 1)(x, w), tt(*x.shape), tt(*w.shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    assert any(launch.task.name == "depthwise_grad" for launch in program.launches)
+    assert rel(run_program(program, [x, w])[0], interpret(graph, [x, w])[0]) < 1e-5
+
+
+def test_sibling_fusion_stores_into_the_interior_of_a_grid():
+    # The batch norm's output (kept for the backward) and the activation stored into the next
+    # convolution's padded grid are one task.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.pipeline import to_program
+
+    rng = np.random.default_rng(4)
+    x = rng.normal(size=(4, 8, 8, 16)).astype(np.float32) / 4
+    w = rng.normal(size=(16, 1, 5, 5)).astype(np.float32)
+
+    def fn(x, w):
+        h = olaf.exp(x) * x + 1.0
+        for _ in range(3):  # not cheap enough to be computed in both
+            h = h * x + olaf.exp(-(h * h))
+        return h, olaf.conv(olaf.silu(olaf.permute(h, (0, 3, 1, 2))), w, 1, 2, groups=16)
+
+    graph = lower(olaf.trace(fn, tt(*x.shape), tt(*w.shape)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    for a, e in zip(*(olaf.tree_flatten(r)[0] for r in (run_program(program, [x, w])[0], interpret(graph, [x, w])[0]))):
+        assert rel(a, e) < 1e-5
+    views = [[a.view for a in launch.task.args if a.writes] for launch in program.launches]
+    assert any(len(vs) == 2 and any(not v.is_contiguous for v in vs) for vs in views)

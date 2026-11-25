@@ -138,7 +138,10 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
     for other in stores:
         arg = launch.task.args[other.attr("arg")]
         target = buffers[launch.buffers[other.attr("arg")]]
-        if arg.view != full_view(target.type.shape) or other.inputs[1:] != starts or other.inputs[0].type.shape != store.inputs[0].type.shape:
+        # With multi, also each element of an interior once: an activation stored straight into the
+        # next convolution's padded grid. (Producer inlining reads a whole buffer at its own coordinates.)
+        whole = arg.view == full_view(target.type.shape) or multi and _interior(arg.view, target.type.shape)
+        if not whole or other.inputs[1:] != starts or other.inputs[0].type.shape != store.inputs[0].type.shape:
             return None
     scalars = _scalar_constants(body)
     coordinate = _coordinate_values(body, scalars)
@@ -194,6 +197,11 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
     weighted = sum(_BYTES[a.dtype] * _fraction(a.view, total) for a in distinct)
     full = sum(1 for a in distinct if _fraction(a.view, total) == 1)
     return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads), gathers, weighted, out_bytes, full)
+
+
+def _interior(view: View, shape) -> bool:
+    """The view is a block of a contiguous buffer of `shape`, its axes in order."""
+    return view.pad is None and view.rank == len(shape) and view.strides == contiguous_strides(shape)
 
 
 def _fraction(view: View, total: Dim) -> float:
@@ -675,11 +683,11 @@ def fuse_epilogues(program: Program, *, shared_cheap_only: bool = False) -> Prog
         launches = list(program.launches)
         for i, launch in enumerate(launches):
             origin = launch.task.origin if launch is not None else ()
-            if launch is None or not origin or not (origin[0] == "contract" or origin[0].startswith("attention")) or launch.offsets:
+            if launch is None or not origin or not (origin[0] in ("contract", "depthwise_rows") or origin[0].startswith("attention")) or launch.offsets:
                 continue
             stores = [op for op in launch.task.body.ops if op.kind == "store"]
-            if origin[0] == "attention_dkv":
-                # dQ, stored row tile by row tile inside the loop over them.
+            if origin[0] in ("attention_dkv", "depthwise_rows"):
+                # dQ, stored row tile by row tile inside the loop over them; a stencil's rows.
                 stores += [op for loop in launch.task.body.ops for region in loop.regions for op in region.ops if op.kind == "store"]
             for store in stores:
                 absorbed = _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only)

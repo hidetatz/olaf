@@ -1183,11 +1183,35 @@ class _Converter:
         out_type = op.outputs[0].type
         out_spatial = tuple(out_type.shape[2:])
         acc = accumulator_dtype(out_type.dtype)
-        grid = self._padded_grid(x, (0, *range(2, 2 + n), 1), padding, 0)
-        gs = contiguous_strides(self.buffers[grid.buffer].type.shape)  # [N, *padded, C]
+        stencil = math.prod(kernel) <= 64
+        # Axes of a stencil stepped over the input's positions instead of the kernel's: where
+        # the plane is smaller than the kernel and every (input, output) pair has a tap, the other
+        # taps only read padding (a 7x7 layer over 4x4: 16 products of 49, and no padded grid).
+        by_input = [
+            stencil and s == d == 1 and size < k and size - 1 + lo <= k - 1 and o - 1 <= lo
+            for s, d, size, k, o, (lo, _) in zip(stride, dilation, x.shape[2:], kernel, out_spatial, padding)
+        ]
+        small = not stencil and n > 1 and kernel[0] == x.shape[2] and out_spatial[0] == 1 and padding[0] == (0, 0)
+        small = small and all(v == 1 for v in (*stride, *dilation)) and max(math.prod(kernel[1:]), math.prod(x.shape[3:])) <= 16
+        if small:
+            padding = ((0, 0),) * n
+        padding_read = tuple((0, 0) if skip else p for skip, p in zip(by_input, padding))
+        if n == 3 and N == 1 and padding[0] == (0, 0):
+            # A weight gradient's batch is its first spatial axis: without the unit axis, its grid
+            # is the forward's (copied whole otherwise, 38 MB for 144 channels at 32 x 32).
+            flat = self.plain(x)
+            v = flat.view
+            flat = Ref(flat.buffer, View((v.shape[2], v.shape[1], *v.shape[3:]), (v.strides[2], v.strides[1], *v.strides[3:]), v.offset), flat.dtype)
+            wider = padding_read[1:] if small else self._grid_padding(flat, (0, 2, 3, 1), padding_read[1:])
+            grid = self._padded_grid(flat, (0, 2, 3, 1), wider, 0)
+            gs = contiguous_strides(self.buffers[grid.buffer].type.shape)
+            gs = (0, *gs)
+        else:
+            grid = self._padded_grid(x, (0, *range(2, 2 + n), 1), padding_read, 0)
+            gs = contiguous_strides(self.buffers[grid.buffer].type.shape)  # [N, *padded, C]
         w = self.plain(w)
         ws = w.view.strides
-        if math.prod(kernel) <= 64:
+        if stencil:
             # The weight as [*kernel, C], channels contiguous: read along the channels at each
             # kernel position, [C, 1, *kernel] puts consecutive lanes 25 elements apart (5 x 5),
             # and the loads, scattered over many sectors, throttled the whole task (8 ms).
@@ -1197,12 +1221,20 @@ class _Converter:
         order = (0, *range(2, 2 + n), 1)  # the output channels-last, like its input
         physical = TensorType(tuple(out_type.shape[a] for a in order), out_type.dtype)
         shape = physical.shape
-        if math.prod(kernel) <= 64:
+        if stencil and n == 2 and math.prod(kernel) > 9 and not any(by_input) and all(v == 1 for v in (*stride, *dilation)):
+            return _permuted(self._depthwise_rows(grid, gs, w, ws, kernel, physical, acc, padding), _inverse(order))
+        if stencil:
             refs = []
-            for q in np.ndindex(*kernel):
-                at = sum(qi * d * st for qi, d, st in zip(q, dilation, gs[1:-1]))
-                refs.append(Ref(grid.buffer, View(shape, (gs[0], *(s * st for s, st in zip(stride, gs[1:-1])), gs[-1]), grid.view.offset + at), x.dtype))
-                refs.append(Ref(w.buffer, View(shape, (*(0,) * (n + 1), ws[0]), w.view.offset + sum(qi * st for qi, st in zip(q, ws[2:]))), w.dtype))
+            taps = [size if skip else k for skip, size, k in zip(by_input, x.shape[2:], kernel)]
+            for q in np.ndindex(*taps):
+                # By the kernel's positions, the output position o reads the input at o * stride + q *
+                # dilation and the weight at q; by the input's, the input at q, the weight at q + lo - o.
+                at = sum(qi * st * (1 if skip else d) for qi, d, st, skip in zip(q, dilation, gs[1:-1], by_input))
+                xs = (0 if skip else s * st for s, st, skip in zip(stride, gs[1:-1], by_input))
+                refs.append(Ref(grid.buffer, View(shape, (gs[0], *xs, gs[-1]), grid.view.offset + at), x.dtype))
+                w_at = sum((qi + lo if skip else qi) * st for qi, st, (lo, _), skip in zip(q, ws[2:], padding, by_input))
+                w_steps = (-st if skip else 0 for st, skip in zip(ws[2:], by_input))
+                refs.append(Ref(w.buffer, View(shape, (0, *w_steps, ws[0]), w.view.offset + w_at), w.dtype))
 
             def compute(b, tiles, starts, tile):
                 total = None
@@ -1218,10 +1250,70 @@ class _Converter:
             # which measured faster there (MobileNetV2's step 50 ms against 56).
             result = self.elementwise("conv", physical, refs, compute, out=out, elements=256 if math.prod(kernel) > 9 else None)
             return _permuted(result, _inverse(order))
-        summed = self._depthwise_weight_grad(grid, gs, w, ws, kernel, out_spatial, stride, dilation, C, acc)
+        if small:
+            summed = self._depthwise_weight_grad_small(grid, gs, w, ws, x.shape[2:], kernel, out_spatial, op.attr("padding"), C, acc)
+        else:
+            summed = self._depthwise_weight_grad(grid, gs, w, ws, kernel, out_spatial, stride, dilation, C, acc)
         if acc is not out_type.dtype:
             summed = self.elementwise("cast", physical, [summed], lambda b, t, s, ts: b.op("cast", t[0], dtype=out_type.dtype))
         return _permuted(summed, _inverse(order))
+
+    def _depthwise_rows(self, grid: Ref, gs, w: Ref, ws, kernel, physical: TensorType, acc: DType, padding) -> Ref:
+        """A stride-1 depthwise stencil [N, H, W, C] walking the rows of the padded grid. Each
+        input row is read once, at the kernel's width of shifts, and added to the sums of the
+        output rows that reach it (one accumulator per kernel row, moved up a row per step); the
+        weights are read once per block. Elementwise, every output reads the whole window and
+        the whole kernel again: 98 loads for 7 x 7 against 7 an element."""
+        KH, KW = kernel
+        N, H, W, C = physical.shape
+        cb = _block(C, 32)
+        wb = min(max(1, 128 // cb), _block(W, 128))
+        tile = (1, 1, wb, cb)
+        xs = [Ref(grid.buffer, View((N, H + KH - 1, W, C), (gs[0], gs[1], gs[2], gs[3]), grid.view.offset + q * gs[2]), grid.dtype) for q in range(KW)]
+        taps = list(np.ndindex(KH, KW))
+        wv = [Ref(w.buffer, View((W, C), (0, ws[0]), w.view.offset + i * ws[2] + j * ws[3]), w.dtype) for i, j in taps]
+        out = self.new_buffer(physical, BufferKind.temp)
+        b = TileBuilder()
+        pids = [TValue(TileType((), INDEX)) for _ in range(3)]
+        n0, w0, c0 = pids[0], b.op("mul", pids[1], b.index(wb)), b.op("mul", pids[2], b.index(cb))
+        weights = {}
+        for k, (q, r) in enumerate(zip(taps, wv)):
+            v = b.op("load", w0, c0, arg=KW + k, shape=(wb, cb), dtype=w.dtype, other=0)
+            weights[q] = v if w.dtype is acc else b.op("cast", v, dtype=acc)
+
+        def step(builder, row, sums):
+            """The sums of the KH output rows ending `row - KH + 1` first, with grid row `row` added."""
+            xt = []
+            for k in range(KW):
+                v = builder.op("reshape", builder.op("load", n0, row, w0, c0, arg=k, shape=tile, dtype=grid.dtype, other=0), shape=(wb, cb))
+                xt.append(v if grid.dtype is acc else builder.op("cast", v, dtype=acc))
+            new = []
+            for k, s in enumerate(sums):  # sums[k]: output row (row - (KH - 1) + k), whose tap here is KH - 1 - k
+                for j in range(KW):
+                    term = builder.op("mul", xt[j], weights[(KH - 1 - k, j)])
+                    s = term if s is None else builder.op("add", s, term)
+                new.append(s)
+            return new
+
+        zero = b.full((wb, cb), 0, acc)
+        sums = [None] * KH
+        for row in range(KH - 1):  # the rows before the first output row completes
+            if row >= padding[0][0]:  # (padding adds nothing)
+                done = step(b, b.index(row), [s if s is not None else zero for s in sums])
+            else:
+                done = [s if s is not None else zero for s in sums]
+            sums = [*done[1:], zero]
+
+        def body(inner, row, carries):
+            done = step(inner, row, list(carries))
+            value = done[0] if acc is physical.dtype else inner.op("cast", done[0], dtype=physical.dtype)
+            at = inner.op("sub", row, inner.index(KH - 1))
+            inner.emit("store", (inner.op("reshape", value, shape=tile), n0, at, w0, c0), {"arg": KW + len(taps)})
+            return [*done[1:], inner.full((wb, cb), 0, acc)]
+
+        b.for_range(b.index(KH - 1), b.index(H + KH - 1), 1, sums, body)
+        self.launch("depthwise_rows", (N, _ceil_div(W, wb), _ceil_div(C, cb)), [*((r, False) for r in (*xs, *wv)), (out, True)], b.finish(pids), 4, origin=("depthwise_rows",))
+        return out
 
     def _depthwise_weight_grad(self, grid: Ref, gs, w: Ref, ws, kernel, out_spatial, stride, dilation, C: int, acc: DType) -> Ref:
         """A depthwise weight gradient: [1, *out, C] = sum over the kernel positions q (the
@@ -1268,13 +1360,78 @@ class _Converter:
             extent = last if axis == n - 1 else 1
             return builder.for_range(builder.index(0), builder.dim(kernel[axis]), extent, accs, body)
 
+        # Along the rows innermost, the input rows a step read are the next step's, `dilation` (a
+        # stride-2 layer's 2) taps lower: only the rest is loaded, at the kernel's width of shifts.
+        walk = n == 3 and out_spatial[0] == 1 and out_spatial[1] > dilation[1] and all(v == 1 for v in stride)
+        TH, TW = out_spatial[-2:]
+        kept = TH - dilation[1] if walk else 0
+
+        def load_x(builder, k, q):
+            xt = builder.op("load", *q, c0, arg=k, shape=tile, dtype=grid.dtype, other=0)
+            return builder.op("reshape", xt if xt.type.dtype is acc else builder.op("cast", xt, dtype=acc), shape=(last, cb))
+
+        def columns(outer, col, carries):
+            # offsets[i * TW + j] is tap (i, j): its view starts i rows and j columns in.
+            rows = [load_x(outer, i * TW + j, (pids[0], outer.index(0), col)) for i in range(kept) for j in range(TW)]
+
+            def row_step(inner, row, carried):
+                held, sums = list(carried[: len(rows)]), carried[len(rows) :]
+                held += [load_x(inner, i * TW + j, (pids[0], row, col)) for i in range(kept, TH) for j in range(TW)]
+                wt = inner.op("load", pids[0], row, col, c0, arg=len(xs), shape=tile, dtype=w.dtype, other=0)
+                wt = inner.op("reshape", wt if wt.type.dtype is acc else inner.op("cast", wt, dtype=acc), shape=(last, cb))
+                return [*held[(TH - kept) * TW :], *(inner.op("add", s, inner.op("mul", v, wt)) for s, v in zip(sums, held))]
+
+            return outer.for_range(outer.index(0), outer.dim(kernel[1]), 1, [*rows, *carries], row_step)[len(rows) :]
+
         accs = [b.full((last, cb), 0, acc) for _ in offsets]
-        accs = loop(b, 1, [pids[0]], accs)
+        if walk:
+            accs = b.for_range(b.index(0), b.dim(kernel[2]), last, accs, columns)
+        else:
+            accs = loop(b, 1, [pids[0]], accs)
         for k, a in enumerate(accs):
             total = b.op("reshape", b.op("reduce", a, fn="sum", axes=(0,)), shape=(1, 1, cb))
             b.emit("store", (total, pids[0], b.index(k), c0), {"arg": len(xs) + 1})
         refs = [*((r, False) for r in xs), (wv, False), (Ref(partial.buffer, View((parts, len(offsets), C), contiguous_strides((parts, len(offsets), C)), 0), acc), True)]
         self.launch("depthwise_grad", (parts, _ceil_div(C, cb)), refs, b.finish(pids), 4, origin=("depthwise_grad",))
+        summed = self._reduce(partial, "sum", (0,), TensorType((len(offsets), C), acc))
+        return replace(summed, view=View((1, *out_spatial, C), contiguous_strides((1, *out_spatial, C)), summed.view.offset))
+
+    def _depthwise_weight_grad_small(self, grid: Ref, gs, w: Ref, ws, plane, kernel, out_spatial, padding, C: int, acc: DType) -> Ref:
+        """_depthwise_weight_grad for planes of at most 16 positions: every (input, output gradient)
+        position pair written out, added to the tap it belongs to. The walk over all taps reads
+        the input at every shift, most of them padding here (a 7x7 layer over 4x4: 784 reads
+        an image and channel against 16, 256 pairs with a tap). Several images a block: there
+        is no position axis left to fill its threads with, and fewer partial sums to add up."""
+        N = kernel[0]
+        offsets = list(np.ndindex(*out_spatial))
+        inputs = list(np.ndindex(*plane[1:]))
+        outputs = list(np.ndindex(*kernel[1:]))
+        cb = _block(C, 32)
+        images = _block(N, 128 // cb)
+        parts = _ceil_div(N, images)
+        refs = [Ref(grid.buffer, View((N, C), (gs[1], gs[-1]), grid.view.offset + sum(p * st for p, st in zip(i, gs[2:-1]))), grid.dtype) for i in inputs]
+        refs += [Ref(w.buffer, View((N, C), (ws[2], ws[0]), w.view.offset + sum(p * st for p, st in zip(q, ws[3:]))), w.dtype) for q in outputs]
+        shape = (parts, len(offsets), C)
+        partial = Ref(self.new_buffer(TensorType(shape, acc), BufferKind.temp).buffer, full_view(shape), acc)
+        b = TileBuilder()
+        pids = [TValue(TileType((), INDEX)) for _ in range(2)]
+        starts = [b.op("mul", p, b.index(e)) for p, e in zip(pids, (images, cb))]
+        tiles = []
+        for k, r in enumerate(refs):
+            tile = b.op("load", *starts, arg=k, shape=(images, cb), dtype=r.dtype, other=0)
+            tiles.append(tile if r.dtype is acc else b.op("cast", tile, dtype=acc))
+        sums: dict[tuple, TValue] = {}
+        for k, q in enumerate(outputs):
+            for i, at in enumerate(inputs):
+                o = (0, *(a - c + lo for a, c, (lo, _) in zip(at, q, padding[1:])))
+                if all(0 <= v < size for v, size in zip(o, out_spatial)):
+                    term = b.op("mul", tiles[i], tiles[len(inputs) + k])
+                    sums[o] = term if o not in sums else b.op("add", sums[o], term)
+        for k, o in enumerate(offsets):
+            value = sums[o] if o in sums else b.full((images, cb), 0, acc)
+            total = b.op("reshape", b.op("reduce", value, fn="sum", axes=(0,)), shape=(1, 1, cb))
+            b.emit("store", (total, pids[0], b.index(k), starts[1]), {"arg": len(refs)})
+        self.launch("depthwise_grad", (parts, _ceil_div(C, cb)), [*((r, False) for r in refs), (partial, True)], b.finish(pids), 4, origin=("depthwise_grad",))
         summed = self._reduce(partial, "sum", (0,), TensorType((len(offsets), C), acc))
         return replace(summed, view=View((1, *out_spatial, C), contiguous_strides((1, *out_spatial, C)), summed.view.offset))
 
@@ -1379,7 +1536,7 @@ class _Converter:
         permuted = _permuted(src, tuple(order))
         best = None
         for (buffer, view, pad), _ in self._grids.items():
-            if buffer != src.buffer or view != permuted.view or len(pad) != len(padding) + 2:
+            if buffer != src.buffer or view != replace(permuted.view, source=None) or len(pad) != len(padding) + 2:
                 continue
             spatial = pad[1:-1]
             if all(lo == max(want_lo, 0) and want_lo >= 0 and hi >= max(want_hi, 0) for (lo, hi), (want_lo, want_hi) in zip(spatial, padding)):
@@ -1404,7 +1561,7 @@ class _Converter:
             # channels-last activation): the copy only duplicated it (ResNet-18's strided
             # shortcuts, forward and weight gradient, 6 copies of up to 17 MB).
             return Ref(src.buffer, full_view(padded_shape), x.dtype)
-        key = (src.buffer, permuted.view, pad)
+        key = (src.buffer, replace(permuted.view, source=None), pad)  # the same elements, however the view came about
         known = self._grids.get(key)
         # The tail as whole extra images: the buffer keeps the grid's axes, so views of it have
         # source maps (which moving the copy's writer into it needs).
