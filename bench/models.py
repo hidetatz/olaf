@@ -10,6 +10,7 @@ STEPS steps, medians compared. Each model runs in its own process (GPU memory).
     python bench/models.py            # all models, one process each
     python bench/models.py resnet     # one model
     python bench/models.py resnet --tuned --olaf-only
+    python bench/models.py resnet --compile-default   # torch.compile without max-autotune
 """
 
 from __future__ import annotations
@@ -32,6 +33,8 @@ import olaf  # noqa: E402
 STEPS = 10
 TUNED = "--tuned" in sys.argv
 OLAF_ONLY = "--olaf-only" in sys.argv
+# The P1 performance condition compares against max-autotune, and so does P1.5.
+COMPILE_MODE = "default" if "--compile-default" in sys.argv else "max-autotune"
 MODELS = ["mlp", "cnn", "resnet", "dcgan", "yolo", "llama", "mixtral", "whisper", "gradcam", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat", "rnn", "lstm"]
 
 
@@ -90,10 +93,14 @@ def _replayer(session, inputs):
 # -- torch --------------------------------------------------------------------------------------
 
 
+def compile_torch(fn):
+    return torch.compile(fn, mode=COMPILE_MODE)
+
+
 def torch_times(step_fn) -> tuple[float, float, float]:
     """(eager ms, compiled ms, compile seconds) of step_fn() (forward, backward, optimizer).
     step_fn may be (eager step, compiled step) when compiling the whole step does not work."""
-    step_fn, compiled = step_fn if isinstance(step_fn, tuple) else (step_fn, torch.compile(step_fn))
+    step_fn, compiled = step_fn if isinstance(step_fn, tuple) else (step_fn, compile_torch(step_fn))
     eager = timed(step_fn, torch.cuda.synchronize)
     start = time.time()
     compiled()
@@ -201,7 +208,11 @@ def build(name):
             return step
 
 
-        return "DCGAN (16x16, width 64), batch 128", (traced, initial, [real, z]), (make(G0, D0), make(torch.compile(G0), torch.compile(D0)))
+        # Without CUDA graphs: D runs three times per step, and with them its second run
+        # overwrites the outputs the first run's backward still reads (a RuntimeError).
+        mode = "max-autotune-no-cudagraphs" if COMPILE_MODE == "max-autotune" else COMPILE_MODE
+        compiled = make(torch.compile(G0, mode=mode), torch.compile(D0, mode=mode))
+        return "DCGAN (16x16, width 64), batch 128", (traced, initial, [real, z]), (make(G0, D0), compiled)
     if name == "yolo":
         import test_yolo
         from olaf.examples import yolo
