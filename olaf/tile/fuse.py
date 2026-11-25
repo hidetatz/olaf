@@ -23,20 +23,25 @@ softmax rewrite for attention are separate rules, added as their own passes.
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from olaf.graph.dim import Dim
+from olaf.graph.dim import Dim, product
 from olaf.graph.types import DType
 from olaf.tile.builder import BINARY, INDEX, UNARY, TileBuilder
-from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, TileType, TOp, TValue, View, full_view
+from olaf.tile.ir import Arg, Body, Buffer, BufferKind, Launch, Program, Task, TileType, TOp, TValue, View, contiguous_strides, full_view
 
 CHEAP_OPS = 3
 # A producer whose output is wider than its inputs (bf16 in, f32 out) is recomputed in every
 # reader up to this cost: reading its inputs again moves fewer bytes than writing and reading
 # its output (GPT-2's gelu tanh, shared by forward and backward after CSE: 50 MB of f32 per layer).
 RECOMPUTE_OPS = 8
+# A row task takes the task before it (fuse_row_prologues) when that loads no more operands than
+# this: a whole row of every operand is held at once. A depthwise stencil inlined in a residual sum
+# (ConvNeXt, 49 taps) made its row tasks 5 to 10 times slower.
+PROLOGUE_LOADS = 8
 # Concats of more inputs than this take no inlined producers (_Rewriter).
 CONCAT_INLINE_INPUTS = 4
 
@@ -57,6 +62,9 @@ class _Pointwise:
     cost: int
     widens: bool = False  # output in a wider type than its inputs, and no fewer bytes than it reads (see _pointwise)
     gathers: bool = False  # it reads through an index (a gather, possibly with pointwise ops after it)
+    read_bytes: float = 0  # per output element, over its operands other than small broadcast ones
+    out_bytes: int = 0
+    operands: int = 0  # how many of them are full-size
 
 
 def fuse(program: Program) -> Program:
@@ -66,7 +74,19 @@ def fuse(program: Program) -> Program:
     recipes: dict[str, _Pointwise] = {}
     launches: list[Launch] = []
     for launch in program.launches:
-        launch = _inline_into(launch, recipes, readers, buffers)
+        # Inlining merges readers: a ReLU's mask (cmp) read once by its select (where), both
+        # reading the pre-activation x, leaves one task reading x where there were two, and x
+        # can then go in as well. Counted once, x stayed materialized beside the selected
+        # output (ResNet-18 wrote each residual sum twice).
+        # Only those merged reads go in on the later rounds; the rest stays as one round left
+        # it (a load a widening cast kept from its producer, now inlined here, stays a load).
+        only = None
+        while (inlined := _inline_into(launch, recipes, readers, buffers, only)) is not launch:
+            lowered = _recount(readers, launch, inlined, recipes, buffers)
+            launch = inlined
+            only = {name for name in lowered if readers[name] == 1 and name in launch.buffers}
+            if not only:
+                break
         info = _pointwise(launch, buffers, indexed=True)
         if info is not None:
             out = launch.buffers[info.store.attr("arg")]
@@ -74,6 +94,33 @@ def fuse(program: Program) -> Program:
                 recipes[out] = info
         launches.append(launch)
     return _without_dead(program, launches)
+
+
+def _reads(launch: Launch) -> Counter:
+    return Counter(name for name, arg in zip(launch.buffers, launch.task.args) if not arg.writes)
+
+
+def _recount(readers: Counter, old: Launch, new: Launch, recipes: dict[str, _Pointwise], buffers: dict[str, Buffer]) -> set[str]:
+    """Update reader counts after `old` was rewritten as `new`; a recipe left without readers
+    is a launch _without_dead drops, so its own reads are not counted either. Returns the
+    buffers whose count went down."""
+    delta = _reads(new)
+    delta.subtract(_reads(old))
+    readers.update(delta)
+    gone = [name for name, d in delta.items() if d < 0]
+    lowered = set(gone)
+    dead: set[str] = set()  # a buffer two dead producers read is queued twice
+    while gone:
+        name = gone.pop()
+        recipe = recipes.get(name)
+        if name in dead or readers[name] != 0 or recipe is None or buffers[name].kind is not BufferKind.temp:
+            continue
+        dead.add(name)
+        for read, count in _reads(recipe.launch).items():
+            readers[read] -= count
+            gone.append(read)
+            lowered.add(read)
+    return lowered
 
 
 def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = False, indexed: bool = False) -> _Pointwise | None:
@@ -141,7 +188,17 @@ def _pointwise(launch: Launch, buffers: dict[str, Buffer], *, multi: bool = Fals
     reads = [_BYTES[a.dtype] for a in args if not a.writes and not _small(a.view, total)]
     out_bytes = _BYTES[store.inputs[0].type.dtype]
     gathers = any(op.kind == "load_indexed" for op in body.ops)
-    return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads), gathers)
+    # For duplication, an operand counts by its distinct elements: a max pooling's backward
+    # selects by its output broadcast over each window, a quarter of the elements it reads.
+    distinct = [a for a in args if not a.writes and not _small(a.view, total)]
+    weighted = sum(_BYTES[a.dtype] * _fraction(a.view, total) for a in distinct)
+    full = sum(1 for a in distinct if _fraction(a.view, total) == 1)
+    return _Pointwise(launch, starts, coordinate, store, cost, out_bytes >= sum(reads) and all(out_bytes > r for r in reads), gathers, weighted, out_bytes, full)
+
+
+def _fraction(view: View, total: Dim) -> float:
+    n = _elements(view)
+    return n / total if isinstance(n, int) and isinstance(total, int) and total else 1.0
 
 
 def _elements(view: View) -> Dim:
@@ -151,6 +208,19 @@ def _elements(view: View) -> Dim:
         if st != 0:
             count = count * d
     return count
+
+
+def _duplication_pays(recipe: _Pointwise, readers: int) -> bool:
+    """Whether `readers` readers each rereading the producer's operands move no more bytes
+    than writing its output once and reading it `readers` times. A ReLU's gradient selecting
+    between the sum of two incoming gradients and zero is three cheap ops on three tensors:
+    duplicated into a batch norm backward's reduction and its elementwise pass, it read six
+    tensors where materializing it wrote one and read two.
+    A producer of one operand is left alone: its readers mostly read that operand anyway (an
+    attention row's fully-masked test on the row maximum), and narrowing ones have _narrows."""
+    if recipe.widens or recipe.operands < 2:
+        return True
+    return readers * recipe.read_bytes <= (readers + 1) * recipe.out_bytes
 
 
 def _small(view: View, total: Dim) -> bool:
@@ -179,8 +249,9 @@ def _scalar_constants(body: Body) -> frozenset[TValue]:
 class _Rewriter:
     """Rebuilds a consumer body, replacing selected loads by inlined producers."""
 
-    def __init__(self, launch: Launch, recipes: dict[str, _Pointwise], readers: Counter, buffers: dict[str, Buffer]) -> None:
+    def __init__(self, launch: Launch, recipes: dict[str, _Pointwise], readers: Counter, buffers: dict[str, Buffer], only: set[str] | None = None) -> None:
         self.launch = launch
+        self.only = only
         self.recipes = recipes
         self.readers = readers
         self.buffers = buffers
@@ -216,8 +287,16 @@ class _Rewriter:
         if op.kind == "load_indexed" and not self.indexed_ok(op):
             return None
         name = self.launch.buffers[op.attr("arg")]
+        if self.only is not None and name not in self.only:
+            return None
         recipe = self.recipes.get(name)
         view = self.launch.task.args[op.attr("arg")].view
+        smaller = self.only is not None and recipe is not None and math.prod(recipe.store.inputs[0].type.shape) < math.prod(op.attr("shape"))
+        if smaller and any(_contains(self.launch.task.body, k) for k in ("exp", "log", "tanh", "erf", "sin", "cos", "pow")):
+            # Found by measuring, not derived: a depthwise stencil (25 taps, made with a smaller
+            # tile) inside SiLU's gradient took milliseconds more per task (EfficientNet 52 to
+            # 76 ms), while ConvNeXt's 49 taps inside residual adds gain (26.6 to 25.2).
+            return None
         if recipe is not None and self.casts_only and [o.kind for o in recipe.launch.task.body.ops if o.kind not in ("store",) and not set(o.outputs) <= recipe.coordinate] != ["load", "cast"]:
             return None
         if recipe is not None and recipe.gathers:
@@ -231,7 +310,7 @@ class _Rewriter:
         if any(a.view.pad is not None for a in recipe.launch.task.args if not a.writes):
             return None
         cheap = recipe.cost <= CHEAP_OPS or (recipe.widens and recipe.cost <= RECOMPUTE_OPS)
-        if self.readers[name] > 1 and not cheap:
+        if self.readers[name] > 1 and not (cheap and _duplication_pays(recipe, self.readers[name])):
             return None
         if self.into_dot and not _widening_cast(recipe):
             return None
@@ -272,7 +351,11 @@ class _Rewriter:
         return not (_contains(self.launch.task.body, "reduce") or _contains(self.launch.task.body, "dot"))
 
     def body(self, body: Body, subst: dict[TValue, TValue]) -> Body:
-        b = TileBuilder()
+        # Loads are merged (TileBuilder's cse): a producer can arrive twice, inlined in a reader
+        # that was itself inlined here and inlined directly. A ReLU's select and its mask both
+        # read the batch-normalized pre-activation, cheap enough to go into both; once they
+        # are one task, each copy loaded the convolution output again.
+        b = TileBuilder(cse=True)
         for op in body.ops:
             recipe = self.allowed(op)
             if recipe is not None and op.kind == "load_indexed":
@@ -292,6 +375,8 @@ class _Rewriter:
                 arg = op.attr("arg")
                 attrs = tuple((k, self.arg_index(*self.args[arg]) if k == "arg" else v) for k, v in attrs)
             b.ops.append(TOp(op.kind, tuple(subst.get(v, v) for v in op.inputs), outputs, attrs, regions))
+            if op.kind in ("store", "atomic_add", "atomic_add_indexed") or op.regions:
+                b.forget_loads()
         return Body(body.params, tuple(b.ops), tuple(subst.get(v, v) for v in body.results))
 
     def inline(self, b: TileBuilder, load: TOp, recipe: _Pointwise, starts: Sequence[TValue], index: TValue | None = None) -> TValue:
@@ -475,6 +560,44 @@ def _widening_cast(recipe: _Pointwise) -> bool:
     return load.attr("dtype") is DType.bf16 and cast.attr("dtype") is DType.f32 and recipe.store.inputs[0] is cast.outputs[0]
 
 
+def _cast_recipe(launch: Launch, buffers: dict[str, Buffer]) -> _Pointwise | None:
+    """The task as a pointwise recipe, also when it writes its whole output through a permuted
+    view (a cast that merges attention heads): only an epilogue can take that one, as it stores
+    through the consumer's own view; producer inlining reads a pointwise output at its
+    logical coordinates."""
+    info = _pointwise(launch, buffers)
+    if info is not None:
+        return info
+    body = launch.task.body
+    stores = [op for op in body.ops if op.kind == "store"]
+    if len(stores) != 1 or any(op.regions or op.kind not in _POINTWISE | {"load", "store"} for op in body.ops):
+        return None
+    store = stores[0]
+    view = launch.task.args[store.attr("arg")].view
+    target = buffers[launch.buffers[store.attr("arg")]]
+    # Every element of the target exactly once: its contiguous axes, reordered.
+    axes = sorted((st, d) for st, d in zip(view.strides, view.shape) if d != 1)
+    whole = sorted((st, d) for st, d in zip(contiguous_strides(target.type.shape), target.type.shape) if d != 1)
+    if view.pad is not None or view.offset != 0 or axes != whole:
+        return None
+    loads = [op for op in body.ops if op.kind == "load"]
+    if any(op.inputs != store.inputs[1:] or op.attr("shape") != store.inputs[0].type.shape for op in loads):
+        return None
+    scalars = _scalar_constants(body)
+    return _Pointwise(launch, tuple(store.inputs[1:]), _coordinate_values(body, scalars), store, 0)
+
+
+def _narrowing_cast(recipe: _Pointwise) -> bool:
+    """The task only casts one f32 load to bf16."""
+    ops = [op for op in recipe.launch.task.body.ops if op.kind not in ("store",) and not set(op.outputs) <= recipe.coordinate]
+    kinds = [op.kind for op in ops if op.kind != "full"]
+    if kinds != ["load", "cast"]:
+        return False
+    load = next(op for op in ops if op.kind == "load")
+    cast = next(op for op in ops if op.kind == "cast")
+    return load.attr("dtype") is DType.f32 and cast.attr("dtype") is DType.bf16 and recipe.store.inputs[0] is cast.outputs[0]
+
+
 def _contains(body: Body, kind: str) -> bool:
     return any(op.kind == kind for op in _walk(body))
 
@@ -496,8 +619,8 @@ def _renumber(body: Body, remap: dict[int, int]) -> Body:
     return Body(body.params, tuple(ops), body.results)
 
 
-def _inline_into(launch: Launch, recipes, readers, buffers) -> Launch:
-    rewriter = _Rewriter(launch, recipes, readers, buffers)
+def _inline_into(launch: Launch, recipes, readers, buffers, only: set[str] | None = None) -> Launch:
+    rewriter = _Rewriter(launch, recipes, readers, buffers, only=only)
     body = rewriter.body(launch.task.body, {})
     if not rewriter.changed:
         return launch
@@ -554,7 +677,11 @@ def fuse_epilogues(program: Program, *, shared_cheap_only: bool = False) -> Prog
             origin = launch.task.origin if launch is not None else ()
             if launch is None or not origin or not (origin[0] == "contract" or origin[0].startswith("attention")) or launch.offsets:
                 continue
-            for store in [op for op in launch.task.body.ops if op.kind == "store"]:
+            stores = [op for op in launch.task.body.ops if op.kind == "store"]
+            if origin[0] == "attention_dkv":
+                # dQ, stored row tile by row tile inside the loop over them.
+                stores += [op for loop in launch.task.body.ops for region in loop.regions for op in region.ops if op.kind == "store"]
+            for store in stores:
                 absorbed = _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only)
                 if absorbed is not None:
                     launches[i], j = absorbed
@@ -571,13 +698,32 @@ def _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only
     launch = launches[i]
     out = launch.buffers[store.attr("arg")]
     buffer = buffers[out]
-    if buffer.kind is not BufferKind.temp or writers.get(out) != [i] or len(readers.get(out, [])) != 1:
+    if buffer.kind is not BufferKind.temp or writers.get(out) != [i] or not readers.get(out):
         return None
-    j = readers[out][0]
+    # With other readers, only a narrowing cast is absorbed, and the original store stays: the
+    # task then writes both copies. A fused attention's f32 output is also read by its
+    # backward's D = rowsum(dO * O) (which keeps the f32 values: in bf16, the rounding would
+    # reach dS = P (dP - D) through the cancellation), and the separate cast pass read the f32
+    # copy again to write the bf16 one in the heads-merged layout (T5: 2.5 ms per step).
+    keep = len(readers[out]) > 1
+    if keep:
+        if shared_cheap_only:
+            return None
+        casts = [j for j in readers[out] if launches[j] is not None and j > i and (r := _cast_recipe(launches[j], buffers)) is not None and _narrowing_cast(r)]
+        if not casts:
+            return None
+        j = casts[0]
+    else:
+        j = readers[out][0]
     consumer = launches[j]
     if consumer is None or consumer.offsets or j < i:
         return None
     info = _pointwise(consumer, buffers)
+    if info is None and not shared_cheap_only:
+        # An attention's gradients are cast straight into the heads-merged layout.
+        info = _cast_recipe(consumer, buffers)
+        if info is not None and not _narrowing_cast(info):
+            info = None
     if info is None:
         return None
     if shared_cheap_only:
@@ -590,22 +736,49 @@ def _try_absorb(launches, i, store, buffers, readers, writers, shared_cheap_only
             # and the backward of silu: 23 MB of f32 per layer at 1024 x 5632).
             return None
     reads = [a for a, (n, arg) in enumerate(zip(consumer.buffers, consumer.task.args)) if n == out]
-    if len(reads) != 1 or launch.task.args[store.attr("arg")].view != full_view(buffer.type.shape):
+    if len(reads) != 1:
         return None
-    # The consumer reads the output whole, possibly with its axes permuted: perm[j] is
-    # the consumer axis of buffer axis j. Its other views and its output are permuted the
-    # same way, so the consumer can be evaluated on the producer's tile.
-    perm = _permutation(consumer.task.args[reads[0]].view, buffer.type.shape)
-    if perm is None:
-        return None
+    written = launch.task.args[store.attr("arg")].view
+    read = consumer.task.args[reads[0]].view
     target = consumer.buffers[info.store.attr("arg")]
-    if tuple(buffers[target].type.shape[perm[j]] for j in range(len(perm))) != buffer.type.shape:
-        return None
+    target_view = consumer.task.args[info.store.attr("arg")].view
+    perm = _permutation(read, buffer.type.shape) if written == full_view(buffer.type.shape) else None
+    if perm is not None:
+        # The consumer reads the output whole, possibly with its axes permuted: perm[j] is
+        # the consumer axis of buffer axis j. Its other views and its output are permuted the
+        # same way, so the consumer can be evaluated on the producer's tile.
+        # The consumer writes its whole target in its own coordinates, possibly through a permuted
+        # view (a cast of attention heads [B, H, S, D] into [B, S, H, D] for the output projection).
+        if tuple(target_view.shape[perm[j]] for j in range(len(perm))) != buffer.type.shape or target_view.pad is not None or product(target_view.shape) != product(buffers[target].type.shape):
+            return None
+        views = {a: _permuted(consumer.task.args[a].view, perm) for a in range(len(consumer.task.args))}
+        iota_axes = {a: j for j, a in enumerate(perm)}
+    else:
+        # A dot over merged row labels (from_graph._merged_contract) writes [8320, 384] where the
+        # consumer sees [128, 65, 384]: the consumer's axes are merged the same way. ViT's
+        # projections otherwise each took their bias in a pass of their own.
+        groups = None if keep else _merge_groups(read, written)
+        if groups is None:
+            return None
+        views = {a: _merged_view(consumer.task.args[a].view, groups) for a in range(len(consumer.task.args))}
+        if any(v is None for v in views.values()):
+            return None
+        # As in _merged_contract: without a source map the target is never row-aligned by
+        # normalize.align_rows, so it must not need to be.
+        if not views[info.store.attr("arg")].is_contiguous or target_view.offset != 0 or product(target_view.shape) != product(buffers[target].type.shape) or not _aligned_rows(target_view):
+            return None
+        if any(op.kind == "iota" for op in consumer.task.body.ops):
+            return None
+        iota_axes = {}
     # The consumer's other inputs must be ready when the producer runs.
     others = {n for n, a in zip(consumer.buffers, consumer.task.args) if not a.writes and n != out}
     if any(w > i for n in others for w in writers.get(n, [])):
         return None
-    return _absorb(launch, store, consumer, info, reads[0], perm), j
+    # The consumer's store moves up to launch i: nothing up to the consumer may read the target's
+    # old value (a parameter updated in place and still read by the backward), nor write it.
+    if any(i <= r < j for r in readers.get(target, [])) or any(i <= w < j for w in writers.get(target, [])):
+        return None
+    return _absorb(launch, store, consumer, info, reads[0], views, iota_axes, keep_store=keep), j
 
 
 def _permutation(view: View, shape) -> list[int] | None:
@@ -627,7 +800,44 @@ def _permuted(view: View, perm: list[int]) -> View:
     return View(tuple(view.shape[a] for a in perm), tuple(view.strides[a] for a in perm), view.offset, pad, view.fill, source)
 
 
-def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int, perm: list[int], keep_store: bool = False) -> Launch:
+def _merge_groups(view: View, merged: View) -> list[int] | None:
+    """How many consecutive axes of `view` make up each axis of `merged`, when both are the whole
+    of one contiguous buffer, else None."""
+    if not view.is_contiguous or not merged.is_contiguous or view.offset != 0 or merged.offset != 0 or not all(isinstance(d, int) for d in view.shape + merged.shape):
+        return None
+    groups, axis = [], 0
+    for d in merged.shape:
+        size, first = 1, axis
+        while axis < view.rank and (size < d or axis == first):
+            size *= view.shape[axis]
+            axis += 1
+        if size != d:
+            return None
+        groups.append(axis - first)
+    return groups if axis == view.rank else None
+
+
+def _merged_view(view: View, groups: list[int]) -> View | None:
+    """`view` with each group of consecutive axes as one, when they are one run in memory."""
+    if view.pad is not None:
+        return None
+    shape, strides, axis = [], [], 0
+    for n in groups:
+        sizes, steps = view.shape[axis : axis + n], view.strides[axis : axis + n]
+        if any(steps[k] != steps[k + 1] * sizes[k + 1] for k in range(n - 1)):
+            return None
+        shape.append(math.prod(sizes))
+        strides.append(steps[-1])
+        axis += n
+    return View(tuple(shape), tuple(strides), view.offset)
+
+
+def _aligned_rows(view: View) -> bool:
+    return isinstance(view.shape[-1], int) and view.shape[-1] % 8 == 0
+
+
+def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read_arg: int, views: dict[int, View], iota_axes: dict[int, int], keep_store: bool = False) -> Launch:
+    """views: the consumer's views over the producer's axes; iota_axes: consumer axis -> producer axis."""
     task = launch.task
     args: list[tuple[str, Arg]] = [(n, a) for n, a in zip(launch.buffers, task.args)]
 
@@ -637,8 +847,9 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
             args.append(key)
         return args.index(key)
 
+    home = next(body for body in (task.body, *(r for op in task.body.ops for r in op.regions)) if any(op is store for op in body.ops))
     b = TileBuilder()
-    b.ops = [op for op in task.body.ops if keep_store or op is not store]
+    b.ops = [op for op in home.ops if keep_store or op is not store]
     value, starts = store.inputs[0], list(store.inputs[1:])
     tile = value.type.shape
     p_tile = info.store.inputs[0].type.shape
@@ -653,10 +864,10 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
                 out = value
             else:
                 arg = consumer.task.args[a]
-                moved = replace(arg, view=_permuted(arg.view, perm))
+                moved = replace(arg, view=views[a])
                 out = b.op("load", *starts, arg=arg_index(consumer.buffers[a], moved), shape=tile, dtype=op.attr("dtype"), other=op.attr("other"))
         elif op.kind == "iota":
-            axis = perm.index(op.attr("axis"))
+            axis = iota_axes[op.attr("axis")]
             out = b.op("iota", starts[axis], shape=tile, axis=axis)
         elif op.kind in ("full", "broadcast") and op.outputs[0].type.shape == p_tile and p_tile != ():
             out = b.op(op.kind, *ins, **{**dict(op.attrs), "shape": tile})
@@ -666,8 +877,11 @@ def _absorb(launch: Launch, store: TOp, consumer: Launch, info: _Pointwise, read
     result = mapped[info.store.inputs[0]]
     target = consumer.buffers[info.store.attr("arg")]
     target_arg = consumer.task.args[info.store.attr("arg")]
-    b.emit("store", (result, *starts), {"arg": arg_index(target, replace(target_arg, view=_permuted(target_arg.view, perm)))})
-    body = Body(task.body.params, tuple(b.ops), task.body.results)
+    b.emit("store", (result, *starts), {"arg": arg_index(target, replace(target_arg, view=views[info.store.attr("arg")]))})
+    body = Body(home.params, tuple(b.ops), home.results)
+    if home is not task.body:
+        ops = tuple(replace(op, regions=tuple(body if r is home else r for r in op.regions)) for op in task.body.ops)
+        body = Body(task.body.params, ops, task.body.results)
     used = sorted({op.attr("arg") for op in _walk(body) if op.kind in _MEMORY})
     remap = {old: new for new, old in enumerate(used)}
     body = _renumber(body, remap)
@@ -735,7 +949,100 @@ def _try_absorb_row(launches, i, store, buffers, readers, writers, written):
         if others & written or any(w > i for n in others for w in writers.get(n, [])):
             continue
         keep = buffer.kind is not BufferKind.temp or any(r != j for r in readers.get(out, []))
-        return _absorb(launch, store, consumer, info, reads[0], list(range(len(buffer.type.shape))), keep_store=keep), j
+        return _absorb(launch, store, consumer, info, reads[0], {a: arg.view for a, arg in enumerate(consumer.task.args)}, {a: a for a in range(len(buffer.type.shape))}, keep_store=keep), j
+    return None
+
+
+class _Prologue(_Rewriter):
+    """Replaces a row task's loads of `name` by the task that computed it, keeping the value."""
+
+    def __init__(self, launch: Launch, name: str, recipe: _Pointwise, buffers: dict[str, Buffer]) -> None:
+        super().__init__(launch, {name: recipe}, Counter(), buffers)
+        self.name = name
+        self.value: TValue | None = None
+        self.at: tuple[TValue, ...] = ()
+
+    def allowed(self, op: TOp) -> _Pointwise | None:
+        return self.recipes[self.name] if op.kind == "load" and self.launch.buffers[op.attr("arg")] == self.name else None
+
+    def inline(self, b, load, recipe, starts, index=None) -> TValue:
+        if self.value is None:
+            self.value, self.at = super().inline(b, load, recipe, starts, index), tuple(starts)
+        return self.value
+
+
+def fuse_row_prologues(program: Program, window: int = 16) -> Program:
+    """Merge the pointwise task whose output a row-fused task reads into it, output included.
+
+    A residual sum is read by the layer normalization that follows and by much else (the next
+    residual sum, the backward), so it is written; the norm, a pass of its own, then read all of
+    it back (12.6 MB of f32 per norm of a DiT). The row task computes the sum itself, stores it,
+    and normalizes the row it holds. The mirror image of fuse_row_epilogues, and run after
+    fuse_epilogues: a task that a dot can absorb is better there.
+
+    The merged task takes the row task's place, so nothing between the two reads the sum or
+    writes what it is computed from; or the pointwise task's, where the row task's other
+    inputs must have been written.
+    """
+    launches = list(program.launches)
+    buffers = {b.name: b for b in program.buffers}
+    written_by: dict[str, int] = Counter(n for launch in launches for n, a in zip(launch.buffers, launch.task.args) if a.writes)
+    i = 0
+    while i < len(launches):
+        merged = _try_prologue(launches, i, buffers, written_by, window)
+        if merged is None:
+            i += 1
+            continue
+        new, j, place = merged
+        launches[place] = new
+        del launches[i if place == j else j]
+        # The merged task sits at j, or at i - 1 once j is gone; it may take another producer.
+        i = j if place == j else i - 1
+    return replace(program, launches=tuple(launches))
+
+
+def _try_prologue(launches, i, buffers, written_by, window) -> tuple[Launch, int, int] | None:
+    launch = launches[i]
+    if launch.task.origin != ("rows",) or launch.offsets or any(op.regions for op in launch.task.body.ops):
+        return None
+    for name, arg in zip(launch.buffers, launch.task.args):
+        if arg.writes or written_by[name] != 1 or arg.view != full_view(buffers[name].type.shape):
+            continue
+        if sum(n == name for n in launch.buffers) != 1:
+            continue
+        loads = [op for op in launch.task.body.ops if op.kind == "load" and launch.buffers[op.attr("arg")] == name]
+        if any(op.kind == "load_indexed" and launch.buffers[op.attr("arg")] == name for op in launch.task.body.ops):
+            continue
+        if not loads or any(op.inputs != loads[0].inputs or op.attr("shape") != loads[0].attr("shape") for op in loads):
+            continue
+        j = next((k for k in range(i - 1, max(-1, i - 1 - window), -1) if any(n == name and a.writes for n, a in zip(launches[k].buffers, launches[k].task.args))), None)
+        if j is None or launches[j].offsets:
+            continue
+        producer = launches[j]
+        info = _pointwise(producer, buffers)
+        if info is None or any(a.view.pad is not None for a in producer.task.args):
+            continue
+        if sum(op.kind == "load" for op in producer.task.body.ops) > PROLOGUE_LOADS:
+            continue
+        p_reads = {n for n, a in zip(producer.buffers, producer.task.args) if not a.writes}
+        reads = {n for n, a in zip(launch.buffers, launch.task.args) if not a.writes} - {name}
+        writes = {n for n, a in zip(launch.buffers, launch.task.args) if a.writes}
+        between = launches[j + 1 : i]
+        touched = {n for k in between for n in k.buffers}
+        written = {n for k in between for n, a in zip(k.buffers, k.task.args) if a.writes}
+        if name in p_reads or writes & p_reads:
+            continue
+        if name not in touched and not p_reads & written:
+            place = i
+        elif not reads & written and not writes & touched:
+            place = j
+        else:
+            continue
+        rewriter = _Prologue(launch, name, info, buffers)
+        body = rewriter.body(launch.task.body, {})
+        slot = rewriter.arg_index(name, replace(arg, writes=True))
+        store = TOp("store", (rewriter.value, *rewriter.at), (), (("arg", slot),))
+        return rewriter.finish(Body(body.params, (*body.ops, store), body.results)), j, place
     return None
 
 
@@ -876,7 +1183,12 @@ def fuse_siblings(program: Program, window: int = 32) -> Program:
     output is stored. A later task B moves to an earlier task A's place, so: B's inputs are all
     written before A, nothing between them touches B's output, and B reads A's outputs only
     through the views A stores them with, so the merged body passes A's values on directly (the
-    parameter update reads the moments just written).
+    parameter update reads the moments just written). Or A moves down to B's, under the same
+    conditions the other way around: the bias corrections of T5's AdamW come after the moments of
+    its embedding and before its update.
+
+    A merged task's stores that only it read are dropped at the end (a tied embedding's gradient,
+    summed from three parts and read by the moments: 66 MB).
     """
     buffers = {b.name: b for b in program.buffers}
     launches = list(program.launches)
@@ -914,18 +1226,42 @@ def fuse_siblings(program: Program, window: int = 32) -> Program:
                 b_out = {n for n, x in zip(b.buffers, b.task.args) if x.writes}
                 touched_between = {n for k in range(i + 1, j) for n in launches[k].buffers}
                 forwarded = [x.view == a_out[n].view for n, x in zip(b.buffers, b.task.args) if not x.writes and n in a_out]
-                if reads_b & written_between or b_out & touched_between or not all(forwarded):
+                if not all(forwarded) or not reads_a & reads_b and not forwarded:
                     continue
-                if not reads_a & reads_b and not forwarded:
+                if not (reads_b & written_between or b_out & touched_between):
+                    launches[i] = _merge(a, info_a, b, info_b)
+                    del launches[j]
+                elif not (reads_a & written_between or set(a_out) & touched_between):
+                    # A moves down to B instead.
+                    launches[j] = _merge(a, info_a, b, info_b)
+                    del launches[i]
+                else:
                     continue
-                launches[i] = _merge(a, info_a, b, info_b)
-                del launches[j]
                 changed = True
                 start = max(0, i - window)
                 break
             if changed:
                 break
-    return replace(program, launches=tuple(launches))
+    return _without_dead_stores(replace(program, launches=tuple(launches)))
+
+
+def _without_dead_stores(program: Program) -> Program:
+    """Drop pointwise tasks' stores to temps that nothing reads (other stores stay in the task)."""
+    read = {n for launch in program.launches for n, x in zip(launch.buffers, launch.task.args) if not x.writes} | set(program.outputs)
+    kinds = {b.name: b.kind for b in program.buffers}
+    launches = []
+    for launch in program.launches:
+        task = launch.task
+        dead = {k for k, (n, x) in enumerate(zip(launch.buffers, task.args)) if x.writes and kinds[n] is BufferKind.temp and n not in read}
+        ops = tuple(op for op in task.body.ops if not (op.kind == "store" and op.attr("arg") in dead))
+        if not dead or any(op.regions for op in task.body.ops) or not any(op.kind == "store" for op in ops):
+            launches.append(launch)
+            continue
+        used = sorted({op.attr("arg") for op in ops if op.kind in _MEMORY})
+        body = _renumber(Body(task.body.params, ops, task.body.results), {old: new for new, old in enumerate(used)})
+        launches.append(replace(launch, task=replace(task, args=tuple(task.args[k] for k in used), body=body), buffers=tuple(launch.buffers[k] for k in used)))
+    used = {n for launch in launches for n in launch.buffers} | set(program.inputs) | set(program.outputs)
+    return replace(program, launches=tuple(launches), buffers=tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp))
 
 
 def _merge(a: Launch, info_a: _Pointwise, b: Launch, info_b: _Pointwise) -> Launch:

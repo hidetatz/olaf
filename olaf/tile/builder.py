@@ -142,7 +142,7 @@ class TileBuilder:
         key = None
         if self.cse and not regions:
             if kind in ("store", "atomic_add", "atomic_add_indexed"):
-                self._seen = {k: v for k, v in self._seen.items() if k[0] not in ("load", "load_indexed")}
+                self.forget_loads()
             elif kind in ("load", "load_indexed") or (len(types) == 1 and types[0].shape == ()):
                 if kind in _FOLD and types[0] == TileType((), INDEX) and all(v in self._constants for v in inputs):
                     return (self.index(_FOLD[kind](*(self._constants[v] for v in inputs))),)
@@ -156,6 +156,10 @@ class TileBuilder:
             if kind == "full" and types[0] == TileType((), INDEX) and isinstance(attrs["value"], int):
                 self._constants[outputs[0]] = attrs["value"]
         return outputs
+
+    def forget_loads(self) -> None:
+        """For ops appended to self.ops directly: after a store, no earlier load is reused."""
+        self._seen = {k: v for k, v in self._seen.items() if k[0] not in ("load", "load_indexed")}
 
     def op(self, kind: str, *inputs: TValue, **attrs) -> TValue:
         return self.emit(kind, inputs, attrs)[0]

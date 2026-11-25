@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import math
-
 from dataclasses import replace
 
 from olaf.graph.dim import Dim
-from olaf.graph.types import DType
-from olaf.tile.ir import Arg, BufferKind, Launch, Program, Task, View, contiguous_strides
+from olaf.graph.types import DType, TensorType
+from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, View, contiguous_strides
 
 _TWO_BYTE = (DType.bf16,)
 
@@ -96,12 +95,18 @@ def eliminate_copies(program: Program) -> Program:
     is a temp written once, through its full view, the writer can write the target instead and
     every other reader reads the target. Conditions: the copy reads and writes full views of
     equally typed contiguous buffers, and nothing touches the target before the copy.
+
+    Likewise when the writer stores through some other view of the whole buffer and the copy, its
+    only reader, reads through that same view: the writer's coordinates are the copy's, so it
+    stores through the copy's target view (a qkv gradient stacked as [3, 32, 6, 256, 64] and
+    copied into the [32, 256, 3, 6, 64] rows its products read).
     """
     from olaf.tile.ir import full_view
 
     buffers = {b.name: b for b in program.buffers}
     launches = list(program.launches)
     rename: dict[str, str] = {}
+    retargeted: dict[int, Launch] = {}
     removed: set[int] = set()
     touches: dict[str, list[int]] = {}
     writers: dict[str, list[int]] = {}
@@ -117,9 +122,18 @@ def eliminate_copies(program: Program) -> Program:
         if src_arg.writes or not dst_arg.writes or not _pure_copy(launch.task):
             continue
         a, b = buffers[src], buffers[dst]
-        if a.kind is not BufferKind.temp or a.type != b.type or a.strides is not None or b.strides is not None:
+        if a.kind is not BufferKind.temp or a.strides is not None or b.strides is not None:
             continue
-        if src_arg.view != full_view(a.type.shape) or dst_arg.view != full_view(b.type.shape):
+        w = writers.get(src, [])
+        if a.type.dtype is b.type.dtype and len(w) == 1 and w[0] < i and w[0] not in retargeted and touches[src] == [w[0], i] and src not in program.outputs and writers.get(dst) == [i] and min(touches[dst]) == i and not (src_arg.view == full_view(a.type.shape) and dst_arg.view == full_view(b.type.shape)):
+            writer = launches[w[0]]
+            # All of both buffers, in some order: every element of the target is then stored.
+            if not writer.offsets and Arg(src_arg.view, a.type.dtype, True) in writer.task.args and _whole(src_arg.view, a.type.shape) and _whole(dst_arg.view, b.type.shape):
+                args = tuple(dst_arg if n == src else arg for n, arg in zip(writer.buffers, writer.task.args))
+                retargeted[w[0]] = replace(writer, task=replace(writer.task, args=args), buffers=tuple(dst if n == src else n for n in writer.buffers))
+                removed.add(i)
+            continue
+        if a.type != b.type or src_arg.view != full_view(a.type.shape) or dst_arg.view != full_view(b.type.shape):
             continue
         w = writers.get(src, [])
         if len(w) != 1 or w[0] >= i or writers.get(dst) != [i] or min(touches[dst]) != i:
@@ -130,15 +144,39 @@ def eliminate_copies(program: Program) -> Program:
             continue
         rename[src] = dst
         removed.add(i)
-    if not rename:
+    if not removed:
         return program
     out = []
     for i, launch in enumerate(launches):
         if i in removed:
             continue
+        launch = retargeted.get(i, launch)
         out.append(replace(launch, buffers=tuple(rename.get(n, n) for n in launch.buffers)))
-    kept = tuple(b for b in program.buffers if b.name not in rename)
+    used = {n for launch in out for n in launch.buffers} | set(program.inputs) | set(program.outputs)
+    kept = tuple(b for b in program.buffers if b.name not in rename and (b.name in used or b.kind is not BufferKind.temp))
     return replace(program, buffers=kept, launches=tuple(out), outputs=tuple(rename.get(n, n) for n in program.outputs))
+
+
+def _whole(view: View, shape) -> bool:
+    """The view shows every element of a contiguous buffer of `shape` once, its axes reordered."""
+    axes = sorted((st, d) for st, d in zip(view.strides, view.shape) if d != 1)
+    return view.pad is None and view.offset == 0 and axes == sorted((st, d) for st, d in zip(contiguous_strides(shape), shape) if d != 1)
+
+
+def _every_element(view: View, shape) -> bool:
+    """As _whole, whose axes may also split the buffer's (a full view, symbolic or not, is one)."""
+    if view.pad is not None or view.offset != 0:
+        return False
+    if view.shape == tuple(shape) and view.strides == contiguous_strides(shape):
+        return True
+    if not all(isinstance(d, int) for d in (*view.shape, *view.strides, *shape)):
+        return False
+    size = 1
+    for st, d in sorted((st, d) for st, d in zip(view.strides, view.shape) if d != 1):
+        if st != size:
+            return False
+        size *= d
+    return size == math.prod(shape)
 
 
 def eliminate_pad_copies(program: Program) -> Program:
@@ -359,7 +397,9 @@ def eliminate_concats(program: Program) -> Program:
     gradient joins dq, dk and dv along its last axis. When input j is a contiguous buffer that
     only the concat reads, and its slice of the output can be shown in j's shape as a strided
     view (an offset block, or rows of a block when the concat axis is inner), its producer
-    stores there directly and the concat disappears.
+    stores there directly and the concat disappears. An input accumulated with atomics (dQ) is
+    copied into its slice, when most inputs are not: the output would have to start at zero and
+    be in the accumulator's type.
     """
     from olaf.tile.ir import full_view
 
@@ -371,6 +411,7 @@ def eliminate_concats(program: Program) -> Program:
             (writers if arg.writes else readers).setdefault(name, []).append(i)
     launches = list(program.launches)
     removed: set[int] = set()
+    copied: dict[int, list[Launch]] = {}
     moved: set[str] = set()
     for i, launch in enumerate(program.launches):
         casts = _select_casts(launch.task) if launch.task.origin == ("concat",) and not launch.offsets else None
@@ -381,15 +422,18 @@ def eliminate_concats(program: Program) -> Program:
             continue
         out, out_arg = outs[0]
         target = buffers[out]
-        if out_arg.view != full_view(target.type.shape) or writers.get(out) != [i] or target.strides is not None:
+        # The whole output, in any axis order: a concat retargeted by eliminate_copies writes q, k
+        # and v's gradients straight into the rows their projection reads.
+        if not _every_element(out_arg.view, target.type.shape) or writers.get(out) != [i] or target.strides is not None:
             continue
         if any(r < i for r in readers.get(out, [])):
             continue
-        plan = _concat_plan(program, launch, target, buffers, readers, writers, i)
-        if plan is None:
+        planned = _concat_plan(program, launch, out_arg.view, buffers, readers, writers, i)
+        if planned is None:
             continue
+        plan, copies = planned
         cast_of = {launch.buffers[k]: dtype for k, dtype in casts.items()}
-        if any((cast_of.get(name) or buffers[name].type.dtype) != target.type.dtype for _, name, *_ in plan):
+        if any((cast_of.get(name) or buffers[name].type.dtype) != target.type.dtype for name in [p[1] for p in plan] + [c[0] for c in copies]):
             continue  # an input the concat would cast to another type than the output's
         if any(name in moved for _, name, *_ in plan):
             continue  # already stored into another concat's output
@@ -411,9 +455,10 @@ def eliminate_concats(program: Program) -> Program:
                 task = _store_cast(task, next(k for k, (n, a) in enumerate(zip(producer.buffers, args)) if n == name and a.writes), cast_of[name])
             launches[j] = Launch(task, tuple(out if n == name else n for n in producer.buffers))
         removed.add(i)
+        copied[i] = [Launch(_copy_task(full_view(buffers[name].type.shape), buffers[name].type.dtype, view, target.type.dtype), (name, out)) for name, view in copies]
     if not removed:
         return program
-    kept = [launch for i, launch in enumerate(launches) if i not in removed]
+    kept = [l for i, launch in enumerate(launches) for l in (copied[i] if i in removed else [launch])]
     used = {n for launch in kept for n in launch.buffers} | set(program.inputs) | set(program.outputs)
     return replace(program, launches=tuple(kept), buffers=tuple(b for b in program.buffers if b.name in used or b.kind is not BufferKind.temp))
 
@@ -442,27 +487,33 @@ def _select_casts(task: Task) -> dict[int, DType] | None:
 
 def _store_cast(task: Task, arg: int, dtype: DType) -> Task:
     """task with its stores to `arg` cast to dtype first (the cast a concat applied to it)."""
-    from olaf.tile.ir import TileType, TOp, TValue
+    from olaf.tile.ir import Body, TileType, TOp, TValue
 
-    ops = []
-    for op in task.body.ops:
-        if op.kind == "store" and op.attr("arg") == arg:
-            value = op.inputs[0]
-            cast = TValue(TileType(value.type.shape, dtype))
-            ops.append(TOp("cast", (value,), (cast,), (("dtype", dtype),)))
-            op = TOp(op.kind, (cast, *op.inputs[1:]), op.outputs, op.attrs, op.regions)
-        ops.append(op)
+    def rewrite(body: Body) -> Body:
+        ops = []
+        for op in body.ops:
+            if op.kind == "store" and op.attr("arg") == arg:
+                value = op.inputs[0]
+                cast = TValue(TileType(value.type.shape, dtype))
+                ops.append(TOp("cast", (value,), (cast,), (("dtype", dtype),)))
+                op = TOp(op.kind, (cast, *op.inputs[1:]), op.outputs, op.attrs)
+            elif op.regions:  # an attention stores dQ in its loop over row tiles
+                op = TOp(op.kind, op.inputs, op.outputs, op.attrs, tuple(rewrite(r) for r in op.regions))
+            ops.append(op)
+        return replace(body, ops=tuple(ops))
+
     args = tuple(replace(a, dtype=dtype) if k == arg else a for k, a in enumerate(task.args))
-    return Task(task.name, task.grid, args, replace(task.body, ops=tuple(ops)), task.warps, task.origin)
+    return Task(task.name, task.grid, args, rewrite(task.body), task.warps, task.origin)
 
 
-def _concat_plan(program: Program, launch: Launch, target, buffers, readers, writers, index: int):
-    """[(producer launch index, its store view into the concat output)] for every input, or None."""
+def _concat_plan(program: Program, launch: Launch, output: View, buffers, readers, writers, index: int):
+    """([(producer launch index, input, its store view into the concat output, its other readers,
+    their offset)], [(input, its slice of the output)] for inputs to copy there), or None."""
     from olaf.tile.from_graph import _reshaped_strides
     from olaf.tile.ir import full_view
 
-    shape = target.type.shape
-    plan = []
+    shape = output.shape
+    plan, copies = [], []
     for name, arg in zip(launch.buffers, launch.task.args):
         if arg.writes:
             continue
@@ -480,7 +531,7 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         source = buffers[name]
         if source.strides is not None:
             return None
-        out_strides = contiguous_strides(shape)
+        out_strides = output.strides
         if not isinstance(lo, int) or not isinstance(out_strides[axis], int):
             return None
         block = View(logical, out_strides, lo * out_strides[axis])
@@ -491,6 +542,9 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
         if strides is None:
             return None
         w = writers.get(name, [])
+        if all(x < index for x in w) and _has_atomics(program, w, name):
+            copies.append((name, View(source.type.shape, strides, block.offset)))
+            continue
         if len(w) != 1 or index not in readers.get(name, []) or source.kind is not BufferKind.temp or w[0] > index:
             return None
         # Other readers (an RNN's bf16 state, stacked for the weight gradient and read by the
@@ -504,15 +558,44 @@ def _concat_plan(program: Program, launch: Launch, target, buffers, readers, wri
             return None
         stores = [a for n, a in zip(producer.buffers, producer.task.args) if n == name]
         has_store = any(op.kind == "store" for op in _ops(producer.task.body))
-        # Atomics into this input would have to see the other inputs' slices as zeros.
-        has_atomic = any(op.kind.startswith("atomic") and producer.buffers[op.attr("arg")] == name for op in _ops(producer.task.body))
-        if len(stores) != 1 or not stores[0].writes or not has_store or has_atomic:
+        if len(stores) != 1 or not stores[0].writes or not has_store:
             return None
         composed = _compose(stores[0].view, source.type.shape, strides, block.offset)
         if composed is None:
             return None
         plan.append((w[0], name, composed, others, block.offset))
-    return plan or None
+    # Copies of the rest are worth it when they are the smaller part (an attention's dQ, of dQ,
+    # dK and dV).
+    return (plan, copies) if len(plan) > len(copies) else None
+
+
+def _has_atomics(program: Program, writers, name: str) -> bool:
+    """Some task adds into the buffer atomically: it accumulates there, in its own dtype and
+    from zero, and its value is whole only after the last of its writers."""
+    return any(op.kind.startswith("atomic") and program.launches[w].buffers[op.attr("arg")] == name for w in writers for op in _ops(program.launches[w].task.body))
+
+
+def _copy_task(view: View, dtype: DType, into: View, to: DType) -> Task:
+    """An elementwise copy between views of one shape, cast to the target's type."""
+    from olaf.tile.builder import INDEX, TileBuilder
+    from olaf.tile.ir import TileType, TValue
+
+    tile = [1] * view.rank
+    budget = 1024
+    for a in range(view.rank - 1, -1, -1):
+        tile[a] = min(budget, 128, 1 << max(view.shape[a] - 1, 0).bit_length())
+        budget //= tile[a]
+        if budget < 2 or tile[a] < view.shape[a] and a < view.rank - 1:
+            break
+    grid = tuple(-(-d // t) for d, t in zip(view.shape, tile))
+    b = TileBuilder()
+    pids = [TValue(TileType((), INDEX)) for _ in grid]
+    starts = [p if t == 1 else b.op("mul", p, b.index(t)) for p, t in zip(pids, tile)]
+    value = b.op("load", *starts, arg=0, shape=tuple(tile), dtype=dtype, other=0)
+    if dtype is not to:
+        value = b.op("cast", value, dtype=to)
+    b.emit("store", (value, *starts), {"arg": 1})
+    return Task("copy", grid, (Arg(view, dtype, False), Arg(into, to, True)), b.finish(pids), 4, ("copy",))
 
 
 def _permuted_strides(read: View, logical, shape, out_strides) -> tuple | None:

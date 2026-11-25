@@ -528,6 +528,51 @@ def test_epilogue_fusion_absorbs_elementwise_after_a_dot():
     assert rel(run_program(after, [x, w, bias])[0][0], interpret(graph, [x, w, bias])[0][0]) < 1e-5
 
 
+@pytest.mark.parametrize("residual", ["full", "per_token"])
+def test_epilogue_over_merged_row_labels(residual):
+    rng = np.random.default_rng(9)
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.tile.fuse import fuse_epilogues
+
+    x, w = rng.normal(size=(6, 5, 40)).astype(np.float32), rng.normal(size=(40, 24)).astype(np.float32)
+    bias = rng.normal(size=(24,)).astype(np.float32)
+    r = rng.normal(size=(6, 5, 24) if residual == "full" else (5, 24)).astype(np.float32)
+
+    def fn(a, b, c, d):
+        h = olaf.einsum("bsi,io->bso", olaf.cast(a, olaf.bf16), olaf.cast(b, olaf.bf16)) + olaf.cast(olaf.broadcast_to(c, (6, 5, 24)), olaf.bf16)
+        return olaf.cast(h, olaf.f32) + olaf.broadcast_to(d, (6, 5, 24))
+
+    graph = lower(olaf.trace(fn, *(tt(*v.shape) for v in (x, w, bias, r))).graph)
+    before = fuse(to_tile(graph, AMPERE_RTX3060))
+    after = fuse_epilogues(before)
+    # [5, 24] repeated over the batch is not one run in memory, so that residual is not absorbed:
+    # the bias and the residual are one task by then, which stays.
+    assert len(before.launches) - len(after.launches) == (1 if residual == "full" else 0)
+    assert any(a.view.shape == (30, 24) for l in after.launches for a in l.task.args)
+    assert rel(run_program(after, [x, w, bias, r])[0][0], interpret(graph, [x, w, bias, r])[0][0]) < 1e-5
+
+
+def test_epilogue_does_not_move_a_store_before_a_reader_of_its_target():
+    rng = np.random.default_rng(9)
+    # The overwrite of c would be absorbed into the dot that feeds it, above a reader of c's old value.
+    from dataclasses import replace
+
+    from olaf.tile.fuse import fuse_epilogues
+
+    x, w, p = (rng.normal(size=n).astype(np.float32) for n in ((6, 40), (40, 24), (6, 24)))
+    graph = lower(olaf.trace(lambda a, b, c: ((a @ b) * 0.1, olaf.sum(c, axis=0)), tt(6, 40), tt(40, 24), tt(6, 24)).graph)
+    program = fuse(to_tile(graph))
+    dot = next(l for l in program.launches if l.task.origin[0] == "contract")
+    c = program.inputs[2]
+    update = next(l for l in program.launches if l is not dot and program.outputs[0] in l.buffers)
+    reader = next(l for l in program.launches if program.outputs[1] in l.buffers)
+
+    in_place = replace(update, buffers=tuple(c if n == program.outputs[0] else n for n in update.buffers))
+    for order, absorbed in (((dot, reader, in_place), False), ((reader, dot, in_place), True), ((dot, reader, update), True)):
+        after = fuse_epilogues(replace(program, launches=order))
+        assert (len(after.launches) == 2) == absorbed
+
+
 def test_reshape_of_strided_views_stays_a_view():
     # The q/k/v slices of a fused projection split into heads without a copy.
     def fn(x):
@@ -598,6 +643,37 @@ def test_sibling_fusion_shares_loads_between_outputs():
     assert rel(got[0], want[0]) < 1e-6
     for name in "mvp":
         assert rel(got_state[name], want_state[name]) < 1e-6
+
+
+def test_sibling_fusion_sinks_a_task_below_what_the_other_waits_for():
+    rng = np.random.default_rng(9)
+    # The update needs a scale computed (from the step count) after the moment's task: the moment
+    # moves down to the update, and the summed gradient only they read is not stored.
+    from olaf.pipeline import to_program
+
+    m_state, p_state, n_state = olaf.state("m", tt(4, 300)), olaf.state("p", tt(4, 300)), olaf.state("n", tt())
+
+    def fn(a, b):
+        g = a * b + olaf.exp(a)
+        m = m_state.read() * 0.9 + g
+        n = n_state.read() + 1.0
+        m_state.write(m)
+        n_state.write(n)
+        p_state.write(p_state.read() - m * olaf.broadcast_to(olaf.exp(n), (4, 300)) * g)
+        return n
+
+    graph = lower(olaf.trace(fn, tt(4, 300), tt(4, 300)).graph)
+    program = to_program(graph)
+    wide = [l for l in program.launches if any(a.view.shape == (4, 300) for a in l.task.args)]
+    assert len(wide) == 1
+    kinds = {b.name: b.kind for b in program.buffers}
+    assert all(kinds[n] != "temp" for n, a in zip(wide[0].buffers, wide[0].task.args) if a.writes)
+    a, b = rng.normal(size=(4, 300)).astype(np.float32), rng.normal(size=(4, 300)).astype(np.float32)
+    state = {"m": rng.normal(size=(4, 300)).astype(np.float32), "p": rng.normal(size=(4, 300)).astype(np.float32), "n": np.float32(0.5)}
+    _, got = run_program(program, [a, b], state)
+    _, want = interpret(graph, [a, b], state)
+    for name in state:
+        assert rel(got[name], want[name]) < 1e-5
 
 
 def test_scan_gradient_stacks_are_written_in_place():
@@ -806,6 +882,63 @@ def test_widened_sum_with_per_channel_terms_is_recomputed_in_each_reader():
     assert rel(got[1].astype(np.float32), want[1].astype(np.float32)) < 1e-2
 
 
+def test_relu_of_a_batch_norm_writes_only_its_output():
+    # relu(normalize(x)) read by two tasks (a sum and a product, as a conv and its weight
+    # gradient read an activation) and differentiated: the backward's mask is read back from
+    # the output (passes.select_mask), so once fusion merges the mask into its select (the
+    # reader counts are kept up to date) the normalization goes in too, loaded once, and the
+    # pre-activation is never written.
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import to_program
+
+    shape = (32, 8, 8, 32)
+    x = bf16_round(R.normal(size=shape).astype(np.float32))
+    m, s = R.normal(size=(32,)).astype(np.float32), R.normal(size=(32,)).astype(np.float32)
+
+    def fn(x, m, s):
+        def loss(x):
+            y = (olaf.cast(x, F32) - olaf.broadcast_to(m, shape)) * olaf.rsqrt(olaf.broadcast_to(s * s + 1.0, shape))
+            z = olaf.nn.relu(olaf.cast(y, olaf.bf16))
+            return olaf.sum(olaf.cast(z, F32)) + olaf.sum(olaf.cast(z * z, F32))
+
+        return olaf.value_and_grad(loss)(x)
+
+    graph = lower(olaf.trace(fn, tt(*shape, dtype=olaf.bf16), tt(32), tt(32)).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    sizes = {buf.name: math.prod(buf.type.shape) for buf in program.buffers}
+    written = [name for launch in program.launches for name, arg in zip(launch.buffers, launch.task.args) if arg.writes and sizes[name] == math.prod(shape)]
+    # The output and the input gradient only.
+    assert len(written) == 2, written
+    got, want = run_program(program, [x, m, s])[0], interpret(graph, [x, m, s])[0]
+    for a, e in zip(olaf.tree_flatten(got)[0], olaf.tree_flatten(want)[0]):
+        assert rel(np.asarray(a, np.float32), np.asarray(e, np.float32)) < 1e-2
+
+
+def test_cheap_producer_of_several_tensors_is_written_once():
+    # A ReLU gradient over the sum of two incoming gradients (three tensors, three cheap ops)
+    # read by a column sum and a pointwise task: rereading the three in both moves more bytes
+    # than writing the result once, so it is not duplicated (fuse._duplication_pays).
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.graph.ir import bf16_round
+    from olaf.pipeline import to_program
+
+    shape = (64, 8, 8, 32)
+    z, g1, g2 = (bf16_round(R.normal(size=shape).astype(np.float32)) for _ in range(3))
+
+    def fn(z, g1, g2):
+        c = olaf.where(z > 0.0, g1 + g2, 0.0)
+        return olaf.sum(olaf.cast(c, F32), axis=(0, 1, 2)), c * z
+
+    graph = lower(olaf.trace(fn, *(tt(*shape, dtype=olaf.bf16) for _ in range(3))).graph)
+    program = to_program(graph, AMPERE_RTX3060)
+    adds = [launch for launch in program.launches if any(op.kind == "add" and op.outputs[0].type.dtype is olaf.bf16 for op in _walk_ops(launch))]
+    assert len(adds) == 1
+    got, want = run_program(program, [z, g1, g2])[0], interpret(graph, [z, g1, g2])[0]
+    for a, e in zip(got, want):
+        assert rel(np.asarray(a, np.float32), np.asarray(e, np.float32)) < 1e-2
+
+
 def test_strided_conv_backward_copies_each_value_into_one_grid():
     # A stride-2 3x3 layer's input gradient pads every phase like the most padded one, and its
     # weight gradient reads the forward's grid of the input: one padded grid per value.
@@ -847,6 +980,27 @@ def test_strided_conv_input_gradient_phases(kernel, pad):
     assert copies == 0, writes
     for p in (program, to_program(graph, AMPERE_RTX3060)):
         assert rel(run_program(p, [x, w])[0][0], interpret(graph, [x, w])[0][0]) < 1e-5
+
+
+def test_later_inlining_rounds_leave_small_tiled_producers():
+    # A 5x5 depthwise stencil is tiled small for its 25 taps. The rounds that follow merged
+    # readers must not put it into a larger tile (EfficientNet's step: 52 to 76 ms).
+    from collections import Counter
+
+    from olaf.backend.capability import AMPERE_RTX3060
+    from olaf.tile.fuse import _inline_into, _pointwise
+
+    x, w = R.normal(size=(8, 32, 16, 16)).astype(np.float32), R.normal(size=(32, 1, 5, 5)).astype(np.float32)
+    graph = lower(olaf.trace(lambda x, w: olaf.exp(olaf.conv(x, w, 1, 2, groups=32)), tt(*x.shape), tt(*w.shape)).graph)
+    program = to_tile(graph, AMPERE_RTX3060)
+    buffers = {b.name: b for b in program.buffers}
+    (stencil,) = [launch for launch in program.launches if sum(op.kind == "load" for op in _walk_ops(launch)) >= 25]
+    (out,) = [name for name, arg in zip(stencil.buffers, stencil.task.args) if arg.writes]
+    (consumer,) = [launch for launch in program.launches if launch is not stencil and out in launch.buffers]
+    recipes = {out: _pointwise(stencil, buffers)}
+    assert recipes[out] is not None
+    assert _inline_into(consumer, recipes, Counter({out: 1}), buffers, {out}) is consumer
+    assert rel(run_program(fuse(program), [x, w])[0][0], interpret(graph, [x, w])[0][0]) < 1e-5
 
 
 @pytest.mark.parametrize("channels,columns", [(64, 64), (96, 32), (144, 16), (192, 64), (40, 16), (5, 8)])
@@ -917,3 +1071,30 @@ def test_concat_of_channels_last_inputs_is_tiled_in_memory_order():
     expected = interpret(graph, [x, w, v])[0][0]
     for p in (program, fuse(program), to_program(graph, AMPERE_RTX3060)):
         assert rel(run_program(p, [x, w, v])[0][0], expected) < 1e-5
+
+
+@pytest.mark.parametrize("early_reader", [False, True])
+def test_row_task_takes_the_residual_sum_it_normalizes(early_reader):
+    # The residual sum is read by the norm and by others: the norm's row task computes and stores
+    # it, at its own place, or (when something in between reads the sum) at the sum's.
+    from olaf.tile.fuse import fuse_row_prologues
+    from olaf.tile.rows import fuse_rows
+
+    rng = np.random.default_rng(13)
+    # 40 wide: the row tile has lanes past the row, where the sum must not reach the statistics.
+    x, y = (rng.normal(size=(3, 6, 40)).astype(np.float32) for _ in range(2))
+
+    def fn(x, y):
+        h = olaf.exp(x) + olaf.tanh(y) * 3.0 + 1.0
+        if early_reader:
+            return olaf.sum(olaf.sin(h), axis=0), olaf.layernorm(h) * olaf.cos(h)
+        return olaf.layernorm(h), olaf.sum(olaf.sin(h), axis=0)
+
+    graph = lower(olaf.trace(fn, tt(3, 6, 40), tt(3, 6, 40)).graph)
+    before = fuse_rows(fuse(to_tile(graph)))
+    after = fuse_row_prologues(before)
+    assert len(after.launches) == len(before.launches) - 1
+    (rows,) = [launch for launch in after.launches if launch.task.name == "rows"]
+    assert {"exp", "tanh"} <= {op.kind for op in rows.task.body.ops} and sum(a.writes for a in rows.task.args) == 2
+    for a, e in zip(run_program(after, [x, y])[0], interpret(graph, [x, y])[0]):
+        assert rel(a, e) < 1e-5
