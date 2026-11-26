@@ -1,43 +1,64 @@
 """Programs build and compile (to PTX) for every described NVIDIA target, without the device.
 
 Only the development machine's GPU can run anything; the other descriptors (A100, RTX 4090,
-H100) come from documentation. Building the training steps of two models with each descriptor
+H100) come from documentation. Building every model's training step with each descriptor
 exercises the decisions taken from it (split reductions by unit count, dot schedules,
 shared memory), and compiling every task for its target catches code generation that would
 only work for sm_86.
 """
+
+import importlib
 
 import numpy as np
 import pytest
 
 import olaf
 from olaf.backend.capability import NVIDIA
-from olaf.examples import mixtral
 from olaf.pipeline import lower_graph, to_program
 
-import test_cnn
-import test_mixtral
+# Every model with a training gate: the step each gate trains, in bf16 where the gate has a
+# bf16 variant. Task kinds come with models (depthwise stencils, attention with a bias, the
+# scan of Mamba-2), so a target is only covered when every model's tasks compile for it.
+CASES = ["mlp", "cnn", "resnet", "llama", "mixtral", "whisper", "unet", "bert", "t5", "mobilenet", "efficientnet", "convnext", "vit", "dit", "mamba2", "gat", "rnn", "lstm"]
 
 
-def mixtral_step(capability):
-    model = mixtral.Mixtral(test_mixtral.CONFIG, olaf.bf16)
-    traced, _ = olaf.train_step(test_mixtral.case(olaf.bf16).olaf_loss, model.init(np.random.default_rng(0)), lambda t: olaf.AdamW(t), *test_mixtral.SPECS)
+def case_step(name):
+    def build(capability):
+        c = importlib.import_module(f"test_{name}").case(olaf.bf16)
+        traced, _ = olaf.train_step(c.olaf_loss, c.params, lambda t: olaf.AdamW(t), *c.input_specs, buffers=c.buffers)
+        return to_program(lower_graph(traced.graph), capability)
+
+    return build
+
+
+def dcgan_step(capability):
+    import test_dcgan
+    from olaf.examples import dcgan
+
+    g, d, b = test_dcgan.params(1)
+    traced, _ = dcgan.gan_step(test_dcgan.CONFIG, g, d, b, test_dcgan.ADAM, test_dcgan.ADAM, test_dcgan.BATCH)
     return to_program(lower_graph(traced.graph), capability)
 
 
-def cnn_step(capability):
-    c = test_cnn.case(olaf.bf16)
-    traced, _ = olaf.train_step(c.olaf_loss, c.params, lambda t: olaf.SGD(t, lr=0.1, momentum=0.9), *c.input_specs)
+def gpt2_step(capability):
+    from test_gpt2 import small_model, split_params
+    from test_training import train_step
+
+    model = small_model()
+    traced, _ = train_step(split_params(model), model.config, 2, 16)
     return to_program(lower_graph(traced.graph), capability)
+
+
+BUILDS = {**{name: case_step(name) for name in CASES}, "dcgan": dcgan_step, "gpt2": gpt2_step}
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("capability", NVIDIA, ids=lambda c: c.target)
-@pytest.mark.parametrize("build", [mixtral_step, cnn_step], ids=["mixtral", "cnn"])
-def test_programs_compile_for_target(capability, build):
+@pytest.mark.parametrize("model", list(BUILDS))
+def test_programs_compile_for_target(capability, model):
     from olaf.backend.cuda.runtime import compile_for
 
-    program = build(capability)
+    program = BUILDS[model](capability)
     ptx = compile_for(program, capability)
     assert len(ptx) == len(program.tasks())
     for kernels in ptx.values():
