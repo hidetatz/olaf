@@ -7,7 +7,7 @@ from dataclasses import replace
 
 from olaf.graph.dim import Dim
 from olaf.graph.types import DType, TensorType
-from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, View, contiguous_strides
+from olaf.tile.ir import Arg, Buffer, BufferKind, Launch, Program, Task, TValue, View, contiguous_strides
 
 _TWO_BYTE = (DType.bf16,)
 
@@ -702,3 +702,132 @@ def _ops(body):
         yield op
         for r in op.regions:
             yield from _ops(r)
+
+
+def skip_masked_tiles(program: Program) -> Program:
+    """A task whose every store is where(iota(axis) < count, x, 0), with `count` read from
+    memory (a mixture of experts' token buffers past each expert's tokens, examples/mixtral.py),
+    runs its loads and arithmetic only where the tile starts below the count: past it, it
+    stores the zeros alone. The masked lanes of a load still issue one load of the view's first
+    element (lowering stays branch-free), so masking the loads would not save the traffic.
+
+    Runs after fusion: the loop it introduces would stop the task from being inlined or merged,
+    and the stores it checks are the final ones. It matches stored values, not where the task
+    came from, so whatever fusion merged into the task is covered by the check.
+    """
+    buffers = {b.name: b for b in program.buffers}
+    launches = []
+    for launch in program.launches:
+        body = _skipping_masked(launch, buffers)
+        launches.append(launch if body is None else replace(launch, task=replace(launch.task, body=body)))
+    return replace(program, launches=tuple(launches))
+
+
+def _skipping_masked(launch: Launch, buffers: dict[str, Buffer]):
+    from olaf.tile.builder import INDEX, TileBuilder
+    from olaf.tile.ir import Body, TileType, TOp
+
+    task = launch.task
+    body = task.body
+    if any(op.regions or op.kind in ("atomic_add", "atomic_add_indexed", "load_indexed", "dot", "reduce") for op in body.ops):
+        return None
+    written = {name for name, arg in zip(launch.buffers, task.args) if arg.writes}
+    if any(name in written for name, arg in zip(launch.buffers, task.args) if not arg.writes):
+        return None  # the loads move before the stores
+    producer = {out: op for op in body.ops for out in op.outputs}
+
+    def through_broadcast(v):
+        op = producer.get(v)
+        while op is not None and op.kind == "broadcast":
+            op = producer.get(op.inputs[0])
+        return op
+
+    def zero(v) -> bool:
+        op = through_broadcast(v)
+        if op is None:
+            return False
+        if op.kind == "full":
+            return op.attr("value") == 0
+        if op.kind == "load":
+            buffer = buffers[launch.buffers[op.attr("arg")]]
+            return buffer.kind is BufferKind.constant and buffer.constant is not None and _all_zero(buffer.constant)
+        return False
+
+    def mask(v):
+        """(iota start, axis, count load, its casts) of cond = iota(axis) < count."""
+        cmp = producer.get(v)
+        if cmp is None or cmp.kind != "cmp" or cmp.attr("fn") != "lt":
+            return None
+        iota = producer.get(cmp.inputs[0])
+        if iota is None or iota.kind != "iota":
+            return None
+        casts, op = [], producer.get(cmp.inputs[1])
+        while op is not None and op.kind == "cast":
+            casts.append(op.attr("dtype"))
+            op = producer.get(op.inputs[0])
+        if op is None or op.kind != "load" or op.attr("dtype").is_float and not casts:
+            return None
+        axis = iota.attr("axis")
+        view = task.args[op.attr("arg")].view
+        shape = op.attr("shape")
+        # One count per tile: it may vary only along axes the tile does not extend over.
+        if any(n > 1 and view.strides[d] != 0 for d, n in enumerate(shape)) or view.strides[axis] != 0:
+            return None
+        return iota.inputs[0], axis, op, tuple(casts)
+
+    stores = [op for op in body.ops if op.kind == "store"]
+    if not stores:
+        return None
+    found = None
+    for store in stores:
+        where = producer.get(store.inputs[0])
+        if where is None or where.kind != "where" or not zero(where.inputs[2]):
+            return None
+        m = mask(where.inputs[0])
+        if m is None:
+            return None
+        start, axis, load, casts = m
+        key = (start, load.inputs, load.attr("arg"), casts)
+        if found is not None and found[0] != key:
+            return None
+        found = (key, m)
+    start, axis, load, casts = found[1]
+
+    # Ops that read memory, and everything computed from them, go into the loop.
+    inside: set = set()
+    for op in body.ops:
+        if op.kind == "store":
+            continue
+        if op.kind == "load" or any(v in inside for v in op.inputs):
+            inside.update(op.outputs)
+    if any(v in inside for store in stores for v in store.inputs[1:]):
+        return None  # a store address depends on memory
+
+    b = TileBuilder()
+    for op in body.ops:
+        if op.kind != "store" and not (set(op.outputs) & inside):
+            b.ops.append(op)
+    count = b.op("load", *load.inputs, arg=load.attr("arg"), shape=(1,) * len(load.attr("shape")), dtype=load.attr("dtype"), other=0)
+    for dtype in reversed(casts):
+        count = b.op("cast", count, dtype=dtype)
+    count = b.op("reshape", count, shape=())
+    if count.type.dtype is not INDEX:
+        return None
+    live = b.op("cmp", start, count, fn="lt")
+    trips = b.op("where", live, b.index(1), b.index(0))
+    values = list(dict.fromkeys(store.inputs[0] for store in stores))
+    zeros = [b.full(v.type.shape, 0, v.type.dtype) for v in values]
+    iv = TValue(TileType((), INDEX))
+    params = [TValue(v.type) for v in values]
+    region = Body((iv, *params), tuple(op for op in body.ops if op.kind != "store" and set(op.outputs) & inside), tuple(values))
+    results = b.emit("for", (b.index(0), trips, b.index(1), *zeros), {}, (region,))
+    final = dict(zip(values, results))
+    for store in stores:
+        b.ops.append(TOp(store.kind, (final[store.inputs[0]], *store.inputs[1:]), store.outputs, store.attrs, store.regions))
+    return Body(body.params, tuple(b.ops), body.results)
+
+
+def _all_zero(value) -> bool:
+    from olaf.tile.from_graph import _zero_constant
+
+    return _zero_constant(value)

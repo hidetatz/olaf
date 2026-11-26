@@ -1353,3 +1353,47 @@ def test_schedule_measurement_is_not_the_launch_time():
     from olaf.search.tune import measure
 
     assert measure("ik,kj->ij", [[64, 64], [64, 64]], "bf16", AMPERE_RTX3060, DotSchedule(64, 64, 32, 3, 4)) < 0.05
+
+
+def _masked_program(with_unmasked: bool, gpu: bool = False):
+    from olaf.pipeline import to_program
+
+    E, T, D = 3, 40, 24  # tiles of 32 rows: counts below, inside and past each tile
+
+    def fn(x, y, counts):
+        live = olaf.iota((E, T), axis=1) < counts.reshape(E, 1)
+        outs = [olaf.where(live.reshape(E, T, 1), olaf.exp(x) * y, 0.0), olaf.where(live.reshape(E, T, 1), x + 1.0, 0.0)]
+        return (*outs, x * y) if with_unmasked else tuple(outs)
+
+    rng = np.random.default_rng(0)
+    arrays = [rng.normal(size=(E, T, D)).astype(np.float32), rng.normal(size=(E, T, D)).astype(np.float32), np.array([0, 17, 40], np.int32)]
+    graph = lower(olaf.trace(fn, tt(E, T, D), tt(E, T, D), tt(E, dtype=DType.i32)).graph)
+    if gpu:
+        from olaf.backend.capability import AMPERE_RTX3060
+        from olaf.backend.cuda.runtime import CudaProgram
+
+        program = to_program(graph, AMPERE_RTX3060)
+        actual, _ = CudaProgram(program).run(arrays)
+    else:
+        program = to_program(graph)
+        actual, _ = run_program(program, arrays)
+    expected, _ = interpret(graph, arrays)
+    for a, e in zip(actual, expected):
+        assert rel(a, e) < 1e-6
+    return [launch for launch in program.launches if any(op.kind == "for" for op in launch.task.body.ops)]
+
+
+def test_masked_tiles_past_the_count_skip_their_loads():
+    # where(iota < count, x, 0) with the count read from memory: tiles starting at or past the
+    # count store zeros without loading; tiles that straddle it still mask element by element.
+    assert _masked_program(with_unmasked=False), "no task skips the tiles past the count"
+
+
+@pytest.mark.gpu
+def test_masked_tiles_past_the_count_skip_their_loads_on_the_gpu():
+    assert _masked_program(with_unmasked=False, gpu=True)
+
+
+def test_masked_tiles_with_an_unmasked_store_load_everything():
+    # The unmasked product is fused into the same task, and needs every row loaded.
+    assert not _masked_program(with_unmasked=True)
