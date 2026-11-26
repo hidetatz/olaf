@@ -110,19 +110,21 @@ class SparseMoE(nn.Module):
             return olaf.where(live.reshape(E, T, 1), x, 0.0)
 
         dtype = self.compute or h.dtype
-        buffers = olaf.zeros((E * T, D), dtype)
-        for slot in slots:
-            buffers = olaf.scatter_add(buffers, slot, _to(flat, dtype))
-        x = used(buffers.reshape(E, T, D))
+        K = c.top_k
+        # All of a token's slots in one scatter and one gather: one pass over the buffers each
+        # way (and one zeroed buffer for the gradient) instead of one per choice.
+        slot = olaf.concat([s.reshape(T, 1) for s in slots], axis=1)
+        tokens = olaf.broadcast_to(_to(flat, dtype).reshape(T, 1, D), (T, K, D))
+        x = used(olaf.scatter_add(olaf.zeros((E * T, D), dtype), slot, tokens).reshape(E, T, D))
         w = p["experts"]
         gate_up = used(olaf.einsum("ecd,efd->ecf", x, _to(w["gate_up_proj"], dtype)))
-        act = used(olaf.silu(gate_up[..., :I]) * gate_up[..., I:])
+        # silu(0) = 0 past the count already; the mask says so, and lets the task that stores it
+        # (kept for the backward) skip those rows (tile.normalize.skip_masked_tiles).
+        act = used(used(olaf.silu(gate_up[..., :I])) * gate_up[..., I:])
         y = used(olaf.einsum("eci,edi->ecd", act, _to(w["down_proj"], dtype))).reshape(E * T, D)
-        out = None
-        for slot, weight in zip(slots, weights):
-            # Hugging Face: expert output (bf16 under autocast) times the f32 routing weight.
-            term = _to(olaf.take(y, slot), DType.f32) * weight.reshape(T, 1)
-            out = term if out is None else out + term
+        # Hugging Face: expert output (bf16 under autocast) times the f32 routing weight.
+        weight = olaf.concat([v.reshape(T, 1) for v in weights], axis=1).reshape(T, K, 1)
+        out = olaf.sum(_to(olaf.take(y, slot), DType.f32) * weight, axis=1)
         return out.reshape(B, S, D)
 
 
